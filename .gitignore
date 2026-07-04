@@ -1,0 +1,7 @@
+﻿*.xlsx
+*.pdf
+server/output/
+dbms/output/
+webwas/output/
+network/output/
+*.txt
