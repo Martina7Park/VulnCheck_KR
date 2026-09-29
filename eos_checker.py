@@ -1,533 +1,458 @@
 #!/usr/bin/env python3
 # ================================================================
-# EoS (End of Support) 자동 판정 모듈 v1.0
-# 기준일: 2026-06-24
+# EoS (End of Support) 자동 판정 모듈 v2.0
+# 데이터 기준일: 2026-09-28 (endoflife.date 스냅샷 + 벤더 공지 수기 데이터)
+# 판정 기준일 : 실행일(오늘) — 환경변수 EOS_CHECK_DATE=YYYY-MM-DD 로 고정 가능
+#
+# [조회 순서]
+#   1) 인터넷 연결 시 endoflife.date 제품 전체 목록(/api/<제품>.json) 조회 → 버전(cycle) 매칭
+#   2) 실패·미연결 시 내장 스냅샷(EOL_SNAPSHOT, 2026-09-28 수집) 사용
+#   3) endoflife.date 에 없는 제품(HP-UX·JEUS·WebtoB·Tibero·Cisco IOS·Junos 등)은 MANUAL_DB
+#   EOS_OFFLINE=1 이면 온라인 조회 생략
 #
 # [사용법]
-#   python eos_checker.py oracle 19c
-#   python eos_checker.py mysql 8.0
-#   python eos_checker.py rhel 7
-#   python eos_checker.py "cisco-ios-xe" 17.9
+#   python eos_checker.py mysql 8.0.46
+#   python eos_checker.py amazon-linux 2
+#   python eos_checker.py mssql 2016
+#   python eos_checker.py --no-api postgresql 13.22
+#   python eos_checker.py            (EoS 현황 목록)
 #
-# [반환]
-#   (결과, EoS일자, 설명)
-#   결과: 양호 / 취약 / 수동확인
+# [반환] check_eos() → (결과, EoS일자, 설명)   결과: 양호 / 취약 / 수동확인
 # ================================================================
-
-import re, sys, datetime, json
+import re, sys, os, datetime, json
 try:
     from urllib.request import urlopen, Request
-    from urllib.error import URLError
     HAS_URLLIB = True
 except ImportError:
     HAS_URLLIB = False
 
-CHECK_DATE = datetime.date(2026, 6, 24)   # 점검 기준일
-RESULT_GOOD   = "양호"
-RESULT_BAD    = "취약"
-RESULT_MANUAL = "수동확인"
+DATA_DATE = datetime.date(2026, 9, 28)   # 내장 데이터 수집일
 
-# ================================================================
-# 하드코딩 EoS 데이터베이스 (2026-06-24 기준)
-# 형식: { 제품명(소문자): { 버전_prefix: EoS_date 또는 None(현역) } }
-# EoS_date = "YYYY-MM-DD" | "YYYY-MM" | "YYYY"
-# None = 현역 (Active)
-# ================================================================
-EOS_DB = {
 
-    # ── OS: Linux ─────────────────────────────────────────────────
-    "rhel": {
-        "6":  "2020-11-30",
-        "7":  "2024-06-30",   # ✗ EoS
-        "8":  None,           # Active until 2029-05-31
-        "9":  None,           # Active until 2032-05-31
-        "10": None,
-    },
-    "centos": {
-        "6":  "2020-11-30",
-        "7":  "2024-06-30",   # ✗ EoS
-        "8":  "2021-12-31",   # ✗ EoS (CentOS 8 조기 종료)
-        "8-stream": None,
-        "9-stream": None,
-    },
-    "rocky": {
-        "8":  None,   # Active until 2029
-        "9":  None,   # Active until 2032
-    },
-    "almalinux": {
-        "8":  None,
-        "9":  None,
-    },
-    "ubuntu": {
-        "16.04": "2021-04-30",
-        "18.04": "2023-04-30",   # ✗ EoS (ESM은 별도)
-        "20.04": "2025-04-30",   # ✗ EoS (ESM은 별도)
-        "22.04": None,            # Active until 2027-04-30
-        "24.04": None,            # Active until 2029-04-30
-        "24.10": "2025-07-12",
-        "25.04": None,
-    },
-    "debian": {
-        "9":  "2022-06-30",
-        "10": "2024-06-30",   # ✗ EoS
-        "11": "2026-08-31",   # Active (barely)
-        "12": None,            # Active until 2028-06-30
-        "13": None,
-    },
-    "sles": {
-        "12": "2024-10-31",   # ✗ EoS
-        "15": None,            # Active until 2031
-    },
-    "amazon-linux": {
-        "1":  "2023-12-31",   # ✗ EoS
-        "2":  "2025-06-30",   # ✗ EoS
-        "2023": None,          # Active
-    },
-
-    # ── OS: Unix ──────────────────────────────────────────────────
-    "aix": {
-        "6.1": "2017-04-30",
-        "7.1": "2023-04-30",   # ✗ EoS
-        "7.2": "2025-04-30",   # ✗ EoS
-        "7.3": None,            # Active
-    },
-    "solaris": {
-        "10": "2021-01-26",   # ✗ EoS
-        "11.4": None,          # Active
-        "11": None,
-    },
-    "hp-ux": {
-        "11i v1": "2012-12-31",
-        "11i v2": "2015-06-30",
-        "11i v3": "2025-12-31",   # ✗ EoS (2025-12-31 지남)
-    },
-
-    # ── OS: Windows Server ────────────────────────────────────────
-    "windows-server": {
-        "2003":   "2015-07-14",
-        "2008":   "2020-01-14",
-        "2008r2": "2020-01-14",   # ✗ EoS
-        "2012":   "2023-10-10",   # ✗ EoS
-        "2012r2": "2023-10-10",   # ✗ EoS
-        "2016":   None,            # Active until 2027-01-12
-        "2019":   None,            # Active until 2029-01-09
-        "2022":   None,            # Active until 2031-10-14
-    },
-
-    # ── DBMS: Oracle ──────────────────────────────────────────────
-    "oracle": {
-        "10g": "2010-07-13",
-        "10":  "2010-07-13",
-        "11g": "2020-12-31",
-        "11":  "2020-12-31",
-        "12c": "2022-07-31",
-        "12":  "2022-07-31",
-        "18c": "2021-06-30",
-        "18":  "2021-06-30",
-        "19c": None,              # Active (Premier 2024-12, Extended 2027-12)
-        "19":  None,
-        "21c": "2024-04-30",   # ✗ EoS (Short Term)
-        "21":  "2024-04-30",
-        "23c": None,              # Active
-        "23":  None,
-    },
-
-    # ── DBMS: MySQL ───────────────────────────────────────────────
-    "mysql": {
-        "5.0": "2012-01-09",
-        "5.1": "2013-12-31",
-        "5.5": "2018-12-31",
-        "5.6": "2021-02-28",   # ✗ EoS
-        "5.7": "2023-10-31",   # ✗ EoS
-        "8.0": "2026-04-30",   # ✗ EoS (2026-04 지남)
-        "8.4": None,            # Active (LTS until 2032)
-        "9.0": "2025-01-31",
-        "9.1": None,
-    },
-
-    # ── DBMS: MariaDB ─────────────────────────────────────────────
-    "mariadb": {
-        "10.4": "2024-06-18",   # ✗ EoS
-        "10.5": "2025-06-24",   # ✗ EoS
-        "10.6": "2026-07-06",   # ⚠ EoS 임박 (2주 후)
-        "10.11": None,           # Active LTS until 2028
-        "11.4": None,            # Active LTS
-        "11.7": None,
-        "11.8": None,
-    },
-
-    # ── DBMS: PostgreSQL ──────────────────────────────────────────
-    "postgresql": {
-        "10": "2022-11-10",
-        "11": "2023-11-09",   # ✗ EoS
-        "12": "2024-11-14",   # ✗ EoS
-        "13": "2025-11-13",   # ✗ EoS
-        "14": None,            # Active until 2026-11-12
-        "15": None,            # Active until 2027-11-11
-        "16": None,            # Active until 2028-11-09
-        "17": None,            # Active until 2029-11-08
-    },
-
-    # ── DBMS: MSSQL ───────────────────────────────────────────────
-    "mssql": {
-        "2008":   "2019-07-09",
-        "2008r2": "2019-07-09",
-        "2012":   "2022-07-12",   # ✗ EoS
-        "2014":   "2024-07-09",   # ✗ EoS
-        "2016":   "2026-07-14",   # ⚠ EoS 임박 (3주 후)
-        "2017":   None,            # Active until 2027-10-12
-        "2019":   None,            # Active until 2030-01-08
-        "2022":   None,            # Active until 2033-01-11
-    },
-    "sqlserver": {  # alias
-        "2012": "2022-07-12",
-        "2014": "2024-07-09",
-        "2016": "2026-07-14",
-        "2017": None,
-        "2019": None,
-        "2022": None,
-    },
-
-    # ── Web Server: Apache ────────────────────────────────────────
-    "apache": {
-        "2.2": "2017-12-31",   # ✗ EoS
-        "2.4": None,            # Active
-    },
-    "httpd": {  # alias
-        "2.2": "2017-12-31",
-        "2.4": None,
-    },
-
-    # ── Web Server: Nginx ─────────────────────────────────────────
-    "nginx": {
-        "1.14": "2020-04-14",
-        "1.16": "2021-05-25",
-        "1.18": "2022-05-24",
-        "1.20": "2023-05-23",
-        "1.22": "2024-08-13",
-        "1.24": None,            # Active (stable)
-        "1.26": None,            # Active (stable)
-        "1.27": None,            # Active (mainline)
-    },
-
-    # ── WAS: Tomcat ───────────────────────────────────────────────
-    "tomcat": {
-        "6":  "2016-12-31",
-        "7":  "2021-03-31",
-        "8.0": "2018-06-30",
-        "8.5": "2024-03-31",   # ✗ EoS
-        "9":  None,             # Active until 2026-12-31 (check)
-        "9.0": None,
-        "10": None,
-        "10.1": None,           # Active
-        "11": None,
-        "11.0": None,           # Active
-    },
-
-    # ── WAS: JEUS ─────────────────────────────────────────────────
-    "jeus": {
-        "5":  "2016-12-31",   # ✗ EoS
-        "6":  "2019-12-31",   # ✗ EoS
-        "7":  "2022-12-31",   # ✗ EoS
-        "8":  None,            # Active (TmaxSoft 정책 따름)
-    },
-
-    # ── WAS: WebtoB ───────────────────────────────────────────────
-    "webtob": {
-        "3": "2016-12-31",
-        "4": "2019-12-31",
-        "5": None,             # Active
-    },
-
-    # ── Network: Cisco IOS-XE ─────────────────────────────────────
-    "cisco-ios-xe": {
-        "16.6":  "2022-08-31",
-        "16.9":  "2023-02-28",
-        "16.12": "2023-08-31",
-        "17.3":  "2024-08-31",
-        "17.6":  "2026-03-31",   # ✗ EoS
-        "17.9":  "2025-08-31",   # ✗ EoS
-        "17.10": "2026-07-31",   # ⚠ EoS 임박 (1개월 후)
-        "17.12": None,            # Active (until ~2027-03)
-        "17.15": None,            # Active (until ~2028-03)
-        "17.17": "2026-03-31",   # ✗ EoS
-        "17.18": None,            # Active (현재 권장)
-    },
-
-    # ── Network: Cisco IOS (Classic) ──────────────────────────────
-    "cisco-ios": {
-        "12.0": "2015-01-12",
-        "12.1": "2015-01-12",
-        "12.2": "2016-04-29",
-        "12.3": "2015-08-31",
-        "12.4": "2018-06-29",
-        "15.0": "2019-07-31",
-        "15.1": "2022-08-31",
-        "15.2": "2023-03-31",
-        "15.4": "2022-10-31",
-        "15.5": "2023-06-30",
-        "15.6": "2023-04-29",
-        "15.7": None,             # check - may still be active
-        "15.8": None,
-        "15.9": None,
-    },
-
-    # ── Network: Cisco ASA ────────────────────────────────────────
-    "cisco-asa": {
-        "9.8":  "2022-09-30",
-        "9.12": "2024-03-31",
-        "9.14": "2024-09-30",
-        "9.16": None,
-        "9.18": None,
-        "9.20": None,
-    },
-
-    # ── Network: Juniper Junos ────────────────────────────────────
-    "junos": {
-        "18": "2023-10-31",
-        "20": "2024-10-31",
-        "21": "2025-10-31",   # ✗ EoS
-        "22": None,
-        "23": None,
-        "24": None,
-    },
-}
-
-# ================================================================
-# endoflife.date API 조회 (인터넷 연결 시)
-# ================================================================
-EOLDATE_PRODUCTS = {
-    "rhel":        "rhel",
-    "centos":      "centos",
-    "ubuntu":      "ubuntu",
-    "debian":      "debian",
-    "oracle":      "oracle-database",
-    "mysql":       "mysql",
-    "mariadb":     "mariadb",
-    "postgresql":  "postgresql",
-    "mssql":       "mssqlserver",
-    "sqlserver":   "mssqlserver",
-    "apache":      "apache",
-    "nginx":       "nginx",
-    "tomcat":      "tomcat",
-    "cisco-ios-xe":"cisco-ios-xe",
-}
-
-def query_eoldate_api(product: str, version: str) -> tuple:
-    """endoflife.date API 조회"""
-    if not HAS_URLLIB:
-        return None, None
-    slug = EOLDATE_PRODUCTS.get(product.lower())
-    if not slug:
-        return None, None
-    url = f"https://endoflife.date/api/{slug}/{version}.json"
+def _check_date():
+    v = os.environ.get("EOS_CHECK_DATE", "")
     try:
-        req = Request(url, headers={"Accept": "application/json", "User-Agent": "eos-checker/1.0"})
-        resp = urlopen(req, timeout=3)
-        data = json.loads(resp.read().decode())
-        eol  = data.get("eol") or data.get("endOfLife")
-        if eol is False:  # eol=false means still active
-            return True, None   # (is_active, eol_date)
-        elif isinstance(eol, str):
-            return False, eol   # (is_active, eol_date)
-    except Exception:
-        pass
-    return None, None
+        return datetime.date.fromisoformat(v) if v else datetime.date.today()
+    except ValueError:
+        return datetime.date.today()
 
 
-# ================================================================
-# 버전 정규화 및 매칭
-# ================================================================
-def normalize_version(v: str) -> str:
-    """버전 문자열 정규화"""
-    if not v:
-        return ""
-    v = v.strip().lower()
-    # 11g r2 → 11g, 12c r1 → 12c
-    v = re.sub(r'\s+r[12]$', '', v)
-    # IOS-XE 17.12.06 → 17.12
-    m = re.match(r'^(\d+\.\d+)', v)
-    if m:
-        return m.group(1)
-    return v
+CHECK_DATE = _check_date()
+RESULT_GOOD, RESULT_BAD, RESULT_MANUAL = "양호", "취약", "수동확인"
+IMMINENT_DAYS = 90   # 종료 임박(수동확인) 기준
 
-def get_version_prefix(version: str) -> list:
-    """버전에서 매칭 가능한 prefix 목록 반환 (긴 것 우선)"""
-    v = normalize_version(version)
-    prefixes = []
-    # 정규화 버전 그대로
-    prefixes.append(v)
-    # 주 버전만 (major)
-    m = re.match(r'^(\d+)', v)
-    if m:
-        prefixes.append(m.group(1))
-    # major.minor
-    m = re.match(r'^(\d+\.\d+)', v)
-    if m and m.group(1) != v:
-        prefixes.append(m.group(1))
-    return prefixes
+# 입력 제품명 → endoflife.date 제품 식별자
+ALIASES = {
+    "rhel": "rhel", "redhat": "rhel", "red hat": "rhel", "centos": "centos", "centos-stream": "centos-stream",
+    "rocky": "rocky-linux", "rocky-linux": "rocky-linux", "almalinux": "almalinux", "alma": "almalinux",
+    "ubuntu": "ubuntu", "debian": "debian", "sles": "sles", "suse": "sles",
+    "amazon-linux": "amazon-linux", "amazon": "amazon-linux", "amzn": "amazon-linux",
+    "oracle-linux": "oracle-linux", "ol": "oracle-linux", "aix": "ibm-aix", "ibm-aix": "ibm-aix", "solaris": "solaris",
+    "windows-server": "windows-server", "windows": "windows-server",
+    "oracle": "oracle-database", "oracle-database": "oracle-database", "mysql": "mysql", "mariadb": "mariadb",
+    "postgresql": "postgresql", "postgres": "postgresql", "pgsql": "postgresql",
+    "mssql": "mssqlserver", "sqlserver": "mssqlserver", "mssqlserver": "mssqlserver",
+    "apache": "apache-http-server", "httpd": "apache-http-server", "apache-http-server": "apache-http-server",
+    "nginx": "nginx", "tomcat": "tomcat", "cisco-ios-xe": "cisco-ios-xe", "ios-xe": "cisco-ios-xe",
+    "redis": "redis", "mongodb": "mongodb", "linux": "linux", "kernel": "linux",
+}
 
-def check_eos(product: str, version: str, use_api: bool = True) -> tuple:
-    """
-    EoS 판정
-    반환: (결과, EoS_일자_또는_None, 설명)
-    """
-    product_lower = product.lower().strip()
-    version_lower = version.lower().strip()
+# endoflife.date 미등재 제품 (벤더 공지 기준, 2026-09-28) — 버전 prefix: 종료일 | None(지원 중)
+MANUAL_DB = {
+    "hp-ux":    {"11i v1": "2012-12-31", "11i v2": "2015-12-31", "11i v3": "2025-12-31", "11.11": "2012-12-31", "11.23": "2015-12-31", "11.31": "2025-12-31"},
+    "jeus":     {"5": "2016-12-31", "6": "2019-12-31", "7": "2022-12-31", "8": None, "9": None},
+    "webtob":   {"3": "2016-12-31", "4": "2019-12-31", "5": None},
+    "tibero":   {"4": "2016-12-31", "5": "2021-12-31", "6": None, "7": None},
+    "cisco-ios": {"12": "2016-04-29", "15.0": "2019-07-31", "15.1": "2022-08-31", "15.2": "2023-03-31", "15.4": "2022-10-31",
+                  "15.5": "2023-06-30", "15.6": "2023-04-29", "15.7": None, "15.8": None, "15.9": None},
+    "cisco-asa": {"9.8": "2022-09-30", "9.12": "2024-03-31", "9.14": "2024-09-30", "9.16": None, "9.18": None, "9.20": None},
+    "junos":    {"18": "2023-10-31", "20": "2024-10-31", "21": "2025-10-31", "22": None, "23": None, "24": None},
+}
 
-    # 1. API 조회 시도
-    if use_api:
+_ONLINE_CACHE = {}
+LAST_SOURCE = ""
+
+
+def fetch_online(slug):
+    """endoflife.date 제품 전체 목록 조회 (성공 시 [(cycle, label, eol)], 실패 시 None). 리다이렉트 추적"""
+    if slug in _ONLINE_CACHE:
+        return _ONLINE_CACHE[slug]
+    data = None
+    if HAS_URLLIB and os.environ.get("EOS_OFFLINE") != "1":
         try:
-            is_active, eol_date = query_eoldate_api(product_lower, normalize_version(version_lower))
-            if is_active is True:
-                return RESULT_GOOD, None, f"{product} {version} 지원 기간 내 (endoflife.date 확인)"
-            elif is_active is False and eol_date:
-                try:
-                    eol = datetime.date.fromisoformat(eol_date)
-                    if eol < CHECK_DATE:
-                        days = (CHECK_DATE - eol).days
-                        return RESULT_BAD, eol_date, f"{product} {version} EoS {days}일 경과 ({eol_date})"
-                    else:
-                        days = (eol - CHECK_DATE).days
-                        return RESULT_GOOD, eol_date, f"{product} {version} EoS {days}일 남음 ({eol_date})"
-                except ValueError:
-                    pass
+            req = Request(f"https://endoflife.date/api/{slug}.json",
+                          headers={"Accept": "application/json", "User-Agent": "eos-checker/2.0"})
+            with urlopen(req, timeout=5) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+            if isinstance(raw, list) and raw:
+                data = [(str(x.get("cycle")), (x.get("releaseLabel") or "").replace("'__CODENAME__'", "").strip(),
+                         x.get("eol")) for x in raw]
         except Exception:
-            pass
-
-    # 2. 하드코딩 DB 조회
-    db_entry = None
-    for key in EOS_DB:
-        if product_lower in key or key in product_lower:
-            db_entry = EOS_DB[key]
-            break
-
-    if db_entry is None:
-        return RESULT_MANUAL, None, f"{product} {version} EoS 정보 없음 - 벤더 사이트 수동 확인"
-
-    # 버전 매칭 (긴 prefix 우선)
-    prefixes = get_version_prefix(version_lower)
-    eol_str = None
-    matched_key = None
-
-    for pfx in prefixes:
-        # 직접 매칭
-        if pfx in db_entry:
-            eol_str  = db_entry[pfx]
-            matched_key = pfx
-            break
-        # 부분 매칭 (major.minor prefix)
-        for k in sorted(db_entry.keys(), key=len, reverse=True):
-            if pfx.startswith(k) or k.startswith(pfx):
-                eol_str  = db_entry[k]
-                matched_key = k
-                break
-        if matched_key:
-            break
-
-    if matched_key is None:
-        return RESULT_MANUAL, None, f"{product} {version} 버전 정보 DB 없음 - 수동 확인"
-
-    # eol_str = None → 현역
-    if eol_str is None:
-        return RESULT_GOOD, None, f"{product} {version} 지원 기간 내 (하드코딩 DB)"
-
-    # EoS 날짜 파싱
-    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
-        try:
-            if fmt == "%Y-%m":
-                eol = datetime.date.fromisoformat(eol_str + "-01")
-            elif fmt == "%Y":
-                eol = datetime.date.fromisoformat(eol_str + "-01-01")
-            else:
-                eol = datetime.date.fromisoformat(eol_str)
-            break
-        except ValueError:
-            eol = None
-
-    if eol is None:
-        return RESULT_MANUAL, eol_str, f"{product} {version} EoS 날짜 파싱 실패: {eol_str}"
-
-    if eol < CHECK_DATE:
-        days = (CHECK_DATE - eol).days
-        if days <= 180:
-            return RESULT_BAD, eol_str, f"{product} {version} EoS {days}일 경과 ({eol_str}) ⚠ 최근 종료"
-        else:
-            return RESULT_BAD, eol_str, f"{product} {version} EoS 종료 ({eol_str}, {days//365}년 {days%365//30}개월 경과)"
-    else:
-        days = (eol - CHECK_DATE).days
-        if days <= 90:
-            return RESULT_MANUAL, eol_str, f"{product} {version} EoS {days}일 남음 ({eol_str}) ⚠ 임박"
-        else:
-            return RESULT_GOOD, eol_str, f"{product} {version} 지원 기간 내 (EoS: {eol_str})"
+            data = None
+    _ONLINE_CACHE[slug] = data
+    return data
 
 
-# ================================================================
-# 시스템 자동 탐지 헬퍼 (bash 스크립트에서 호출용)
-# ================================================================
-def detect_and_check(product: str, version: str) -> str:
-    """결과를 파이프 포맷으로 반환"""
-    result, eol_date, desc = check_eos(product, version)
+def _cycle_candidates(slug, version):
+    """입력 버전 → endoflife.date cycle 후보 (긴 것 우선)"""
+    v = version.strip().lower()
+    v = re.sub(r"^v", "", v)
+    out = []
+    if slug == "oracle-database":
+        m = re.match(r"(\d+)(?:\.(\d+))?\s*([cgi]|ai)?", v)
+        if m:
+            if m.group(2) and m.group(1) in ("10", "11", "12", "9"):
+                out.append(f"{m.group(1)}.{m.group(2)}")
+            out.append(m.group(1))
+            if m.group(1) in ("10", "11", "12"):
+                out.append(m.group(1) + ".2")
+        return out
+    if slug == "windows-server":
+        m = re.search(r"(2003|2008|2012|2016|2019|2022|2025)\s*-?\s*(r2)?", v)
+        if m:
+            return [f"{m.group(1)}-r2" if m.group(2) else m.group(1), m.group(1)]
+    if slug == "mssqlserver":
+        return [v]   # 연도(2016 등)는 releaseLabel 로 매칭
+    if slug == "amazon-linux":
+        if re.match(r"^20(1[0-9])\.\d+", v):
+            return [re.match(r"^\d{4}\.\d+", v).group()]
+        if v.startswith("2023"):
+            return ["2023"]
+        if re.match(r"^2(\.|$)", v):
+            return ["2"]
+        if re.match(r"^1(\.|$)", v):
+            return ["2018.03"]
+    parts = re.findall(r"\d+", v)
+    for n in range(min(len(parts), 3), 0, -1):
+        out.append(".".join(parts[:n]))
+    return out
+
+
+def _match(slug, rows, version):
+    """rows 에서 버전에 맞는 (cycle, label, eol) 반환"""
+    if slug == "mssqlserver":
+        y = re.search(r"(2008|2012|2014|2016|2017|2019|2022|2025)", version)
+        if y:
+            cand = [r for r in rows if r[1].startswith(y.group(1))]
+            sp = re.search(r"sp\s*(\d)", version, re.I)
+            if sp:
+                c2 = [r for r in cand if f"SP{sp.group(1)}" in r[1]]
+                cand = c2 or cand
+            if cand:   # 서비스팩 미지정 → 최신 SP(종료일 가장 늦은 행) 기준
+                return max(cand, key=lambda r: str(r[2]))
+        return None
+    cmap = {r[0]: r for r in rows}
+    for c in _cycle_candidates(slug, version):
+        if c in cmap:
+            return cmap[c]
+    # AIX 7.2 → 7.2.x 중 최신 TL
+    m = re.match(r"^(\d+\.\d+)$", version.strip())
+    if m:
+        tl = [r for r in rows if r[0].startswith(m.group(1) + ".")]
+        if tl:
+            return max(tl, key=lambda r: [int(x) for x in re.findall(r"\d+", r[0])])
+    return None
+
+
+def _judge(product, version, eol, src, cycle=""):
+    tag = f"{product} {version}" + (f" (주기 {cycle})" if cycle and cycle != version else "")
+    if eol is False or eol is None:
+        return RESULT_GOOD, None, f"{tag} 지원 기간 내 [{src}]"
+    if eol is True:
+        return RESULT_BAD, "종료", f"{tag} 지원 종료 [{src}]"
+    try:
+        d = datetime.date.fromisoformat(str(eol)[:10])
+    except ValueError:
+        return RESULT_MANUAL, str(eol), f"{tag} 종료일 형식 확인 필요({eol}) [{src}]"
+    days = (d - CHECK_DATE).days
+    if days < 0:
+        return RESULT_BAD, str(d), f"{tag} EoS {d} ({-days}일 경과) [{src}]"
+    if days <= IMMINENT_DAYS:
+        return RESULT_MANUAL, str(d), f"{tag} EoS {d} ({days}일 남음, 임박) [{src}]"
+    return RESULT_GOOD, str(d), f"{tag} 지원 기간 내 (EoS {d}) [{src}]"
+
+
+def check_eos(product, version, use_api=True):
+    """EoS 판정 → (결과, EoS일자|None, 설명)"""
+    global LAST_SOURCE
+    p = (product or "").lower().strip()
+    v = (version or "").strip()
+    if not v:
+        return RESULT_MANUAL, None, f"{product} 버전 미확인 - 수동 확인"
+    slug = ALIASES.get(p) or next((s for k, s in ALIASES.items() if k in p), None)
+    if slug:
+        rows, src = None, ""
+        if use_api:
+            rows = fetch_online(slug)
+            src = "endoflife.date 온라인 조회" if rows else ""
+        if not rows:
+            rows = EOL_SNAPSHOT.get(slug)
+            src = f"내장 데이터 {DATA_DATE}"
+        if rows:
+            hit = _match(slug, rows, v)
+            if hit:
+                LAST_SOURCE = src
+                return _judge(product, v, hit[2], src, hit[1] or hit[0])
+            return RESULT_MANUAL, None, f"{product} {v} 버전 주기 미등재 - 벤더 지원 정책 수동 확인 [{src}]"
+    key = next((k for k in MANUAL_DB if k == p or k in p), None)
+    if key:
+        db = MANUAL_DB[key]
+        vv = v.lower()
+        for k in sorted(db, key=len, reverse=True):
+            if vv == k or vv.startswith(k + ".") or vv.startswith(k + " ") or vv.startswith(k):
+                return _judge(product, v, db[k] if db[k] else False, f"벤더 공지 수기 데이터 {DATA_DATE}", k)
+        return RESULT_MANUAL, None, f"{product} {v} 버전 정보 없음 - 벤더 지원 정책 수동 확인"
+    return RESULT_MANUAL, None, f"{product} {v} EoS 정보 없음 - 벤더 지원 정책 수동 확인"
+
+
+def kernel_status(kernel, use_api=True):
+    """리눅스 커널 버전 → 업스트림(kernel.org) 기준 지원 상태 (참고용: 배포판 커널은 배포판 지원 정책을 따름)"""
+    m = re.match(r"(\d+)\.(\d+)", kernel or "")
+    if not m:
+        return RESULT_MANUAL, None, "커널 버전 미확인"
+    r, e, d = check_eos("linux", f"{m.group(1)}.{m.group(2)}", use_api)
+    return r, e, d.replace("linux ", "커널 ")
+
+
+def detect_and_check(product, version):
+    result, _, desc = check_eos(product, version)
     return f"{result}|{desc}"
 
 
-# ================================================================
-# 일괄 점검 (운영 시스템 전체 검사용)
-# ================================================================
-def batch_check(items: list) -> list:
-    """
-    items: [(product, version, item_code), ...]
-    반환: [(item_code, result, eol_date, desc), ...]
-    """
-    results = []
-    for product, version, code in items:
-        result, eol_date, desc = check_eos(product, version)
-        results.append((code, result, eol_date, desc))
-    return results
+def batch_check(items):
+    return [(code,) + check_eos(product, version) for product, version, code in items]
+
+
+EOL_SNAPSHOT = {   # endoflife.date /api/<제품>.json 스냅샷 (2026-09-28 수집) - (cycle, releaseLabel, eol[날짜|True=종료|False=지원중])
+    "almalinux": [
+        ('10', '', '2035-05-31'), ('9', '', '2032-05-31'), ('8', '', '2029-05-31'),
+    ],
+    "amazon-linux": [
+        ('2023', '', '2029-06-30'), ('2', '', '2026-06-30'), ('2018.03', 'AMI 2018.03', '2023-12-31'),
+        ('2017.09', 'AMI 2017.09', '2023-12-31'), ('2017.03', 'AMI 2017.03', '2023-12-31'), ('2016.09', 'AMI 2016.09', '2023-12-31'),
+        ('2016.03', 'AMI 2016.03', '2023-12-31'), ('2015.09', 'AMI 2015.09', '2023-12-31'), ('2015.03', 'AMI 2015.03', '2023-12-31'),
+        ('2014.09', 'AMI 2014.09', '2023-12-31'), ('2014.03', 'AMI 2014.03', '2023-12-31'), ('2013.09', 'AMI 2013.09', '2023-12-31'),
+        ('2013.03', 'AMI 2013.03', '2023-12-31'), ('2012.09', 'AMI 2012.09', '2023-12-31'), ('2012.03', 'AMI 2012.03', '2023-12-31'),
+        ('2011.09', 'AMI 2011.09', '2023-12-31'), ('2010.11', 'AMI 2010.11', '2023-12-31'),
+    ],
+    "apache-http-server": [
+        ('2.4', '', False), ('2.2', '', '2017-07-11'), ('2.0', '', '2013-07-10'),
+        ('1.3', '', '2010-02-03'),
+    ],
+    "centos-stream": [
+        ('10', '', '2030-05-31'), ('9', '', '2027-05-31'), ('8', '', '2024-05-31'),
+    ],
+    "centos": [
+        ('8', '', '2021-12-31'), ('7', '', '2024-06-30'), ('6', '', '2020-11-30'),
+        ('5', '', '2017-03-31'),
+    ],
+    "cisco-ios-xe": [
+        ('26.1', '', False), ('17.18', '', '2029-08-08'), ('17.17', '', '2026-07-30'),
+        ('17.16', '', '2026-01-13'), ('17.15', '', '2028-09-30'), ('17.14', '', '2025-05-31'),
+        ('17.13', '', '2024-12-31'), ('17.12', '', '2027-09-30'), ('17.11', '', '2024-05-14'),
+        ('17.10', '', '2024-01-03'), ('17.9', '', '2026-09-30'), ('17.8', '', '2023-05-30'),
+        ('17.7', '', '2023-01-30'), ('17.6', '', '2024-09-30'), ('17.5', '', '2022-05-30'),
+        ('17.4', '', '2022-01-28'), ('17.3', '', '2023-09-30'), ('17.2', '', '2021-07-15'),
+        ('17.1', '', '2020-12-30'), ('16.12', '', '2022-08-18'),
+    ],
+    "debian": [
+        ('13', '', '2030-06-30'), ('12', '', '2028-06-30'), ('11', '', '2026-08-31'),
+        ('10', '', '2024-06-30'), ('9', '', '2022-07-01'), ('8', '', '2020-06-30'),
+        ('7', '', '2018-05-31'), ('6', '', '2016-02-29'), ('5', '', '2012-02-06'),
+        ('4', '', '2010-02-15'), ('3.1', '', '2008-03-31'), ('3.0', '', '2006-06-30'),
+        ('2.2', '', '2003-06-30'), ('2.1', '', '2000-10-30'), ('2.0', '', '1999-02-15'),
+        ('1.3', '', '1998-12-08'), ('1.2', '', '1997-10-23'), ('1.1', '', '1996-12-12'),
+    ],
+    "ibm-aix": [
+        ('7.3.4', '', '2028-12-31'), ('7.3.3', '', '2027-12-31'), ('7.3.2', '', '2026-11-30'),
+        ('7.3.1', '', '2025-12-31'), ('7.3.0', '', '2024-12-31'), ('7.2.5', '', False),
+        ('7.2.4', '', '2022-11-30'), ('7.2.3', '', '2021-09-30'), ('7.2.2', '', '2020-10-31'),
+        ('7.2.1', '', '2019-11-30'), ('7.2.0', '', '2018-12-31'), ('7.1.5', '', '2023-04-30'),
+        ('6.1.9', '', '2017-04-30'),
+    ],
+    "linux": [
+        ('7.2', '', False), ('7.1', '', '2026-09-02'), ('7.0', '', '2026-06-27'),
+        ('6.19', '', '2026-04-22'), ('6.18', '', '2028-12-31'), ('6.17', '', '2025-12-18'),
+        ('6.16', '', '2025-10-12'), ('6.15', '', '2025-08-20'), ('6.14', '', '2025-06-10'),
+        ('6.13', '', '2025-04-20'), ('6.12', '', '2028-12-31'), ('6.11', '', '2024-12-05'),
+        ('6.10', '', '2024-10-10'), ('6.9', '', '2024-07-27'), ('6.8', '', '2024-05-30'),
+        ('6.7', '', '2024-04-03'), ('6.6', '', '2027-12-31'), ('6.5', '', '2023-11-28'),
+        ('6.4', '', '2023-09-13'), ('6.3', '', '2023-07-11'), ('6.2', '', '2023-05-17'),
+        ('6.1', '', '2027-12-31'), ('6.0', '', '2023-01-12'), ('5.19', '', '2022-10-24'),
+        ('5.18', '', '2022-08-21'), ('5.17', '', '2022-06-14'), ('5.16', '', '2022-04-13'),
+        ('5.15', '', '2026-12-31'), ('5.14', '', '2021-11-21'), ('5.13', '', '2021-09-18'),
+        ('5.12', '', '2021-07-20'), ('5.11', '', '2021-05-19'), ('5.10', '', '2026-12-31'),
+        ('5.4', '', '2025-12-03'), ('4.19', '', '2024-12-05'), ('4.14', '', '2024-01-10'),
+        ('4.9', '', '2023-01-07'),
+    ],
+    "mariadb": [
+        ('13.0', '', '2026-12-31'), ('12.3', '', '2029-06-12'), ('12.2', '', '2026-05-28'),
+        ('12.1', '', '2026-02-13'), ('12.0', '', '2025-11-18'), ('11.8', '', '2028-06-04'),
+        ('11.7', '', '2025-05-12'), ('11.6', '', '2025-02-13'), ('11.5', '', '2024-11-21'),
+        ('11.4', '', '2029-05-29'), ('11.3', '', '2024-05-29'), ('11.2', '', '2024-11-21'),
+        ('11.1', '', '2024-08-21'), ('11.0', '', '2024-06-06'), ('10.11', '', '2028-02-16'),
+        ('10.10', '', '2023-11-17'), ('10.9', '', '2023-08-22'), ('10.8', '', '2023-05-20'),
+        ('10.7', '', '2023-02-09'), ('10.6', '', '2026-07-06'), ('10.5', '', '2025-06-24'),
+        ('10.4', '', '2024-06-18'), ('10.3', '', '2023-05-25'), ('10.2', '', '2022-05-23'),
+        ('10.1', '', '2020-10-17'), ('10.0', '', '2019-03-31'), ('5.5', '', '2020-04-11'),
+        ('5.3', '', '2017-03-01'), ('5.2', '', '2015-11-10'), ('5.1', '', '2015-02-01'),
+    ],
+    "mongodb": [
+        ('8.3', '', '2029-10-31'), ('8.2', '8.2 (Rapid Release)', '2026-07-31'), ('8.1', '8.1 (Rapid Release)', '2025-09-30'),
+        ('8.0', '', '2029-10-31'), ('7.3', '7.3 (Rapid Release)', '2024-10-02'), ('7.2', '7.2 (Rapid Release)', '2024-03-27'),
+        ('7.1', '7.1 (Rapid Release)', '2024-01-23'), ('7.0', '', '2027-08-31'), ('6.3', '6.3 (Rapid Release)', '2023-08-31'),
+        ('6.2', '6.2 (Rapid Release)', '2023-04-24'), ('6.1', '6.1 (Rapid Release)', '2023-02-09'), ('6.0', '', '2025-07-31'),
+        ('5.3', '5.3 (Rapid Release)', '2022-07-19'), ('5.2', '5.2 (Rapid Release)', '2022-03-23'), ('5.1', '5.1 (Rapid Release)', '2022-01-19'),
+        ('5.0', '', '2024-10-31'), ('4.4', '', '2024-02-29'), ('4.2', '', '2023-04-30'),
+        ('4.0', '', '2022-04-30'), ('3.6', '', '2021-04-30'), ('3.4', '', '2020-01-31'),
+        ('3.2', '', '2018-09-30'), ('3.0', '', '2018-02-28'), ('2.6', '', '2016-10-31'),
+        ('2.4', '', '2013-03-31'), ('2.2', '', '2014-02-28'), ('2.0', '', '2013-03-31'),
+        ('1.8', '', '2012-09-30'), ('1.6', '', '2012-02-28'), ('1.4', '', '2012-09-30'),
+        ('1.2', '', '2011-06-30'), ('1.0', '', '2010-08-31'),
+    ],
+    "mssqlserver": [
+        ('17.0', '2025', '2036-01-06'), ('16.0', '2022', '2033-01-11'), ('13.0-sp3-acp', '2016 SP3 Azure Connect Pack', '2026-07-14'),
+        ('13.0-sp3', '2016 SP3', '2026-07-14'), ('15.0', '2019', '2030-01-08'), ('12.0-sp3', '2014  SP3', '2024-07-09'),
+        ('13.0-sp2', '2016 SP2', '2022-10-11'), ('11.0-sp4', '2012  SP4', '2022-07-12'), ('14.0', '2017', '2027-10-12'),
+        ('13.0-sp1', '2016 SP1', '2019-07-09'), ('12.0-sp2', '2014  SP2', '2020-01-14'), ('13.0', '2016', '2018-01-09'),
+        ('11.0-sp3', '2012  SP3', '2018-10-09'), ('12.0-sp1', '2014  SP1', '2017-10-10'), ('10.50-sp3', '2008 R2  SP3', '2019-07-09'),
+        ('10.0-sp4', '2008  SP4', '2019-07-09'), ('11.0-sp2', '2012  SP2', '2017-01-10'), ('12.0', '2014', '2016-07-12'),
+        ('11.0-sp1', '2012  SP1', '2015-07-14'), ('10.50-sp2', '2008 R2  SP2', '2015-10-13'), ('11.0', '2012', '2014-01-14'),
+        ('10.00-sp3', '2008  SP3', '2015-10-13'), ('10.50-sp1', '2008 R2  SP1', '2013-10-08'), ('9.0-sp4', '2005  SP4', '2016-04-12'),
+        ('10.00-sp2', '2008  SP2', '2012-10-09'), ('10.50-r2', '2008  R2', '2012-07-10'), ('10.00-sp1', '2008  SP1', '2011-10-11'),
+        ('9.00-sp3', '2005  SP3', '2012-01-10'), ('10.00', '2008', '2010-04-13'), ('9.00-sp2', '2005  SP2', '2010-01-12'),
+        ('9.0-sp1', '2005  SP1', '2008-04-08'), ('9.0', '2005', '2007-07-10'), ('8.0-sp4', '2000  SP4', '2013-04-09'),
+        ('7.0-sp4', '7.0  SP4', '2011-01-11'), ('6.50-sp5a', '6.5  SP5a', '2002-01-01'), ('6.0-sp3', '6.0  SP3', '1999-03-31'),
+    ],
+    "mysql": [
+        ('9.7', '', '2034-04-30'), ('9.6', '', '2026-04-21'), ('9.5', '', '2026-01-20'),
+        ('9.4', '', '2025-10-21'), ('9.3', '', '2025-07-22'), ('9.2', '', '2025-04-15'),
+        ('9.1', '', '2025-01-21'), ('9.0', '', '2024-10-15'), ('8.4', '', '2032-04-30'),
+        ('8.3', '', '2024-04-30'), ('8.2', '', '2024-01-16'), ('8.1', '', '2023-10-25'),
+        ('8.0', '', '2026-04-30'), ('5.7', '', '2023-10-31'), ('5.6', '', '2021-02-28'),
+        ('5.5', '', '2018-12-31'),
+    ],
+    "nginx": [
+        ('1.31', '', False), ('1.30', '', False), ('1.29', '', '2026-05-13'),
+        ('1.28', '', '2026-04-14'), ('1.27', '', '2025-06-24'), ('1.26', '', '2025-04-23'),
+        ('1.25', '', '2024-05-29'), ('1.24', '', '2024-04-23'), ('1.23', '', '2023-05-23'),
+        ('1.22', '', '2023-04-11'), ('1.21', '', '2022-06-21'), ('1.20', '', '2022-05-24'),
+        ('1.19', '', '2021-05-25'), ('1.18', '', '2021-04-20'), ('1.16', '', '2020-04-20'),
+        ('1.14', '', '2019-04-23'), ('1.12', '', '2018-04-17'), ('1.10', '', '2017-04-12'),
+        ('1.8', '', '2016-04-26'), ('1.6', '', '2015-04-21'), ('1.4', '', '2014-04-24'),
+        ('1.2', '', '2013-04-24'), ('1.0', '', '2012-04-23'),
+    ],
+    "oracle-database": [
+        ('23', '26ai', '2031-12-31'), ('21', '21c', '2027-07-31'), ('19', '19c', '2029-12-31'),
+        ('18', '18c', '2021-06-30'), ('12.2', '12c Release 2', '2022-03-31'), ('12.1', '12c Release 1', '2018-07-31'),
+        ('11.2', '11g Release 2', '2015-01-31'), ('11.1', '11g Release 1', '2012-08-31'), ('10.2', '10g Release 2', '2010-07-31'),
+        ('10.1', '10g Release 1', '2009-01-31'), ('9.2', '9i Release 2', '2007-07-31'), ('9.0', '9i Release 1', '2003-12-31'),
+    ],
+    "oracle-linux": [
+        ('10', '', '2035-06-30'), ('9', '', '2032-06-30'), ('8', '', '2029-07-31'),
+        ('7', '', '2024-12-31'), ('6', '', '2021-03-31'),
+    ],
+    "postgresql": [
+        ('18', '', '2030-11-14'), ('17', '', '2029-11-08'), ('16', '', '2028-11-09'),
+        ('15', '', '2027-11-11'), ('14', '', '2026-11-12'), ('13', '', '2025-11-13'),
+        ('12', '', '2024-11-21'), ('11', '', '2023-11-09'), ('10', '', '2022-11-10'),
+        ('9.6', '', '2021-11-11'), ('9.5', '', '2021-02-11'), ('9.4', '', '2020-02-13'),
+        ('9.3', '', '2018-11-08'), ('9.2', '', '2017-11-09'), ('9.1', '', '2016-10-27'),
+        ('9.0', '', '2015-10-08'), ('8.4', '', '2014-07-24'), ('8.3', '', '2013-02-07'),
+        ('8.2', '', '2011-12-05'), ('8.1', '', '2010-11-08'), ('8.0', '', '2010-10-01'),
+        ('7.4', '', '2010-10-01'), ('7.3', '', '2007-11-27'), ('7.2', '', '2007-02-04'),
+        ('7.1', '', '2006-04-13'), ('7.0', '', '2005-05-08'), ('6.5', '', '2004-06-09'),
+        ('6.4', '', '2003-10-30'), ('6.3', '', '2003-03-01'),
+    ],
+    "redis": [
+        ('8.10', '', False), ('8.8', '', False), ('8.6', '', False),
+        ('8.4', '', False), ('8.2', '', '2030-09-01'), ('8.0', '', '2026-12-01'),
+        ('7.4', '', '2029-12-01'), ('7.2', '', '2029-12-01'), ('7.0', '', '2024-07-29'),
+        ('6.2', '', '2027-04-01'), ('6.0', '', '2022-05-31'), ('5.0', '', '2022-04-27'),
+    ],
+    "rhel": [
+        ('10', '', '2035-05-31'), ('9', '', '2032-05-31'), ('8', '', '2029-05-31'),
+        ('7', '', '2024-06-30'), ('6', '', '2020-11-30'), ('5', '', '2017-03-31'),
+        ('4', '', '2012-02-29'),
+    ],
+    "rocky-linux": [
+        ('10', '', '2035-05-31'), ('9', '', '2032-05-31'), ('8', '', '2029-05-31'),
+    ],
+    "sles": [
+        ('16.0', '', '2027-11-30'), ('15.7', '', '2031-07-31'), ('15.6', '', '2025-12-31'),
+        ('15.5', '', '2024-12-31'), ('15.4', '', '2023-12-31'), ('15.3', '', '2022-12-31'),
+        ('15.2', '', '2021-12-31'), ('12.5', '', '2024-10-31'), ('15.1', '', '2021-01-31'),
+        ('12.4', '', '2020-06-30'), ('15.0', '', '2019-12-31'), ('12.3', '', '2019-06-30'),
+        ('12.2', '', '2018-03-31'), ('12.1', '', '2017-05-31'), ('11.4', '', '2019-03-31'),
+        ('12.0', '', '2016-06-30'), ('11.3', '', '2016-01-31'), ('11.2', '', '2014-01-31'),
+        ('10.4', '', '2013-07-31'), ('11.1', '', '2012-08-31'), ('10.3', '', '2011-10-11'),
+        ('11.0', '', '2010-12-31'), ('10.2', '', '2010-04-11'), ('10.1', '', '2008-11-30'),
+        ('10.0', '', '2007-12-31'),
+    ],
+    "solaris": [
+        ('11.4', '', '2031-11-01'), ('11.3', '', '2021-01-01'), ('11.2', '', True),
+        ('11.1', '', True), ('11', '', True), ('10', '', '2018-01-01'),
+        ('9', '', '2011-10-01'), ('8', '', '2009-03-01'),
+    ],
+    "tomcat": [
+        ('11.0', '', False), ('10.1', '', False), ('10.0', '', '2022-10-31'),
+        ('9.0', '', '2027-03-31'), ('8.5', '', '2024-03-31'), ('8.0', '', '2018-06-30'),
+        ('7', '', '2021-03-31'), ('6', '', '2016-12-31'), ('5', '', '2012-09-30'),
+    ],
+    "ubuntu": [
+        ('26.04', '', '2031-05-29'), ('25.10', '', '2026-07-01'), ('25.04', '', '2026-01-17'),
+        ('24.10', '', '2025-07-10'), ('24.04', '', '2029-05-31'), ('23.10', '', '2024-07-12'),
+        ('23.04', '', '2024-01-20'), ('22.10', '', '2023-07-20'), ('22.04', '', '2027-06-01'),
+        ('21.10', '', '2022-07-14'), ('21.04', '', '2022-01-20'), ('20.10', '', '2021-07-22'),
+        ('20.04', '', '2025-05-31'), ('19.10', '', '2020-07-06'), ('19.04', '', '2020-01-23'),
+        ('18.10', '', '2019-07-18'), ('18.04', '', '2023-05-31'), ('17.10', '', '2018-07-19'),
+        ('17.04', '', '2018-01-13'), ('16.10', '', '2017-07-20'), ('16.04', '', '2021-04-02'),
+        ('15.10', '', '2016-07-28'), ('15.04', '', '2016-02-04'), ('14.10', '', '2015-07-23'),
+        ('14.04', '', '2019-04-02'), ('13.10', '', '2014-07-17'), ('13.04', '', '2014-01-27'),
+        ('12.10', '', '2014-05-16'), ('12.04', '', '2017-04-28'), ('11.10', '', '2013-05-09'),
+        ('11.04', '', '2012-10-28'), ('10.10', '', '2012-04-10'), ('10.04', '', '2013-05-09'),
+        ('9.10', '', '2011-04-30'), ('9.04', '', '2010-10-23'), ('8.10', '', '2010-04-30'),
+        ('8.04', '', '2013-05-09'), ('7.10', '', '2009-04-18'), ('7.04', '', '2008-10-19'),
+        ('6.10', '', '2008-04-26'), ('6.06', '', '2011-06-01'), ('5.10', '', '2007-04-13'),
+        ('5.04', '', '2006-10-31'), ('4.10', '', '2006-04-30'),
+    ],
+    "windows-server": [
+        ('2025', '', '2034-11-14'), ('23h2-ac', 'Windows Server 23H2 AC', '2026-05-12'), ('2022', '', '2031-10-14'),
+        ('20h2-sac', 'Windows Server 20H2 SAC', '2022-08-09'), ('2004-sac', 'Windows Server 2004 SAC', '2021-12-14'), ('1909-sac', 'Windows Server 1909 SAC', '2021-05-11'),
+        ('1903-sac', 'Windows Server 1903 SAC', '2020-12-08'), ('1809-sac', 'Windows Server 1809 SAC', '2020-11-10'), ('2019', '', '2029-01-09'),
+        ('1803-sac', 'Windows Server 1803 SAC', '2019-11-12'), ('1709-sac', 'Windows Server 1709 SAC', '2019-04-09'), ('2016', '', '2027-01-12'),
+        ('2012-r2', 'Windows Server 2012 R2', '2023-10-10'), ('2012', '', '2023-10-10'), ('2008-r2-sp1', 'Windows Server 2008 R2 SP1', '2020-01-14'),
+        ('2008-sp2', 'Windows Server 2008 SP2', '2020-01-14'), ('2003-sp2', 'Windows Server 2003 SP2', '2015-07-14'), ('2003-sp1', 'Windows Server 2003 SP1', '2009-04-14'),
+        ('2003', '', '2007-04-10'), ('2000', '', '2010-07-13'),
+    ],
+}
 
 
 # ================================================================
 # CLI
 # ================================================================
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("사용법: python eos_checker.py <제품> <버전>")
-        print("예시:")
-        print("  python eos_checker.py oracle 19c")
-        print("  python eos_checker.py mysql 8.0")
-        print("  python eos_checker.py rhel 7")
-        print("  python eos_checker.py ubuntu 20.04")
-        print("  python eos_checker.py cisco-ios-xe 17.9")
-        print("  python eos_checker.py mssql 2016")
-        print("  python eos_checker.py tomcat 8.5")
-        print()
-        # 전체 현황 출력
-        print("=" * 65)
-        print(f"  EoS 전체 현황 ({CHECK_DATE} 기준)")
-        print("=" * 65)
-        all_items = []
-        for prod, versions in EOS_DB.items():
-            for ver, eol in sorted(versions.items()):
-                if eol:
-                    try:
-                        d = datetime.date.fromisoformat(eol + ("-01" if len(eol)==7 else "") + ("-01" if len(eol)==4 else ""))
-                        if d >= datetime.date(2020, 1, 1):
-                            all_items.append((prod, ver, eol, d))
-                    except: pass
-        all_items.sort(key=lambda x: x[3], reverse=True)
-        for prod, ver, eol, d in all_items[:30]:
-            passed = d < CHECK_DATE
-            flag = "✗ EoS" if passed else ("⚠ 임박" if (d - CHECK_DATE).days <= 90 else "  예정")
-            print(f"  {flag}  {prod:20} {ver:12} → {eol}")
-        sys.exit(0)
-
-    product = sys.argv[1]
-    version = sys.argv[2]
+    args = [a for a in sys.argv[1:] if a != "--no-api"]
     use_api = "--no-api" not in sys.argv
-
-    result, eol_date, desc = check_eos(product, version, use_api)
-
-    print(f"제품:   {product} {version}")
-    print(f"결과:   {result}")
-    print(f"EoS:    {eol_date or 'N/A'}")
-    print(f"설명:   {desc}")
+    if len(args) < 2:
+        print("사용법: python eos_checker.py [--no-api] <제품> <버전>")
+        print("  예) mysql 8.0.46 / postgresql 13.22 / amazon-linux 2 / rhel 7.9 / mssql 2016 / tomcat 9.0.85 / windows-server 2012r2")
+        print("=" * 70)
+        print(f"  EoS 현황 (판정 기준일 {CHECK_DATE}, 내장 데이터 {DATA_DATE}) - 최근 종료·임박 주기")
+        print("=" * 70)
+        rows = []
+        for slug, lst in EOL_SNAPSHOT.items():
+            for cyc, lab, eol in lst:
+                if isinstance(eol, str):
+                    d = datetime.date.fromisoformat(eol[:10])
+                    if datetime.date(2024, 1, 1) <= d <= CHECK_DATE + datetime.timedelta(days=365):
+                        rows.append((d, slug, lab or cyc))
+        for d, slug, c in sorted(rows, reverse=True):
+            flag = "종료" if d < CHECK_DATE else "예정"
+            print(f"  [{flag}] {slug:20} {c:28} {d}")
+        sys.exit(0)
+    r, e, d = check_eos(args[0], args[1], use_api)
+    print(f"제품:   {args[0]} {args[1]}")
+    print(f"결과:   {r}")
+    print(f"EoS:    {e or 'N/A'}")
+    print(f"설명:   {d}")
