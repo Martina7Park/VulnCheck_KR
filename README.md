@@ -11,15 +11,34 @@
 
 ---
 
-## 지원 점검 대상
+## 자체 커버 범위
 
-| 구분 | 항목코드 | 지원 유형 |
-|------|----------|-----------|
-| 서버 | SRV-xxx | Linux (RHEL/Ubuntu/Debian), AIX, HP-UX, Solaris, Windows |
-| 웹서버/WAS | WST-xxx | Apache, Nginx, WebtoB, IIS / Tomcat, JEUS |
-| 데이터베이스 | DBM-xxx | Oracle, MSSQL, MySQL, MariaDB, PostgreSQL, Tibero |
-| 네트워크 장비 | NET-xxx | Cisco IOS/IOS-XE, A10, Alteon, Juniper |
-| 보안장비 | ISS-xxx | 방화벽, VPN, IDS/IPS, DDoS, WAF |
+### 완전 자동 점검 (스크립트 실행 → 결과 txt → 엑셀 변환)
+
+| 구분 | 항목코드 | 점검 스크립트 | 지원 OS / 벤더 | 항목 수 |
+|------|----------|-------------|---------------|---------|
+| 서버 | SRV-xxx | `check_server.sh` | RHEL, CentOS, Ubuntu, SLES, Debian, Amazon Linux, AIX, HP-UX, Solaris | ~79개 |
+| | | `check_server.ps1` | Windows Server 전체 | ~93개 |
+| 웹서버/WAS | WST-xxx | `check_webwas.sh` | Apache, Nginx, WebtoB / Tomcat, JEUS | ~117개 |
+| | | `check_webwas.ps1` | IIS / Tomcat, JEUS | ~64개 |
+| 데이터베이스 | DBM-xxx | `check_dbms.sh` | Oracle, MySQL, MariaDB, PostgreSQL, Tibero | ~28개 |
+| | | `check_dbms_mssql.ps1` | MSSQL | ~25개 |
+| 네트워크 장비 | NET-xxx | convert_v4.py 내장 파싱 | Cisco IOS/IOS-XE/ASA, Juniper JunOS, Alteon/Radware, A10, Dell FTOS, D-Link (DGS/DES/DXS) | 45개 |
+| PC (업무용 단말) | PC-xx | `check_pc.ps1` | Windows 10/11 Home/Pro/Enterprise | 18개 |
+| | | `check_pc_mac.sh` | macOS 12~15 (Monterey~Sequoia) | 18개 |
+
+### 반자동 (config 파일 기반 점검 → 결과 txt → 엑셀 변환)
+
+| 구분 | 항목코드 | 점검 스크립트 | 지원 벤더/장비 | 항목 수 |
+|------|----------|-------------|---------------|---------|
+| 보안장비 | ISS-xxx | `check_security.sh` | FortiGate, Palo Alto, 일반 / FW, VPN, IDS, IPS, DDoS, WAF | 43개 |
+
+### 보조 모듈
+
+| 모듈 | 설명 |
+|------|------|
+| `check_patch.py` | 패치 현황 보조 점검 |
+| `eos_checker.py` | 서버/웹서버/DBMS 버전별 EoS(지원 종료) 자동 판정 |
 
 ---
 
@@ -41,8 +60,11 @@ pip install openpyxl
 ├── check_server.sh                        # 서버 점검 스크립트 (Linux/Unix)
 ├── check_server.ps1                       # 서버 점검 스크립트 (Windows PowerShell)
 ├── check_webwas.sh                        # 웹서버/WAS 점검 스크립트
+├── check_webwas.ps1                       # 웹서버/WAS 점검 스크립트 (Windows)
 ├── check_dbms.sh                          # DBMS 점검 스크립트 (Linux)
 ├── check_dbms_mssql.ps1                   # DBMS 점검 스크립트 (MSSQL/Windows)
+├── check_pc.ps1                           # PC 점검 스크립트 (Windows 10/11)
+├── check_pc_mac.sh                        # PC 점검 스크립트 (macOS 12~15)
 ├── check_patch.py                         # 패치 현황 점검 보조 스크립트
 ├── eos_checker.py                         # EoS(지원 종료) 자동 판정 모듈
 ├── 전자금융기반시설_보안_취약점_평가기준(제2026-1호).xlsx  # 기준 엑셀 (필수)
@@ -62,10 +84,14 @@ pip install openpyxl
 │   └── output/
 │       └── DB-ORA-01.txt
 │
-└── network/
-    ├── network_template.xlsx
-    └── config/                            # 네트워크 장비 config 파일 위치
-        └── ISR4461-CORE-01.txt
+├── network/
+│   ├── network_template.xlsx
+│   └── config/                            # 네트워크 장비 config 파일 위치
+│       └── ISR4461-CORE-01.txt
+│
+└── pc/
+    └── output/                            # PC 점검 결과 txt 파일 위치
+        └── PC-DESK-01.txt
 ```
 
 ---
@@ -97,6 +123,16 @@ powershell -ExecutionPolicy Bypass -File check_server.ps1 > C:\Temp\hostname_ser
 powershell -ExecutionPolicy Bypass -File check_dbms_mssql.ps1 > C:\Temp\hostname_dbms.txt
 ```
 
+**PC (Windows 10/11 PowerShell)**
+```powershell
+powershell -ExecutionPolicy Bypass -File check_pc.ps1 > C:\Temp\PC_%COMPUTERNAME%.txt
+```
+
+**PC (macOS)**
+```bash
+bash check_pc_mac.sh > ~/Desktop/$(hostname)_pc.txt
+```
+
 결과 파일(.txt)을 해당 카테고리의 `output/` 폴더 또는 `config/` 폴더에 복사합니다.
 
 ### 2단계: 컨버터 실행
@@ -118,6 +154,7 @@ python convert_v4.py
   3. 데이터베이스
   4. 네트워크 장비
   5. 보안장비
+  6. PC(업무용 단말)
 ```
 
 ### 3단계: 결과 확인
@@ -177,8 +214,10 @@ Excel 출력은 서버별 개별 시트 + 전체 요약 시트로 구성됩니�
 ## 네트워크 장비 config 파일
 
 네트워크 장비는 `check_*` 스크립트 대신 장비 config 파일을 직접 사용합니다.
-`network/config/` 폴더에 장비명.txt 형태로 저장하면 벤더(Cisco/Juniper/Alteon/A10)를
+`network/config/` 폴더에 장비명.txt 형태로 저장하면 벤더(Cisco/Juniper/Alteon/A10/D-Link)를
 자동으로 탐지하여 분석합니다.
+
+D-Link 장비(DGS/DES/DXS 시리즈)는 `show config` 출력을 저장하면 됩니다.
 
 ---
 
