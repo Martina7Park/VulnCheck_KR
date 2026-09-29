@@ -1771,6 +1771,7 @@ check_SRV177() {
 check_SRV179() {
     evd "SRV-179" "uname -srm; cat /etc/os-release 2>/dev/null | head -5; oslevel -s 2>/dev/null; swlist -l product 2>/dev/null | grep -E '^\s*HP-UX' | head -3; pkg info entire 2>/dev/null | grep -iE 'version|branch'; cat /etc/release 2>/dev/null | head -2"
     EOS_SCRIPT="$(dirname "$0")/eos_checker.py"
+    [ -f "$EOS_SCRIPT" ] || EOS_SCRIPT="$(dirname "$0")/../../converter/eos_checker.py"   # 저장소 구조 그대로 실행 시
     [ ! -f "$EOS_SCRIPT" ] && {
         result "SRV-179|수동확인|eos_checker.py 없음 - 수동 확인 필요"
         return
@@ -4200,6 +4201,7 @@ check_upload
 # WST-126: EoS 시스템 교체 (자동 판정)
 evd "WST-126" "httpd -v 2>/dev/null; nginx -v 2>&1; cat ${TOMCAT_HOME:-/dev/null}/RELEASE-NOTES 2>/dev/null | head -3"
 EOS_SCRIPT="$(dirname "$0")/eos_checker.py"
+[ -f "$EOS_SCRIPT" ] || EOS_SCRIPT="$(dirname "$0")/../../converter/eos_checker.py"   # 저장소 구조 그대로 실행 시
 check_webwas_eos() {
     local product="$1" version="$2"
     [ -f "$EOS_SCRIPT" ] || { result "WST-126|수동확인|eos_checker.py 없음"; return; }
@@ -5077,6 +5079,7 @@ _merge_hold "WST-080" "수동확인" "웹 제품 보안패치 확인 필요 (Apa
 # WST-126: EoS (OS 판정 + 웹서버/WAS 제품 EoS 병합)
 evd "WST-126" "httpd -v 2>/dev/null || apache2 -v 2>/dev/null || nginx -v 2>&1; cat ${TOMCAT_HOME:-/dev/null}/RELEASE-NOTES 2>/dev/null | grep -i 'Tomcat Version'"
 EOS_SCRIPT="$(dirname "$0")/eos_checker.py"
+[ -f "$EOS_SCRIPT" ] || EOS_SCRIPT="$(dirname "$0")/../../converter/eos_checker.py"   # 저장소 구조 그대로 실행 시
 _eos_one() {
     local p="$1" v="$2" r d
     [ -n "$v" ] || { echo "수동확인|${p} 버전 확인 실패"; return; }

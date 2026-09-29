@@ -1,7 +1,10 @@
-﻿*.xlsx
+# 기준 엑셀·결과 보고서·점검 결과(txt)는 저장소에 올리지 않음
+*.xlsx
 *.pdf
-server/output/
-dbms/output/
-webwas/output/
-network/output/
 *.txt
+!scripts/network/README.txt
+
+# 컨버터 작업 폴더 (converter/ 아래에 생성)
+converter/*/output/
+converter/network/config/
+converter/logs/

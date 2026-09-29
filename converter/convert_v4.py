@@ -9,26 +9,21 @@
 # [사용법]
 #   python convert_v4.py
 #   → 1. 평가 기반 선택  (1: 전자금융 / 2: 주요정보)
-#   → 2. 점검 대상 선택  (1: 서버 / 2: 웹WAS / 3: DBMS / 4: 네트워크 / 5: 보안장비)
+#   → 2. 점검 대상 선택  (1: 서버 / 2: 웹WAS / 3: DBMS / 4: 네트워크 / 5: 보안장비 / 6: PC / 7: EoS 현황)
 #
-# [폴더 구조]
-#   convert/
-#   #── convert_v4.py
-#   #── 전자금융기반시설_보안_취약점_평가기준_제2026-1호.xlsx  ← 기준 엑셀
-#   #── server/
-#   #   #── template.xlsx          ← 결과 기입할 엑셀 (기준 엑셀 복사본)
-#   #   #── output/                ← check_server.sh 실행 결과 txt 파일
-#   #       #── WEB-PROD-01.txt
-#   #       #── DB-PROD-01.txt
-#   #── webwas/
-#   #   #── template.xlsx
-#   #   #── output/
-#   #── dbms/
-#   #   #── template.xlsx
-#   #   #── output/
-#   #── network/
-#       #── template.xlsx
-#       #── config/                ← 네트워크 장비 config 파일 (기존 방식)
+# [폴더 구조]  (이 파일이 있는 폴더 기준)
+#   converter/
+#   ├── convert_v4.py
+#   ├── eos_checker.py · kisa26_cases.json
+#   ├── 전자금융기반시설_보안_취약점_평가기준(제2026-1호).xlsx  ← 기준 엑셀
+#   ├── server/output/      ← 서버 점검 결과 txt (+ *_evidence.txt)
+#   ├── webwas/output/
+#   ├── dbms/output/
+#   ├── network/config/     ← 네트워크 장비 config
+#   ├── security/output/
+#   ├── pc/output/
+#   └── logs/               ← 감사 로그 (자동 생성)
+#   카테고리별 template.xlsx 는 없으면 기준 엑셀로 자동 생성
 #
 # [점검 스크립트 출력 형식]
 #   항목코드|결과|근거설명
