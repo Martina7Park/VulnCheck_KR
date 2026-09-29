@@ -325,7 +325,7 @@ else { Pass "015" "public 역할에 기본 외 권한 없음" }
 # eos_checker.py 활용
 EvdQ "DBM-016" "SQL Server version / ProductUpdateLevel / ProductUpdateReference" "$verNum ($build) / $(Run-Q "SELECT CAST(SERVERPROPERTY('ProductLevel') AS varchar)+' '+ISNULL(CAST(SERVERPROPERTY('ProductUpdateLevel') AS varchar),'-')+' '+ISNULL(CAST(SERVERPROPERTY('ProductUpdateReference') AS varchar),'-')")"
 $eosScript = Join-Path (Split-Path $MyInvocation.MyCommand.Path) "eos_checker.py"
-if (-not (Test-Path $eosScript)) { $eosScript = Join-Path $script:ScriptDir "..\..\converter\eos_checker.py" }   # 저장소 구조 그대로 실행 시
+if (-not (Test-Path $eosScript)) { $eosScript = Join-Path $script:ScriptDir "..\converter\eos_checker.py" }   # 저장소 구조 그대로 실행 시
 if (Test-Path $eosScript) {
     $py = @('py','python','python3') | Where-Object { Get-Command $_ -EA SilentlyContinue } | Select-Object -First 1
     $eosResult = if ($py) { & $py $eosScript "mssql" $verNum 2>$null } else { $null }

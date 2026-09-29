@@ -1929,7 +1929,7 @@ if ($WAS_SRV -eq "tomcat" -and $TOMCAT_HOME -and (Test-Path "$TOMCAT_HOME\conf\s
     }
     if ($tcVer) {
         $eosScript = Join-Path (Split-Path $MyInvocation.MyCommand.Path) "eos_checker.py"
-        if (-not (Test-Path $eosScript)) { $eosScript = Join-Path $script:ScriptDir "..\..\converter\eos_checker.py" }   # 저장소 구조 그대로 실행 시
+        if (-not (Test-Path $eosScript)) { $eosScript = Join-Path $script:ScriptDir "..\converter\eos_checker.py" }   # 저장소 구조 그대로 실행 시
         if (Test-Path $eosScript) {
             $eosResult  = python3 $eosScript "tomcat" $tcVer 2>$null
             $eosStatus  = ($eosResult | Where-Object {$_ -match "^결과:"}) -replace "결과:\s*",""
