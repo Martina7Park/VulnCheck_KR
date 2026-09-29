@@ -55,7 +55,10 @@ _XL_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")   # 엑셀 셀에 쓸 
 
 def read_text(path):
     """결과·증적 파일 읽기 (인코딩 자동 판별, 엑셀 불가 제어 문자 제거)"""
-    for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr", "latin-1"):
+    with open(path, "rb") as f:
+        bom = f.read(2)
+    encs = ("utf-16",) if bom in (b"\xff\xfe", b"\xfe\xff") else ()   # PowerShell 5.1 '>' 리다이렉트 = UTF-16LE
+    for enc in encs + ("utf-8-sig", "utf-8", "cp949", "euc-kr", "latin-1"):
         try:
             with open(path, encoding=enc) as f:
                 return _XL_ILLEGAL.sub("", f.read())
@@ -5218,7 +5221,7 @@ def _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items):
             g = groups.setdefault(key, {"secs": secs, "hosts": []})
             g["hosts"].append(f"{host}({rv})")
     rank = {"상": 0, "중": 1, "하": 2}
-    rows = sorted(groups.items(), key=lambda kv: (rank.get((criteria_items.get(kv[0][0]) or {}).get("risk", ""), 9), _code_sort_key(kv[0][0]) if "_code_sort_key" in globals() else kv[0][0]))
+    rows = sorted(groups.items(), key=lambda kv: (rank.get((criteria_items.get(kv[0][0]) or {}).get("risk", ""), 9), kv[0][0]))
     ws = wb.create_sheet(SECURITY_GUIDE_SHEET)
     if REVIEW_SHEET in wb.sheetnames:   # 검토·수정 바로 뒤
         wb.move_sheet(SECURITY_GUIDE_SHEET, offset=wb.sheetnames.index(REVIEW_SHEET) + 1 - wb.sheetnames.index(SECURITY_GUIDE_SHEET))

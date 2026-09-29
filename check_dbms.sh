@@ -748,8 +748,8 @@ check_mysql() {
     else
         [ -z "$MYSQL_PASS" ] && [ -t 0 ] && { read -rs -p "MySQL ${MYSQL_USER} 비밀번호: " MYSQL_PASS </dev/tty; echo >&2; }
         _MYSQL_CNF=$(mktemp /tmp/.dbm_check_XXXXXX.cnf 2>/dev/null || echo "/tmp/.dbm_check_$$.cnf")
+        (umask 077; printf '[client]\nuser=%s\n%s\n' "$MYSQL_USER" "${MYSQL_PASS:+password=$MYSQL_PASS}" > "$_MYSQL_CNF")
         chmod 600 "$_MYSQL_CNF" 2>/dev/null
-        printf '[client]\nuser=%s\n%s\n' "$MYSQL_USER" "${MYSQL_PASS:+password=$MYSQL_PASS}" > "$_MYSQL_CNF"
         trap "rm -f '$_MYSQL_CNF'" EXIT
         OPTS="--defaults-extra-file=${_MYSQL_CNF} $_base -N --batch"
     fi
