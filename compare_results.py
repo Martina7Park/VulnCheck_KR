@@ -53,7 +53,10 @@ BD = Border(
 
 
 def read_text(path):
-    for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr", "latin-1"):
+    with open(path, "rb") as f:
+        bom = f.read(2)
+    encs = ("utf-16",) if bom in (b"\xff\xfe", b"\xfe\xff") else ()   # PowerShell 5.1 '>' 리다이렉트 = UTF-16LE
+    for enc in encs + ("utf-8-sig", "utf-8", "cp949", "euc-kr", "latin-1"):
         try:
             with open(path, encoding=enc) as f:
                 return f.read()
