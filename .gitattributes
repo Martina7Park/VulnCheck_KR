@@ -1,3 +1,0 @@
-# 통합 점검 파일은 생성된 바이트 그대로 유지 (check_all.bat 은 CRLF 필수)
-all/check_all.bat -text
-all/check_all.sh -text
