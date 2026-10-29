@@ -13,11 +13,11 @@
 
 ```bash
 pip install openpyxl          # 최초 1회 (Windows: install_prereq.bat)
-python convert_v4.py          # 기준(전자금융/주요정보) → 대상(서버·웹WAS·DBMS·네트워크·보안장비·PC) 선택
+python convert_v4.py          # 기준(전자금융/주요정보) → 대상(서버·웹WAS·DBMS·네트워크·보안장비·PC·가상화) 선택
 ```
 
 이 폴더에 기준 엑셀(`전자금융기반시설_보안_취약점_평가기준(제2026-1호).xlsx`)을 두고, 결과를 아래 폴더에 넣습니다 (없으면 만드세요).
 
 ```
-server/output/   webwas/output/   dbms/output/   security/output/   pc/output/   network/config/
+server/output/   webwas/output/   dbms/output/   security/output/   pc/output/   hypervisor/output/   network/config/
 ```

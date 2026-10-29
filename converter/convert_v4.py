@@ -137,6 +137,7 @@ SHEET_MAP = {
     "network": "네트워크 장비",
     "security":"정보보호시스템 장비",
     "pc":      None,   # PC는 기준 엑셀에 시트 없음 → 코드 내장 항목 사용
+    "hypervisor": None,   # 가상화(ESXi)도 기준 엑셀·2026 가이드에 없음 → 코드 내장 항목(HV_ITEMS)
 }
 
 # PC 점검 항목 정의 (기준 엑셀에 없으므로 코드에서 관리)
@@ -4904,6 +4905,7 @@ FILL_LIGHT_BLUE = PatternFill("solid", fgColor="D6E4F0")
 CAT_LABEL = {
     "server":"서버", "webwas":"웹/WAS", "dbms":"DBMS",
     "network":"네트워크 장비", "security":"보안장비", "pc":"PC(업무용 단말)",
+    "hypervisor":"가상화(ESXi)",
 }
 
 
@@ -4935,6 +4937,8 @@ def _parse_header_info(text):
             info["date"] = v
         elif "점검 기준" in k:
             info["standard"] = v
+        elif kl in ("ip", "ip 주소", "관리 ip"):
+            info["ip"] = v if re.match(r"^[0-9a-fA-F.:]+$", v) else ""
         elif "dbms" in kl or "dbms 종류" in k:
             info["dbms"] = v
         elif "버전" in k and not info.get("version"):
@@ -4944,6 +4948,22 @@ def _parse_header_info(text):
     if info.get("os_detail"):   # 점검대상 시트 O/S: 배포판 이름·버전 (+커널)
         info["os"] = info["os_detail"] + (f" (커널 {info['kernel']})" if info.get("kernel") else "")
     return info
+
+
+_GENERIC_HOST = re.compile(r"^(localhost|localhost\d*\.\S*|localhost6\S*)$", re.I)
+
+
+def _host_key(all_results, host_ips, hinfo):
+    """보고서 대상 식별 키(=호스트명). 같은 호스트명이라도 결과 헤더 IP 가 다르면 별도 대상 '호스트명(IP)'
+    (localhost.localdomain 등 기본 호스트명, 서로 다른 서버의 같은 이름) — 같은 IP 결과끼리만 병합"""
+    h, ip = hinfo["hostname"], (hinfo.get("ip") or "").strip()
+    if ip and ip not in h and (_GENERIC_HOST.match(h) or (h in all_results and host_ips.get(h, ip) != ip)):
+        h = f"{h}({ip})"
+        print(f"[INFO] 호스트명 '{hinfo['hostname']}' 중복/기본값 → IP 로 구분: {h}")
+    hinfo["hostname"] = h
+    if ip:
+        host_ips.setdefault(h, ip)
+    return h
 
 
 # ================================================================
@@ -5447,7 +5467,10 @@ def _create_overview_sheet(wb, mode, category, hosts_info, criteria_items=None, 
 
     r = 4
     ws.merge_cells(f"B{r}:P{r}")
-    if mode == "EF":
+    if category == "hypervisor":
+        basis = (f"{'전자금융기반시설 보안 취약점 평가기준(제2026-1호)' if mode == 'EF' else '주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드(2026)'}을 준용한 "
+                 "가상화(VMware ESXi) 자체 점검 항목(VMware vSphere 보안 구성 가이드·CIS ESXi 벤치마크 기반)")
+    elif mode == "EF":
         basis = ("전자금융기반시설 보안 취약점 평가기준(제2026-1호)을 준용한 PC 자체 점검 항목(평가기준에 PC 분야 없음)"
                  if category == "pc" else "전자금융기반시설 보안 취약점 평가기준(제2026-1호)")
     else:   # 주요정보: 2026 상세가이드 (PC 도 가이드 PC-01~18)
@@ -7241,6 +7264,7 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
     all_results = {}
     evidences   = {}
     hosts_info  = []
+    host_ips    = {}
 
     for fname in input_files:
         pure = os.path.splitext(fname)[0]
@@ -7291,11 +7315,11 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
                     forced += 1
             if forced:
                 print(f"[INFO] {fname} → 평가대상 아닌 항목 {forced}건 N-A 보정")
-        if mode == "MI":   # 가이드 항목 변환 후 현황 구성
-            evidences[hinfo["hostname"]] = evidence
+        _h = _host_key(all_results, host_ips, hinfo)
+        if mode == "MI":   # 가이드 항목 변환 후 현황 구성 (같은 호스트 여러 결과 파일 → 증적 누적)
+            evidences[_h] = {**evidences.get(_h, {}), **(evidence or {})}
         else:
             res = compose_status(res, evidence, criteria_items, detected_sub)
-        _h = hinfo["hostname"]
         if _h in all_results:   # 같은 호스트 결과 파일이 여럿(전자금융 + 주요정보 전용 스크립트 등) → 판정·증적 병합, 대상 1대 (파일 순서 무관)
             _old_res, _old_sub = all_results[_h]
             res = {**_old_res, **res}
@@ -7565,6 +7589,225 @@ def _pc_items_as_criteria():
     return items
 
 
+# ================================================================
+# 가상화(VMware ESXi) — 기준 엑셀·2026 상세가이드에 없는 분야 → 코드 내장 항목 (virtualization/check_esxi.sh 결과)
+# 항목 근거: VMware vSphere 보안 구성 가이드(SCG)·CIS VMware ESXi 벤치마크, 판단 수치는 국내 기준에 맞춤
+# 기관 기준표에 가상화 항목이 따로 있으면 아래 항목명·판단기준을 그에 맞춰 조정 (스크립트 판정 수치도 함께)
+# ================================================================
+HV_ITEMS = {   # 코드: (중요도, 통제 분야, 항목명, 양호 기준, 취약 기준, 조치 방법)
+    "ESX-01": ("상", "계정 관리", "불필요한 로컬 계정 제거",
+               "기본 계정(root·dcui·vpxuser) 외 불필요한 로컬 계정이 없는 경우",
+               "퇴직자·공용·미사용 등 불필요한 로컬 계정이 존재하는 경우",
+               "esxcli system account list 로 계정 확인 후 불필요 계정 삭제: esxcli system account remove -i <계정>"),
+    "ESX-02": ("상", "계정 관리", "비밀번호 복잡성 설정",
+               "영문·숫자·특수문자 3종류 8자 이상 또는 2종류 10자 이상으로 비밀번호 복잡성 정책이 설정된 경우",
+               "비밀번호 복잡성 정책이 기준에 미달하는 경우 (ESXi 기본값 min=disabled,disabled,disabled,7,7 포함)",
+               "esxcli system settings advanced set -o /Security/PasswordQualityControl -s \"retry=3 min=disabled,disabled,disabled,8,8\"\n(Host Client [관리]→[시스템]→[고급 설정] Security.PasswordQualityControl)"),
+    "ESX-03": ("중", "계정 관리", "비밀번호 최대 사용 기간 설정",
+               "비밀번호 최대 사용 기간이 90일 이하로 설정된 경우",
+               "비밀번호 최대 사용 기간이 90일을 초과하거나 제한이 없는 경우",
+               "esxcli system settings advanced set -o /Security/PasswordMaxDays -i 90"),
+    "ESX-04": ("중", "계정 관리", "비밀번호 재사용 제한",
+               "최근 사용한 비밀번호 5개 이상 재사용을 금지한 경우",
+               "최근 비밀번호 재사용 제한이 5개 미만인 경우",
+               "esxcli system settings advanced set -o /Security/PasswordHistory -i 5"),
+    "ESX-05": ("상", "계정 관리", "계정 잠금 임계값 설정",
+               "로그인 실패 5회 이하에서 계정이 잠기도록 설정된 경우",
+               "계정 잠금을 사용하지 않거나 임계값이 5회를 초과하는 경우",
+               "esxcli system settings advanced set -o /Security/AccountLockFailures -i 5\nesxcli system settings advanced set -o /Security/AccountUnlockTime -i 900"),
+    "ESX-06": ("상", "계정 관리", "AD 연동 관리자 그룹 자동 권한 제한",
+               "AD 미연동이거나, 연동 시 'ESX Admins' 그룹 자동 관리자 권한을 해제(또는 관리 그룹명 변경)한 경우",
+               "AD 연동 상태에서 기본 'ESX Admins' 그룹에 자동으로 관리자 권한이 부여되는 경우 (CVE-2024-37085)",
+               "esxcli system settings advanced set -o /Config/HostAgent/plugins/hostsvc/esxAdminsGroupAutoAdd -i 0\n"
+               "또는 esxcli system settings advanced set -o /Config/HostAgent/plugins/hostsvc/esxAdminsGroup -s \"<관리 전용 그룹>\"\nESXi 8.0 U3 / 7.0 U3q 이상 패치 적용"),
+    "ESX-07": ("상", "서비스 관리", "SSH 서비스 상시 활성화 제한",
+               "SSH 서비스 시작 정책이 수동(off)이고 작업 시에만 실행하며, root 공개키 등록이 없거나 용도가 관리되는 경우",
+               "SSH 서비스가 호스트와 함께 자동 시작되도록 설정된 경우",
+               "Host Client [관리]→[서비스]→TSM-SSH → 정책 '수동으로 시작 및 중지', 작업 후 중지\n"
+               "vim-cmd hostsvc/disable_ssh ; vim-cmd hostsvc/stop_ssh\n불필요한 키: /etc/ssh/keys-root/authorized_keys 정리"),
+    "ESX-08": ("상", "서비스 관리", "ESXi Shell 상시 활성화 제한",
+               "ESXi Shell 시작 정책이 수동(off)이고 작업 시에만 실행하는 경우",
+               "ESXi Shell 이 호스트와 함께 자동 시작되도록 설정된 경우",
+               "vim-cmd hostsvc/disable_esx_shell ; vim-cmd hostsvc/stop_esx_shell"),
+    "ESX-09": ("상", "서비스 관리", "SLP 서비스 비활성화",
+               "SLP(slpd) 서비스가 중지되고 자동 시작되지 않는 경우 (또는 서비스 없음)",
+               "SLP 서비스가 실행 중이거나 자동 시작되는 경우 (OpenSLP 원격 코드 실행 CVE-2021-21974, ESXiArgs 랜섬웨어)",
+               "/etc/init.d/slpd stop\nesxcli network firewall ruleset set -r CIMSLP -e 0\nchkconfig slpd off"),
+    "ESX-10": ("중", "서비스 관리", "SNMP 서비스 보안 설정",
+               "SNMP 를 사용하지 않거나, SNMPv3 또는 추측하기 어려운 커뮤니티 문자열(8자 이상, public/private 아님)을 사용하는 경우",
+               "SNMP 커뮤니티 문자열이 기본값(public/private)이거나 8자 미만인 경우",
+               "미사용: esxcli system snmp set -e no\n사용: esxcli system snmp set -c <복잡한 문자열> 또는 SNMPv3 사용자(-u)·인증(-a)·암호화(-x) 설정"),
+    "ESX-11": ("중", "서비스 관리", "MOB(Managed Object Browser) 비활성화",
+               "MOB 가 비활성화된 경우",
+               "MOB 가 활성화되어 https://<호스트>/mob 로 내부 객체에 접근 가능한 경우",
+               "esxcli system settings advanced set -o /Config/HostAgent/plugins/solo/enableMob -i 0"),
+    "ESX-12": ("하", "서비스 관리", "불필요한 CIM 서비스 비활성화",
+               "CIM(sfcbd) 서비스를 사용하지 않거나 하드웨어 모니터링 용도로만 사용하는 경우",
+               "불필요한 CIM 서비스가 실행 중인 경우",
+               "esxcli system wbem set -e 0  (서버 벤더 모니터링 도구가 필요하면 예외 근거 기록)"),
+    "ESX-13": ("상", "접근 통제", "방화벽 사용 및 관리 서비스 접근 IP 제한",
+               "ESXi 방화벽이 사용(기본 DROP)되고 SSH·vSphere Client·웹 접근 서비스가 허용 IP 로 제한된 경우",
+               "방화벽이 비활성화되었거나 관리 서비스가 모든 IP(All)에서 접근 가능한 경우",
+               "esxcli network firewall ruleset set -r sshServer -a false\n"
+               "esxcli network firewall ruleset allowedip add -r sshServer -i <관리자 대역>\n"
+               "(vSphereClient·webAccess 도 동일, vCenter IP 포함)"),
+    "ESX-14": ("중", "접근 통제", "잠금 모드(Lockdown Mode) 설정",
+               "vCenter 관리 호스트에 일반(Normal) 이상 잠금 모드가 설정된 경우",
+               "vCenter 관리 호스트에 잠금 모드를 사용하지 않는 경우",
+               "vCenter [호스트]→[구성]→[시스템]→[보안 프로파일]→잠금 모드 '일반', 예외 사용자 최소화"),
+    "ESX-15": ("중", "접근 통제", "세션 타임아웃 설정",
+               "ESXi Shell 유휴 600초·Shell 가용 3600초·DCUI 600초·Host Client 900초 이하로 설정된 경우",
+               "세션 타임아웃이 설정되지 않았거나(0) 기준을 초과하는 경우",
+               "esxcli system settings advanced set -o /UserVars/ESXiShellInteractiveTimeOut -i 600\n"
+               "esxcli system settings advanced set -o /UserVars/ESXiShellTimeOut -i 600\n"
+               "esxcli system settings advanced set -o /UserVars/DcuiTimeOut -i 600"),
+    "ESX-16": ("하", "접근 통제", "로그온 경고 메시지 설정",
+               "DCUI·Host Client 또는 SSH 로그온 화면에 비인가 사용 금지 경고 메시지가 설정된 경우",
+               "로그온 경고 메시지가 설정되지 않은 경우",
+               "esxcli system settings advanced set -o /Annotations/WelcomeMessage -s \"<경고 문구>\"\n"
+               "esxcli system settings advanced set -o /Config/Etc/issue -s \"<경고 문구>\""),
+    "ESX-17": ("중", "접근 통제", "취약한 TLS 프로토콜 비활성화",
+               "SSLv3·TLS 1.0·TLS 1.1 이 비활성화되고 TLS 1.2 이상만 사용하는 경우",
+               "SSLv3·TLS 1.0·TLS 1.1 중 하나라도 허용된 경우",
+               "esxcli system settings advanced set -o /UserVars/ESXiVPsDisabledProtocols -s \"sslv3,tlsv1,tlsv1.1\" 후 재부팅 (ESXi 6.7·7.0)"),
+    "ESX-18": ("중", "접근 통제", "관리 네트워크 분리",
+               "관리 VMkernel 이 가상머신 네트워크와 분리된 VLAN·물리망을 사용하는 경우",
+               "관리 VMkernel 포트그룹과 가상머신 포트그룹이 같은 vSwitch·VLAN 에 있는 경우",
+               "관리(Management) VMkernel 을 전용 VLAN 포트그룹(또는 전용 vSwitch·업링크)으로 이동, 상위 스위치에서 관리망 접근 통제"),
+    "ESX-19": ("중", "접근 통제", "가상 스위치 보안 정책 설정",
+               "표준 vSwitch·포트그룹의 무차별 모드·MAC 주소 변경·위조 전송이 모두 거부(Reject)된 경우",
+               "무차별 모드·MAC 주소 변경·위조 전송 중 하나라도 허용(Accept)된 경우 (업무상 필요 근거 없는 경우)",
+               "esxcli network vswitch standard policy security set -v <vSwitch> -p false -m false -f false\n"
+               "esxcli network vswitch standard portgroup policy security set -p \"<포트그룹>\" -o false -m false -f false\n(분산 스위치는 vCenter 에서 설정)"),
+    "ESX-20": ("중", "접근 통제", "iSCSI CHAP 인증 설정",
+               "iSCSI 미사용이거나 CHAP(상호 CHAP 권고) 인증을 사용하는 경우",
+               "iSCSI 어댑터에 CHAP 인증을 사용하지 않는 경우",
+               "esxcli iscsi adapter auth chap set -A <vmhba> -d uni -l required -N <이름> -S <비밀값>"),
+    "ESX-21": ("중", "로그 관리", "원격 로그 서버 설정",
+               "Syslog 로 원격(중앙) 로그 서버에 로그를 전송하는 경우",
+               "원격 로그 서버가 설정되지 않았거나 방화벽 syslog 규칙이 비활성화된 경우",
+               "esxcli system syslog config set --loghost=udp://<로그서버>:514\nesxcli network firewall ruleset set -r syslog -e true\nesxcli system syslog reload"),
+    "ESX-22": ("중", "로그 관리", "로그 영구 저장소 설정",
+               "로그가 데이터스토어 등 영구 저장소에 저장되는 경우",
+               "로그가 휘발성 저장소(ramdisk·/tmp)에 저장되어 재부팅 시 소실되는 경우",
+               "esxcli system syslog config set --logdir=/vmfs/volumes/<데이터스토어>/log/<호스트>\nesxcli system syslog reload"),
+    "ESX-23": ("중", "로그 관리", "NTP 시간 동기화 설정",
+               "NTP(또는 PTP) 시간 동기화가 설정되어 동작하는 경우",
+               "시간 동기화가 설정되지 않았거나 서비스가 동작하지 않는 경우",
+               "esxcli system ntp set -s <NTP 서버> -e true  (ESXi 7.0 U1 이상)\n이전 버전: Host Client [관리]→[시스템]→[시간 및 날짜]"),
+    "ESX-24": ("상", "패치 관리", "지원 종료(EoS) 버전 사용 금지",
+               "Broadcom 일반 지원 기간 내 ESXi 버전을 사용하는 경우",
+               "일반 지원이 종료된 ESXi 버전을 사용하는 경우 (6.7 이하: 2022-10-15, 7.0: 2025-10-02 종료)",
+               "지원 버전(ESXi 8.0 U3 이상)으로 업그레이드 (하드웨어 호환성 목록 확인)"),
+    "ESX-25": ("상", "패치 관리", "최신 보안 패치 적용",
+               "VMware 보안 권고(VMSA)의 최신 보안 패치가 적용된 경우",
+               "최신 보안 패치가 적용되지 않았거나 1년 이상 패치 이력이 없는 경우",
+               "Broadcom 지원 포털에서 최신 패치 다운로드 → esxcli software profile update -d <zip> -p <프로파일>\n(vCenter 사용 시 vSphere Lifecycle Manager)"),
+    "ESX-26": ("상", "가상화 보안", "VIB 허용 수준 설정",
+               "VIB 허용 수준이 PartnerSupported 이상(VMwareCertified·VMwareAccepted·PartnerSupported)인 경우",
+               "VIB 허용 수준이 CommunitySupported 인 경우",
+               "esxcli software acceptance set --level=PartnerSupported (커뮤니티 VIB 제거 후)"),
+    "ESX-27": ("중", "가상화 보안", "비인가 실행 파일 차단",
+               "설치된 VIB 외 실행 파일 실행이 차단(execInstalledOnly=TRUE)된 경우",
+               "임의 실행 파일 실행이 허용(execInstalledOnly=FALSE)된 경우",
+               "esxcli system settings kernel set -s execInstalledOnly -v TRUE 후 재부팅 (ESXi 8.0: esxcli system settings encryption set --require-exec-installed-only=T)"),
+    "ESX-28": ("하", "가상화 보안", "가상머신 콘솔 복사·붙여넣기 제한",
+               "가상머신 콘솔 복사·붙여넣기·끌어놓기가 차단(기본값 유지)된 경우",
+               "가상머신 설정(.vmx)에서 콘솔 복사·붙여넣기·끌어놓기를 허용한 경우",
+               "가상머신 [설정 편집]→[VM 옵션]→[고급]→[구성 매개 변수]\nisolation.tools.copy.disable / paste.disable / dnd.disable = TRUE"),
+    "ESX-29": ("하", "가상화 보안", "가상머신 간 메모리 페이지 공유 제한",
+               "Mem.ShareForceSalting 이 2 로 설정되어 가상머신 간 페이지 공유가 제한된 경우",
+               "Mem.ShareForceSalting 이 0 또는 1 로 가상머신 간 페이지 공유를 허용하는 경우",
+               "esxcli system settings advanced set -o /Mem/ShareForceSalting -i 2"),
+    "ESX-30": ("하", "가상화 보안", "dvFilter 네트워크 API 제한",
+               "dvFilter 네트워크 API 를 사용하지 않거나 보안 어플라이언스 용도로만 사용하는 경우",
+               "불필요하게 dvFilter 바인드 주소(Net.DVFilterBindIpAddress)가 설정된 경우",
+               "esxcli system settings advanced set -o /Net/DVFilterBindIpAddress -s \"\""),
+}
+HV_EOS_CODE = "ESX-24"
+
+
+def _hv_items_as_criteria():
+    """HV_ITEMS → criteria_items 호환 형식 (판단기준·조치방법은 GENERIC 열)"""
+    risk_map = {"상": "4.0", "중": "3.0", "하": "2.0"}
+    items = {}
+    for code, (risk, area, name, good, bad, fix) in HV_ITEMS.items():
+        items[code] = {
+            "name":         name,
+            "risk":         risk_map.get(risk, risk),
+            "desc":         "",
+            "control_area": area,
+            "control_sub":  "",
+            "applies_to":   {},
+            "criteria_by":  {"GENERIC": {"기준": f"* 양호 : {good}\n* 취약 : {bad}", "방법": fix}},
+            "fix":          fix,
+        }
+    return items
+
+
+def run_hv_convert(mode, base_dir):
+    """가상화(ESXi) 점검 결과 변환 (기준 엑셀 없이 코드 내장 항목, 전자금융·주요정보 공통)"""
+    category  = "hypervisor"
+    cat_dir   = os.path.join(base_dir, category)
+    input_dir = os.path.join(cat_dir, "output")
+    if not os.path.exists(input_dir):
+        print(f"[ERROR] 가상화 점검 결과 폴더 없음: {input_dir}")
+        return
+    input_files = sorted(f for f in os.listdir(input_dir)
+                         if f.endswith(".txt") and "evidence" not in f.lower())
+    if not input_files:
+        print(f"[ERROR] {input_dir}에 .txt 파일 없음 (virtualization/check_esxi.sh 결과 <호스트>_esxi.txt)")
+        return
+
+    criteria_items = _hv_items_as_criteria()
+    print(f"[INFO] 가상화(ESXi) 내장 항목 {len(criteria_items)}개 로드 (VMware 보안 구성 가이드·CIS 벤치마크 기반)")
+    check_eos = _load_eos_checker(base_dir)
+
+    all_results, hosts_info, host_ips = {}, [], {}
+    for fname in input_files:
+        path = os.path.join(input_dir, fname)
+        text = read_text(path)
+        hinfo = _parse_header_info(text)
+        if not hinfo["hostname"]:
+            hinfo["hostname"] = os.path.splitext(fname)[0]
+        res = parse_pipe(text)
+        if _category_mismatch(res, criteria_items, fname):
+            continue
+        _h = _host_key(all_results, host_ips, hinfo)
+        evidence = {}
+        evd_path = find_evidence_file(path)
+        if evd_path:
+            evidence = parse_evidence(evd_path)
+            print(f"[INFO] {fname} → 증적 파일 병합: {os.path.basename(evd_path)} ({len(evidence)}건)")
+        # EoS: 호스트 시계 대신 점검자 PC 날짜·eos_checker 데이터로 재판정
+        mv = re.search(r"ESXi\s+(\d+\.\d+)", hinfo.get("os", ""))
+        if check_eos and mv:
+            try:
+                r, _eol, desc = check_eos("esxi", mv.group(1), use_api=False)
+                if r in (RESULT_GOOD, RESULT_BAD) and res.get(HV_EOS_CODE, ("",))[0] != r:
+                    res[HV_EOS_CODE] = (r, f"{desc} (컨버터 재판정)")
+            except Exception:
+                pass
+        for code in criteria_items:
+            if code not in res:
+                res[code] = (RESULT_MANUAL, "스크립트 미점검 항목 (수동 확인 필요)")
+        res = compose_status(res, evidence, criteria_items, "GENERIC")
+        if _h in all_results:   # 같은 호스트 재점검 결과 → 나중 파일 판정 우선 병합
+            res = {**all_results[_h][0], **res}
+            print(f"[INFO] {fname}: 같은 호스트({_h})의 다른 결과 파일과 병합")
+        else:
+            hosts_info.append(hinfo)
+        all_results[_h] = (res, "GENERIC")
+        bad  = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_BAD)
+        good = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_GOOD)
+        print(f"[INFO] {fname} → {_h}: 총 {len(criteria_items)}개 / 양호 {good} / 취약 {bad}")
+
+    if not all_results:
+        print("[ERROR] 변환할 가상화(ESXi) 점검 결과가 없습니다 - virtualization/check_esxi.sh 결과(<호스트>_esxi.txt)를 넣으십시오.")
+        return
+    _write_report(mode, category, cat_dir, base_dir, all_results, hosts_info, criteria_items)
+
+
 def run_pc_convert(mode, base_dir):
     """PC 점검 결과 변환 (기준 엑셀 없이 코드 내장 항목 사용)"""
     cat_dir   = os.path.join(base_dir, "pc")
@@ -7699,6 +7942,11 @@ def run_convert(mode, category, base_dir, criteria_excel):
         run_pc_convert(mode, base_dir)
         return
 
+    # 가상화(ESXi)도 코드 내장 항목 (전자금융·주요정보 공통)
+    if category == "hypervisor":
+        run_hv_convert(mode, base_dir)
+        return
+
     cat_dir    = os.path.join(base_dir, category)
     sheet_name = SHEET_MAP.get(category, "")
 
@@ -7749,6 +7997,7 @@ def run_convert(mode, category, base_dir, criteria_excel):
     all_results = {}
     evidences   = {}
     hosts_info  = []
+    host_ips    = {}
     for fname in sorted(input_files):
         path  = os.path.join(input_dir, fname)
         pure  = os.path.splitext(fname)[0]
@@ -7854,11 +8103,11 @@ def run_convert(mode, category, base_dir, criteria_excel):
         res = run_eos_check(category, res, text, base_dir)
 
         detected_sub = sub_key if input_mode == "pipe" else "GENERIC"
-        if kisa_mode:   # 가이드 항목 변환 후 현황 구성
-            evidences[hinfo["hostname"]] = evidence
+        _h = _host_key(all_results, host_ips, hinfo)
+        if kisa_mode:   # 가이드 항목 변환 후 현황 구성 (같은 호스트 여러 결과 파일 → 증적 누적)
+            evidences[_h] = {**evidences.get(_h, {}), **(evidence or {})}
         else:
             res = compose_status(res, evidence, criteria_items, detected_sub)
-        _h = hinfo["hostname"]
         if _h in all_results:   # 같은 호스트 결과 파일이 여럿(전자금융 + 주요정보 전용 스크립트 등) → 판정·증적 병합, 대상 1대 (파일 순서 무관)
             _old_res, _old_sub = all_results[_h]
             res = {**_old_res, **res}
@@ -7992,19 +8241,20 @@ def main():
     # ── 2단계: 점검 대상 선택 ─────────────────────────────────
     print(f"\n[2단계] 점검 대상 선택 ({mode_name})")
     if mode == "MI":   # 2026 상세가이드 항목코드
-        codes = ["U-01~67 / W-01~64", "WEB-01~26", "D-01~26", "N-01~38", "S-01~23", "PC-01~18"]
+        codes = ["U-01~67 / W-01~64", "WEB-01~26", "D-01~26", "N-01~38", "S-01~23", "PC-01~18", "ESX-01~30"]
     else:
-        codes = ["SRV-xxx", "WST-xxx", "DBM-xxx", "NET-xxx", "ISS-xxx", "PC-xx"]
+        codes = ["SRV-xxx", "WST-xxx", "DBM-xxx", "NET-xxx", "ISS-xxx", "PC-xx", "ESX-01~30"]
     print(f"  1. 서버           ({codes[0]}: Linux/Unix/Windows - AIX, HP-UX, LINUX, Solaris, Windows)")
     print(f"  2. 웹서버/WAS     ({codes[1]}: Apache, Nginx, WebtoB, Tomcat, JEUS, IIS)")
     print(f"  3. 데이터베이스   ({codes[2]}: Oracle, MSSQL, MySQL, MariaDB, PostgreSQL, Tibero)")
     print(f"  4. 네트워크 장비  ({codes[3]}: Cisco, A10, Alteon, Juniper, D-Link)")
     print(f"  5. 보안장비       ({codes[4]}: FW, VPN, IDS, IPS, DDoS, WAF)")
     print(f"  6. PC(업무용단말) ({codes[5]}: Windows 10/11, macOS)")
-    print("  7. EoS 현황       (서버·웹/WAS·DBMS·네트워크 OS·버전·커널 → 지원 종료 대수 .txt)")
+    print(f"  7. 가상화         ({codes[6]}: VMware ESXi 6.5~9.0 - 자체 항목, 두 기준 공통)")
+    print("  8. EoS 현황       (서버·웹/WAS·DBMS·네트워크 OS·버전·커널 → 지원 종료 대수 .txt)")
     while True:
-        sel = input("  선택 (1~7): ").strip()
-        if sel == "7":
+        sel = input("  선택 (1~8): ").strip()
+        if sel == "8":
             write_eos_inventory(base_dir)
             return
         if sel == "1": category = "server";   cat_name = "서버"; break
@@ -8013,7 +8263,8 @@ def main():
         if sel == "4": category = "network";  cat_name = "네트워크 장비"; break
         if sel == "5": category = "security"; cat_name = "보안장비"; break
         if sel == "6": category = "pc";       cat_name = "PC(업무용 단말)"; break
-        print("  1~7 중 하나를 입력하세요.")
+        if sel == "7": category = "hypervisor"; cat_name = "가상화(ESXi)"; break
+        print("  1~8 중 하나를 입력하세요.")
 
     print(f"\n[실행] {mode_name} / {cat_name} 점검 컨버팅 시작")
     sub = "config" if category == "network" else "output"

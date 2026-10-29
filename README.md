@@ -17,6 +17,7 @@
 | [`network/`](network) | 네트워크 장비 — 스크립트 없음, config 추출 안내 | 장비 콘솔 | — |
 | [`security/`](security) | 보안장비 config 점검 (FortiGate·Palo Alto 등) | 점검자 PC | `check_security.sh` |
 | [`pc/`](pc) | 업무용 PC 점검 (Windows·macOS·iOS) | 사용자 PC | `run_pc.bat` / `run_pc_kisa.bat` / `check_pc_mac*.sh` |
+| [`virtualization/`](virtualization) | 가상화 점검 (VMware ESXi) — 자체 항목 ESX-01~30 | ESXi 호스트 | `check_esxi.sh` |
 | [`converter/`](converter) | 결과 → 상세보고서 엑셀 변환, EoS 판정, 결과 비교 | 점검자 PC | `convert_v4.py` |
 
 각 폴더를 열면 파일별 용도가 README 로 정리되어 있습니다. `.sh` 는 Linux/Unix·macOS, `.bat`·`.ps1` 은 Windows 용이며, Windows 는 `run_*.bat` 만 실행하면 됩니다.
@@ -28,7 +29,8 @@
 ```
 ① 대상 시스템            ② 결과 회수                     ③ 점검자 PC
 server/ webwas/ dbms/  →  결과 .txt + 증적 _evidence.txt  →  converter/<분야>/output/ 에 넣고
-pc/ 스크립트 실행          (네트워크·보안장비는 config)        python convert_v4.py
+pc/ virtualization/       (네트워크·보안장비는 config)        python convert_v4.py
+스크립트 실행
                                                             → 상세보고서_<기준>_<분야>_<일시>.xlsx
 ```
 
@@ -44,6 +46,8 @@ python convert_v4.py
 ```
 
 두 기준은 항목코드가 겹쳐도 뜻이 다릅니다(예: PC-01). 스크립트에서 고른 기준과 컨버터에서 고른 기준을 맞추십시오.
+
+호스트명이 같은 서버(`localhost.localdomain` 등)는 결과 머리말의 `# IP:` 로 구분해 보고서에서 별도 대상이 됩니다. 기본 호스트명(localhost*)은 스크립트가 결과·증적 파일명에 IP 를 붙입니다. 그 외 이름이 겹치면 회수할 때 파일명만 바꾸십시오(예: `SecureGate-EX1_2_server.txt`).
 
 ---
 

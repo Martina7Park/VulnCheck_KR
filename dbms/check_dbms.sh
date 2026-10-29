@@ -118,6 +118,15 @@ get_owner() {
 }
 
 HN=$(hostname 2>/dev/null || uname -n)
+# 대표 IP (결과 머리말 '# IP:' — 호스트명이 같은 서버를 컨버터가 IP 로 구분) / 기본 호스트명(localhost*)이면 결과·증적 파일명에 IP 부가
+_IP=""
+if [ "$(uname -s 2>/dev/null)" = "Linux" ]; then   # hostname -I 는 Linux 전용 (Solaris·AIX hostname 은 인자를 호스트명 변경으로 처리)
+    _IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+    [ -z "$_IP" ] && _IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -v '^127\.' | head -1)
+fi
+[ -z "$_IP" ] && _IP=$( (ifconfig -a | awk '/inet /{for (i = 2; i <= NF; i++) { v = $i; sub(/^addr:/, "", v); if (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && v !~ /^127\./) { print v; exit } }}') 2>/dev/null)
+[ -z "$_IP" ] && _IP=$( (netstat -in | awk '$4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $4 !~ /^127\./ { print $4; exit }') 2>/dev/null)
+case "$HN" in localhost|localhost.*|localhost6*) [ -n "$_IP" ] && HN="${HN}_${_IP}" ;; esac
 # ── 결과 사본 자동 저장: '> 파일' 리다이렉트를 빠뜨려도 판정 결과가 증적과 같은 위치에 남도록 표준출력을 복사 ──
 # ── 점검 기준 선택: 인자 ef|mi|all (또는 1|2|3), 미지정 시 메뉴 / 터미널이 아니면(자동 실행) all ──
 _KMODE="${1:-${CHECK_MODE:-}}"
@@ -153,6 +162,7 @@ fi
 
 echo "# ================================================================"
 echo "# 점검 대상: ${HN}"
+echo "# IP: ${_IP:-미확인}"
 echo "# DBMS 종류: ${DBMS_TYPE}"
 echo "# OS: ${OS_FAMILY}"
 echo "# OS 상세: $( ( [ -r /etc/os-release ] && . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-$NAME $VERSION_ID}" ) || ( command -v oslevel >/dev/null 2>&1 && echo "AIX $(oslevel -s 2>/dev/null)" ) || ( [ -r /etc/release ] && head -1 /etc/release | sed 's/^ *//' ) || uname -sr 2>/dev/null)"
