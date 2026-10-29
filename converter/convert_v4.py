@@ -33,7 +33,7 @@
 #   SRV-xxx|수동확인|직접 확인 필요
 # ================================================================
 
-import os, re, sys, datetime, json, hashlib
+import os, re, sys, datetime, json, hashlib, ipaddress
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -978,23 +978,19 @@ def build_dlink_checks(lines, text):
     else:
         results['NET-013'] = ng(fmt("접근 IP 제한 설정 없음", "trusted_host 설정", "비인가 IP 접근 가능"))
 
-    # NET-022: IP Source Routing (L2 스위치 해당 없음)
-    if any_m(r'config\s+route\s+.*source|ip\s+source.?route'):
-        results['NET-022'] = ng(fmt("source routing 관련 설정 발견", "IP source routing 차단", "source routing 비활성화 필요"))
-    else:
-        results['NET-022'] = na(fmt("D-Link L2/L3 스위치 source routing 해당 없음", "IP source routing 차단", "해당 없음"))
-
-    # NET-026: Proxy ARP
-    if any_m(r'proxy.?arp|ip\s+proxy'):
-        results['NET-026'] = ng(fmt("Proxy ARP 관련 설정 발견", "Proxy ARP 비활성화", "비활성화 필요"))
-    else:
-        results['NET-026'] = na(fmt("D-Link 스위치 Proxy ARP 해당 없음", "Proxy ARP 비활성화", "해당 없음"))
-
-    # NET-027: Directed Broadcast
-    if any_m(r'directed.?broadcast'):
-        results['NET-027'] = ng(fmt("directed broadcast 관련 설정 발견", "Directed Broadcast 차단", "비활성화 필요"))
-    else:
-        results['NET-027'] = na(fmt("D-Link 스위치 Directed Broadcast 해당 없음", "Directed Broadcast 차단", "해당 없음"))
+    # NET-022·026·027: 기능을 켠 설정(enable)이 있을 때만 취약 — 'proxy_arp disable' 처럼 끈 설정은 양호
+    def _feat(code, pat, name, crit):
+        hit = find_lines(pat)
+        on_ = [l for l in hit if re.search(r'\benable\b|\bon\b', l, re.I) and not re.search(r'\bdisable\b|\boff\b', l, re.I)]
+        if on_:
+            results[code] = ng(fmt(f"{name} 활성: {on_[0][:70]}", crit, "비활성화 필요"))
+        elif hit:
+            results[code] = ok(fmt(f"{name} 비활성: {hit[0][:70]}", crit, "비활성 설정됨"))
+        else:
+            results[code] = na(fmt(f"D-Link 스위치 {name} 설정 없음", crit, "해당 없음"))
+    _feat('NET-022', r'config\s+route\s+.*source|ip\s+source.?route|source_route', "Source Routing", "IP source routing 차단")
+    _feat('NET-026', r'proxy.?arp', "Proxy ARP", "Proxy ARP 비활성화")
+    _feat('NET-027', r'directed.?broadcast', "Directed Broadcast", "Directed Broadcast 차단")
 
     # NET-038~040: ACL 필터링
     acl_profile = find_lines(r'create\s+access_profile|config\s+access_profile')
@@ -1034,6 +1030,17 @@ def build_dlink_checks(lines, text):
     else:
         results['NET-047'] = ng(fmt("DoS prevention/safeguard 미설정", "config dos_prevention / safeguard_engine", "DDoS 방어 미설정"))
 
+    # 외부(경계) 인터페이스 필터링 항목: L2 스위치는 라우터 해당 항목(N-A), 공인 IP·BGP 가 없는 내부 장비는 판정 보류 (IOS 계열 판정과 같은 기준)
+    _dl_type = detect_net_dtype(lines)
+    for c in ('NET-038', 'NET-039', 'NET-047'):
+        if results.get(c, ("",))[0] != RESULT_BAD:
+            continue
+        if _dl_type == "SW":
+            results[c] = na(fmt("L2 스위치 - WAN/라우팅 없음", "라우터 해당 항목", "L2 스위치 N-A"))
+        elif not _net_external(text):
+            results[c] = mc(fmt("내부 장비 - 인터페이스·정적 경로에 공인 IP 없음 (외부망 연결 인터페이스 없음)", "외부(경계) 인터페이스 필터링",
+                                f"상단 경계 라우터·방화벽의 필터링 적용 여부 확인 - 이 장비가 외부망과 직접 연결되면 취약 (참고: {results[c][1].split('[판단]')[-1].strip()[:40]})"))
+
     # NET-049: 명령어 권한 수준
     admin_acc = find_lines(r'create\s+account\s+admin\b')
     oper_acc = find_lines(r'create\s+account\s+operator\b')
@@ -1065,6 +1072,8 @@ def build_net_checks(lines, text):
     # IOS 유사 문법 D-Link DGS-3630: 제조사 기본값이 Cisco 와 다름 (CLI Reference Guide R2.25)
     _brand, _model, _fw = _net_brand(text)
     _dgs = _brand == "D-LINK" and "DGS-3630" in (_model or "").upper()
+    # NX-OS: feature 구문 또는 'version 9.3(8)' 형식 — enable 모드·aaa new-model·tcp-keepalives 없음, 기본값이 IOS 와 다름
+    _nxos = vendor == "CISCO" and _net_nxos(text)
 
     def any_m(pat, flags=re.I):
         return any(re.search(pat, l, flags) for l in lines)
@@ -1259,6 +1268,8 @@ def build_net_checks(lines, text):
         results['NET-006'] = ok(fmt("VRF Mgmt 전용 SNMP v3 호스트 설정 (관리망 분리)", "관리망 한정 SNMP 허용", "외부 SNMP 접근 차단됨"))
     elif acl_deny_snmp:
         results['NET-006'] = ok(fmt("외부 SNMP 차단 ACL 적용됨", "외부 인터페이스 SNMP 차단 ACL", "외부 SNMP 차단 확인됨"))
+    elif not (has_comm or v3_groups or any_m(r'^\s*snmp-server\s+(host|user|group|community|enable)\b')):
+        results['NET-006'] = na(fmt("SNMP 미사용", "해당 없음", "SNMP 미사용"))
     else:
         snmp_hosts = find_lines(r'snmp-server host\s+\S+')
         host_str = ", ".join(snmp_hosts[:3]) if snmp_hosts else "없음"
@@ -1330,11 +1341,27 @@ def build_net_checks(lines, text):
             "AAA 인증 방식 수동 확인"
         ))
     else:
-        results['NET-008'] = ng(fmt(
-            "aaa new-model 미설정",
-            "AAA 인증 체계 적용",
-            "AAA 미사용 - 중앙 인증 미적용"
-        ))
+        # 계정별 로컬 인증(aaa authentication login ... local 과 같은 효과)은 '인증 체계 없음'이 아님 → 수동확인
+        _act = [" ".join(sub) for _, sub in _cfg_blocks(lines, r"^line\s+(con|vty|aux)\b")
+                if not re.search(r'transport input none|no exec\b', " ".join(sub), re.I)]
+        if _dgs and users:
+            results['NET-008'] = mc(fmt(
+                "로컬 계정 DB 로그인 인증 (라인 인증 방식 미지정 시 로컬 DB - DGS-3630 기본값), RADIUS/TACACS+ 미연동",
+                "AAA 인증 설정 또는 별도 인증서버",
+                "계정별 로컬 인증 사용 - 기관 정책상 중앙 인증서버 연동 필요 여부 확인"
+            ))
+        elif users and _act and all(re.search(r'login (local|authentication)', s, re.I) for s in _act):
+            results['NET-008'] = mc(fmt(
+                "aaa new-model 미설정, 모든 접속 라인 login local (계정별 로컬 인증)",
+                "AAA 인증 설정 또는 별도 인증서버",
+                "계정별 로컬 인증 사용 - 기관 정책상 중앙 인증서버 연동 필요 여부 확인"
+            ))
+        else:
+            results['NET-008'] = ng(fmt(
+                "aaa new-model 미설정",
+                "AAA 인증 체계 적용",
+                "AAA 미사용 - 중앙 인증 미적용"
+            ))
 
     # ──────────────────────────────────────────────────────────────
     # NET-009: 비밀번호 미설정 계정 (다시)
@@ -1382,7 +1409,7 @@ def build_net_checks(lines, text):
         for b in line_blocks(kind):
             s = " ".join(b)
             if re.search(r'transport input none|no exec\b', s, re.I): continue
-            if not (re.search(r'\bpassword\s+\S|login local|login authentication', s, re.I) or aaa_default or dlink_local_auth):
+            if not (re.search(r'\bpassword\s+\S|login local|login authentication', s, re.I) or aaa_default or dlink_local_auth or _nxos):
                 line_nopw.append(b[0])
     pw_vals = [re.search(r'(?:secret|password)\s+(?:\d\s+)?(\S+)\s*$', l, re.I) for l in find_lines(r'(secret|password)\s+(\d\s+)?\S+\s*$')]
     pw_vals = [m.group(1) for m in pw_vals if m]
@@ -1597,7 +1624,9 @@ def build_net_checks(lines, text):
     # NET-026: Proxy ARP
     no_proxy = find_lines(r'no ip proxy-arp')
     real_ip = [i for i in ifaces if i["has_ip"] and "Loopback" not in i["name"]]
-    if not real_ip:
+    if is_pure_l2:
+        results['NET-026'] = na(fmt("L2 스위치 - 라우팅 미사용 (관리용 IP 만 설정)", "라우터 해당 항목", "Proxy ARP 는 라우팅 시에만 동작 - L2 스위치 N-A"))
+    elif not real_ip:
         results['NET-026'] = na(fmt("IP 라우팅 인터페이스 없음", "Proxy ARP 비활성화", "라우팅 없음"))
     elif len(no_proxy) >= len(real_ip):
         results['NET-026'] = ok(fmt(f"no ip proxy-arp: {len(no_proxy)}개 인터페이스", "모든 인터페이스 Proxy ARP 비활성", "Proxy ARP 전체 차단됨"))
@@ -1702,7 +1731,7 @@ def build_net_checks(lines, text):
             svc_disabled.append(f"Domain-lookup(비활성:{l})")
 
         # 7. PAD
-        if any_m(r"^\s*service pa"):
+        if any_m(r"^\s*service pad\b"):
             svc_enabled.append("PAD")
             svc_detail["PAD"] = fline(r"service pad") or "service pad"
         else:
@@ -1790,14 +1819,17 @@ def build_net_checks(lines, text):
     else:
         log_lines = find_lines(r'^logging\s+')
         explicit_on = any_m(r'^\s*logging on\b')
-        if explicit_on or log_lines:
+        if any_m(r'^\s*no logging on\b'):
+            results['NET-033'] = ng(fmt("no logging on", "logging 활성화 필요", "시스템 로깅 비활성"))
+        elif explicit_on or log_lines:
             results['NET-033'] = ok(fmt(
                 f"logging 설정: {log_lines[0] if log_lines else 'logging on'}",
                 "logging on 또는 logging host 설정",
                 f"로깅 활성화됨 ({len(log_lines)}개 logging 구문)"
             ))
-        else:
-            results['NET-033'] = ng(fmt("logging 설정 없음", "logging 활성화 필요", "로깅 미설정"))
+        else:   # running-config 는 기본값을 표시하지 않음 - IOS 는 logging on 기본 활성
+            results['NET-033'] = ok(fmt("logging 구문 없음 - no logging on 미설정 (logging on 기본 활성)", "logging on 또는 logging host 설정",
+                                        "로깅 활성 - 기본값 (원격·버퍼 로그는 NET-035·036 참조)"))
 
     # NET-034: 로그 타임스탬프
     if vendor in ("ASA",):
@@ -1838,8 +1870,11 @@ def build_net_checks(lines, text):
                 "logging buffered 설정",
                 f"로깅 버퍼 설정됨 ({size or '기본'} bytes, {level})"
             ))
-        else:
-            results['NET-035'] = ng(fmt("logging buffered 미설정", "logging buffered [크기] [레벨] 설정", "버퍼 로그 미설정 - 메모리 로그 없음"))
+        elif any_m(r'^\s*no logging buffered\b'):
+            results['NET-035'] = ng(fmt("no logging buffered", "logging buffered [크기] [레벨] 설정", "버퍼 로그 비활성 - 메모리 로그 없음"))
+        else:   # 버퍼 로깅 기본값은 플랫폼별(대부분 기본 활성) - running-config 만으로 미설정 단정 불가
+            results['NET-035'] = mc(fmt("logging buffered 구문 없음 (no logging buffered 도 없음)", "logging buffered [크기] [레벨] 설정",
+                                        "버퍼 로깅 기본값은 플랫폼별 - show logging 의 Buffer logging 상태·크기 확인"))
 
     # NET-036: 원격 로그서버
     if vendor == "ASA":
@@ -2021,6 +2056,14 @@ def build_net_checks(lines, text):
             results['NET-047'] = ng(fmt(f"DDoS 권장 포트 차단 ACL 없음{' (' + _copp[:40] + ')' if _copp else ''}",
                                         "ACL 로 DDoS 권장 포트 차단 (상단 DDoS 대응장비·전용회선이면 양호)",
                                         "포트 차단 ACL 미설정 - 상단 DDoS 대응장비·전용회선 여부 확인"))
+
+    # 외부(경계) 인터페이스 필터링 항목: 공인 IP·BGP 가 없는 내부 장비는 외부 인터페이스가 없어 이 config 만으로 판정 불가
+    if not is_pure_l2 and not _net_external(text):
+        for c in ('NET-038', 'NET-039', 'NET-040', 'NET-041', 'NET-042', 'NET-047'):
+            if results.get(c, ("",))[0] == RESULT_BAD:
+                results[c] = mc(fmt("내부 장비 - 인터페이스·정적 경로에 공인 IP 없음, BGP 미사용 (외부망 연결 인터페이스 없음)",
+                                    "외부(경계) 인터페이스 필터링",
+                                    f"상단 경계 라우터·방화벽의 필터링 적용 여부 확인 - 이 장비가 외부망과 직접 연결되면 취약 (참고: {results[c][1].split('[판단]')[-1].strip()[:60]})"))
 
     # NET-048: 보안패치
     results['NET-048'] = mc(fmt("장비 운영 IOS/펌웨어 버전 확인", "벤더 보안 권고 버전 사용", "version 명령으로 현재 버전 확인 후 벤더 EoL/패치 공지 대조"))
@@ -2262,8 +2305,8 @@ def build_net_checks(lines, text):
 
     # NET-058: 계정 잠금
     _mf = fline(r'aaa local authentication attempts max-fail\s+\d+')
-    _bf = fline(r'login block-for\s+\d+\s+attempts\s+\d+')
-    _n  = int(re.search(r'max-fail\s+(\d+)', _mf).group(1)) if _mf else (int(re.search(r'attempts\s+(\d+)', _bf).group(1)) if _bf else None)
+    _bf = fline(r'login block-for\s+\d+\s+attempts\s+\d+|aaa authentication rejected\s+\d+\s+in\s+\d+')
+    _n  = int(re.search(r'max-fail\s+(\d+)', _mf).group(1)) if _mf else (int(re.search(r'(?:attempts|rejected)\s+(\d+)', _bf).group(1)) if _bf else None)
     lockout = _mf or _bf or fline(r'aaa.*lockout|security authentication failure rate')
     if _n is not None and _n <= 5:
         results['NET-058'] = ok(fmt(lockout, "계정 잠금 임계값 적절(5회 이하)", f"로그인 실패 {_n}회 잠금/차단"))
@@ -2332,6 +2375,12 @@ def build_net_checks(lines, text):
             results['NET-015'] = ok(fmt("no ip telnet server / ip ssh server", "SSH 전용", "SSH 전용 접속"))
         else:
             results['NET-015'] = na(fmt("Telnet·SSH 서버 모두 비활성 (원격 CLI 접속 불가)", "Telnet 미허용", "원격 CLI 미사용"))
+        # enable 비밀번호: 출고 시 빈 값. 로컬 계정이 모두 privilege 15 면 로그인 즉시 관리자 - enable 단계를 거치지 않음
+        _privs = {m.group(1): int(m.group(2)) for l in users for m in [re.search(r'username\s+(\S+)\s+privilege\s+(\d+)', l, re.I)] if m}
+        _names = {m.group(1) for l in users for m in [re.match(r'\s*username\s+(\S+)', l, re.I)] if m}
+        if results.get('NET-010', ("",))[0] == RESULT_BAD and not ep and not es and _names and all(_privs.get(n) == 15 for n in _names):
+            results['NET-010'] = mc(fmt(f"enable 비밀번호 미설정(출고 시 빈 값), 로컬 계정 모두 privilege 15: {', '.join(sorted(_names))}",
+                                        "enable secret 설정", "로그인 시 바로 관리자 권한 - enable 미사용 구조. privilege 15 미만 계정을 만들면 무인증 권한 상승이므로 기관 기준상 enable 비밀번호 필수면 취약"))
         results['NET-012'] = mc(fmt(f"{_dev}: 비밀번호 복잡성 정책 설정 기능 없음 ({_ref})", "비밀번호 복잡도 정책 적용",
                                     "기관 복잡도 기준(2종 10자 / 3종 8자 이상) 비밀번호 사용 여부 확인"))
         _l3 = [(h.split(None, 1)[1], sub) for h, sub in _cfg_blocks(lines, r"^interface\s+\S+")
@@ -2363,6 +2412,51 @@ def build_net_checks(lines, text):
                 results['NET-058'] = ng(fmt(f"{_dev}: 로그인 실패 잠금 명령 없음 ({_ref}), AAA 서버 인증 미사용", "로그인 실패 시 차단 설정",
                                             "무제한 로그인 시도 허용 - 인증 서버 잠금 정책 적용 필요"))
 
+    # Cisco NX-OS: IOS 기본값·명령 가정 항목을 NX-OS 기본값으로 판정
+    #   AAA 항상 활성(로컬 인증) / enable 모드 없음(역할 기반) / password 5 $5$·$6$ = SHA-2 crypt
+    #   Proxy ARP·Directed Broadcast 기본 비활성 / 로그 타임스탬프 기본 기록 / 콘솔 로깅 기본 critical(2)
+    #   ip source-route·tcp-keepalives 명령 없음
+    if _nxos:
+        if results.get('NET-008', ("",))[0] == RESULT_BAD:
+            srv = fline(r'^\s*(tacacs-server|radius-server)\s+host\s+\S+|^\s*aaa group server\s+\S+')
+            results['NET-008'] = ok(fmt(f"NX-OS AAA + 인증서버: {srv}", "AAA 인증 설정 또는 별도 인증서버", "중앙 인증 연동됨")) if srv \
+                else mc(fmt("NX-OS AAA 기본 활성 (aaa new-model 명령 없음) - 로컬 계정 인증, 인증서버 미연동", "AAA 인증 설정 또는 별도 인증서버",
+                            "계정별 로컬 인증 사용 - 기관 정책상 중앙 인증서버 연동 필요 여부 확인"))
+        results['NET-010'] = na(fmt("NX-OS - enable 모드 없음 (계정 역할 role 로 권한 부여)", "enable secret 설정", "해당 없음 - 계정 역할은 NET-049 참조"))
+        _nx_pw = []
+        for ln in find_lines(r'^\s*username\s+\S+\s+password\s+'):
+            m = re.search(r'password\s+(\d)\s+(\S+)', ln, re.I)
+            who = re.match(r'\s*username\s+(\S+)', ln, re.I).group(1)
+            if m and m.group(2) == "!":   # 비밀번호 없이 잠긴 계정 (원격 로그인 불가)
+                continue
+            strong_h = bool(m and m.group(1) in ("5", "8") and re.match(r'\$(5|6|8|9)\$', m.group(2)))
+            _nx_pw.append((who, strong_h, (m.group(2)[:3] if m else "평문")))
+        if _nx_pw:
+            _wk = [f"{w}: {h}" for w, s_, h in _nx_pw if not s_]
+            results['NET-011'] = ng(fmt("; ".join(_wk[:5]), "비밀번호 안전한 알고리즘(SHA-2 이상) 암호화", f"평문 또는 MD5 등 약한 해시 {len(_wk)}건")) if _wk \
+                else ok(fmt(", ".join(f"{w}: {h}" for w, _, h in _nx_pw[:5]), "비밀번호 안전한 알고리즘 암호화", "NX-OS password 5 SHA-2 crypt($5$/$6$) 적용"))
+        if not any_m(r'^\s*no\s+ip\s+source-route\b'):
+            results['NET-022'] = mc(fmt("NX-OS - ip source-route 명령 없음", "IP 소스라우팅 차단", "IP 옵션(소스 라우팅) 패킷 처리 방식 제조사 문서 확인"))
+        if results.get('NET-026', ("",))[0] == RESULT_BAD:
+            _pa = find_lines(r'^\s*ip proxy-arp\b')
+            results['NET-026'] = ng(fmt(f"ip proxy-arp 설정 {len(_pa)}개", "Proxy ARP 비활성화", "Proxy ARP 허용")) if _pa \
+                else ok(fmt("ip proxy-arp 설정 없음", "Proxy ARP 비활성화", "NX-OS 기본값 비활성"))
+        if results.get('NET-027', ("",))[0] in (RESULT_BAD, RESULT_MANUAL) and not find_lines(r'^\s*ip directed-broadcast'):
+            results['NET-027'] = ok(fmt("ip directed-broadcast 설정 없음", "Directed Broadcast 차단", "NX-OS 기본값 비활성"))
+        if results.get('NET-034', ("",))[0] == RESULT_BAD:
+            results['NET-034'] = ok(fmt("NX-OS 시스템 로그 기본 타임스탬프 기록 (service timestamps 명령 없음)", "로그에 시간 정보 기록", "기본 동작"))
+        if results.get('NET-037', ("",))[0] == RESULT_BAD:
+            _cl = fline(r'^\s*logging console\s+\d')
+            _lv = int(re.search(r'logging console\s+(\d)', _cl).group(1)) if _cl else 2
+            results['NET-037'] = ng(fmt(_cl, "콘솔 로깅 중지 또는 critical(2) 이상", f"콘솔 로그 레벨 {_lv}")) if _lv > 2 \
+                else ok(fmt(_cl or "logging console 미설정 (NX-OS 기본 2=critical)", "콘솔 로깅 중지 또는 critical 이상", f"콘솔 로그 레벨 {_lv}"))
+        if results.get('NET-044', ("",))[0] == RESULT_BAD:
+            _ur = find_lines(r'^\s*ip unreachables\b')
+            results['NET-044'] = ng(fmt(f"ip unreachables 설정 {len(_ur)}개", "ICMP Unreachable 차단", "ICMP Unreachable 허용")) if _ur \
+                else mc(fmt("ip unreachables·no ip unreachables 설정 없음", "ICMP Unreachable 차단", "NX-OS 기본값 확인 (show ip interface 의 unreachables 상태)"))
+        if results.get('NET-051', ("",))[0] == RESULT_BAD:
+            results['NET-051'] = mc(fmt("NX-OS - service tcp-keepalives 명령 없음", "TCP keepalive 설정", "유휴 세션은 line exec-timeout(NET-014) 로 관리 - 제조사 동작 확인"))
+
     # NET-059: EoS
     results['NET-059'] = mc(fmt(
         (f"장비: D-Link {_model}{f', 펌웨어 {_fw}' if _fw else ''}" if _brand == "D-LINK" else f"장비 벤더: {vendor}, 운영체제: config 상단 version 확인"),
@@ -2376,6 +2470,37 @@ def build_net_checks(lines, text):
 # ================================================================
 # 점검 파일 헤더에서 대상 유형 탐지 (OS/DB/네트워크 세부 분기용)
 # ================================================================
+_NET_ADDR_PATS = (
+    r"(?mi)^\s*ip address\s+(\d+\.\d+\.\d+\.\d+)",                                  # IOS·NX-OS·ASA·D-Link(IOS 유사) 인터페이스
+    r"(?mi)\baddress\s+(\d+\.\d+\.\d+\.\d+)/\d+",                                   # Junos family inet address
+    r"(?mi)^\s*config\s+ipif\s+\S+\s+ipaddress\s+(\d+\.\d+\.\d+\.\d+)",             # D-Link 네이티브 CLI
+    r"(?mi)^\s*ip route\s+(?:vrf\s+\S+\s+)?\S+\s+\S+\s+(\d+\.\d+\.\d+\.\d+)",       # IOS 정적 경로 next-hop
+    r"(?mi)^\s*route\s+\S+\s+\S+\s+\S+\s+(\d+\.\d+\.\d+\.\d+)",                     # ASA 정적 경로 next-hop
+    r"(?mi)\bnext-hop\s+(\d+\.\d+\.\d+\.\d+)",                                       # Junos 정적 경로 next-hop
+    r"(?mi)^\s*create\s+iproute\s+(?:default|\S+\s+\S+)\s+(\d+\.\d+\.\d+\.\d+)",     # D-Link 네이티브 경로
+)
+
+
+def _net_external(text):
+    """경계(외부망 연결) 장비 단서 — 인터페이스 주소·정적 경로 next-hop 중 공인 IP 또는 BGP 사용.
+    없으면 내부 장비: '외부 인터페이스' 필터링 항목은 이 장비 config 만으로 판정할 수 없음"""
+    if re.search(r"(?mi)^\s*(router bgp|set protocols bgp)\b", text):
+        return True
+    for pat in _NET_ADDR_PATS:
+        for ip in re.findall(pat, text):
+            try:
+                if ipaddress.ip_address(ip).is_global:
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
+def _net_nxos(text):
+    """Cisco NX-OS config 여부 (running-config 의 version 은 IOS 는 15.2, NX-OS 는 9.3(8) 형식)"""
+    return bool(re.search(r"(?mi)^\s*feature\s+\S|^\s*version\s+\d+\.\d+\(\d+\)|\bnx-?os\b", text))
+
+
 def _net_brand(text):
     """config 머리말(주석)의 제조사·모델·펌웨어 — 설정 문법이 IOS 계열이어도 실제 제조사 식별 (예: D-Link DGS-3630)"""
     head = "\n".join(l for l in text.splitlines()[:30] if l.lstrip().startswith(("!", "#")))
@@ -2418,6 +2543,7 @@ def build_net_kisa_checks(lines, text):
     # 제조사 문서로 기본값을 확인한 모델: DGS-3630 (CLI Reference Guide R2.25, D-Link)
     dgs3630 = dlink and "DGS-3630" in (model or "").upper()
     DGS_REF = "D-Link DGS-3630 CLI Reference Guide R2.25"
+    nxos = vendor == "CISCO" and _net_nxos(text)   # NX-OS: Telnet 기본 비활성(feature telnet), 라인은 AAA 로컬 인증
 
     def on(pat):
         return next((l.strip() for l in lines if re.match(pat, l, re.I)), "")
@@ -2476,6 +2602,9 @@ def build_net_kisa_checks(lines, text):
             r["N-08"] = (RESULT_GOOD, "Telnet 서버 비활성(no ip telnet server), SSH 서버 설정(ip ssh server) 없음(기본 비활성) - 평문 원격 접속 없음")
         elif telnet_off:
             r["N-08"] = (RESULT_GOOD, "Telnet 서버 비활성(no ip telnet server) - SSH 접속만 사용")
+        elif nxos:
+            r["N-08"] = ((RESULT_BAD, "Telnet 활성 (feature telnet) - 평문 접속 허용") if on(r"^\s*feature\s+telnet\b")
+                         else (RESULT_GOOD, "NX-OS Telnet 미사용 (feature telnet 없음 - 기본 비활성), SSH 접속"))
         elif dlink:
             r["N-08"] = (RESULT_BAD, "Telnet 서버 비활성화 설정(no ip telnet server) 없음 - 평문 접속 허용")
         elif on(r"^\s*sdwan\b"):   # Catalyst SD-WAN IOS XE: VTY 기본 SSH 만 허용 (Cisco SD-WAN 명령 참조)
@@ -2504,7 +2633,7 @@ def build_net_kisa_checks(lines, text):
                         if re.search(r"\b(password|secret)\s+(0\s+)?" + weak_def + r"\s*$", l, re.I)})
     aaa_login = on(r"^\s*aaa\s+authentication\s+login\s+default\s+(?!none\b)\S")
     line_noauth = []
-    if not dlink:
+    if not dlink and not nxos:   # NX-OS 라인은 비밀번호 개념 없이 AAA(로컬 계정)로 인증
         for h, sub in _cfg_blocks(lines, r"^line\s+(con|vty|aux)\b"):
             s1 = " ".join(sub).lower()
             if re.search(r"transport input none|no exec\b", s1):
@@ -2569,7 +2698,19 @@ def build_net_kisa_checks(lines, text):
         else:
             lg = on(r"^\s*logging\s+(buffered|server|console|monitor)\b")
             r["N-14"] = ((RESULT_GOOD, f"{dev}: 로깅 정책 설정: {lg}") if lg
-                         else (RESULT_BAD, f"{dev}: 기본 로깅(logging on 기본 활성, 버퍼 warnings 이상)만 동작 - 로그 기록 정책에 따른 레벨·대상 설정 없음 ({DGS_REF})"))
+                         else (RESULT_MANUAL, f"{dev}: 기본 로깅(logging on 기본 활성, 버퍼 warnings 이상)만 동작 - 기관 로그 기록 정책(레벨·대상)에 부합하는지 확인 ({DGS_REF}), 원격 로그는 N-11"))
+    # N-14 (IOS 계열): running-config 에 로깅 구문이 없으면 기본 로깅(logging on)만 동작 - 정책 부합 여부는 config 만으로 판정 불가
+    if "N-14" not in r:
+        if vendor == "ASA":
+            le, lt = on(r"^\s*logging enable\b"), on(r"^\s*logging (trap|host)\b")
+            r["N-14"] = ((RESULT_GOOD, f"로깅 활성: {le}" + (f" / {lt}" if lt else ""))
+                         if le else (RESULT_BAD, "logging enable 미설정 - ASA 기본 로깅 비활성"))
+        elif on(r"^\s*no\s+logging\s+on\b"):
+            r["N-14"] = (RESULT_BAD, "시스템 로깅 비활성 (no logging on)")
+        else:
+            lg = on(r"^\s*logging\s+(buffered|host|server|trap|console|monitor|\d)")
+            r["N-14"] = ((RESULT_GOOD, f"로깅 정책 설정: {lg}") if lg
+                         else (RESULT_MANUAL, "logging 구문 없음 - 기본 로깅(logging on)만 동작: 기관 로그 기록 정책(레벨·대상)에 부합하는지 확인, 원격 로그는 N-11"))
 
     # ── 패치 관리: 제조사 공개 자료로 확인한 펌웨어 정보 (2026-09-29 조사) ──
     if dgs3630:
@@ -2606,7 +2747,9 @@ def build_net_kisa_checks(lines, text):
     if dtype != "라우터":   # 판단기준: 경계 라우터 또는 보안 장비에 적용 여부 → 이 장비 설정만으로 판정 불가
         r["N-22"] = (RESULT_MANUAL, f"{dtype}({dev}) - 판단기준상 경계 라우터 또는 보안 장비의 스푸핑 방지 필터링 적용 여부 확인 (적용 시 양호)")
         r["N-23"] = (RESULT_MANUAL, f"{dtype}({dev}) - 판단기준상 경계 라우터의 DDoS 방어 설정 또는 DDoS 대응 장비 사용 여부 확인 (사용 시 양호)")
-    if dlink:
+    if nxos:
+        r["N-25"] = (RESULT_MANUAL, "NX-OS - service tcp-keepalives 명령 없음 - 유휴 세션 정리 동작은 제조사 확인 필요 (세션 타임아웃은 N-07)")
+    elif dlink:
         r["N-25"] = (RESULT_MANUAL, f"{dev}: TCP Keepalive 설정 명령 없음" + (f" ({DGS_REF} 전체 확인)" if dgs3630 else "")
                                     + " - 유휴 세션 정리 동작은 제조사 확인 필요 (세션 타임아웃은 N-07)")
     else:
@@ -2659,12 +2802,30 @@ def build_net_kisa_checks(lines, text):
                  else (RESULT_GOOD, f"L3 인터페이스({ifn})에 ip directed-broadcast 설정 없음 (기본 차단)"))
     if on(r"^\s*no ip source-route\b"):
         r["N-32"] = (RESULT_GOOD, "Source Routing 차단 (no ip source-route)")
+    elif dtype == "L2 스위치":
+        r["N-32"] = (RESULT_GOOD, f"L2 스위치(라우팅 미사용, IP 는 관리용 {ifn}) - 소스 라우팅 패킷을 라우팅하지 않음")
+    elif nxos:
+        r["N-32"] = (RESULT_MANUAL, "NX-OS - ip source-route 명령 없음 - IP 옵션(소스 라우팅) 패킷 처리 방식은 제조사 확인 필요")
     elif dlink:
         r["N-32"] = (RESULT_MANUAL, f"{dev}: Source Routing 차단 설정 명령 없음" + (f" ({DGS_REF} 전체 확인, DoS 방어 유형에도 없음)" if dgs3630 else "")
                                     + " - 소스 라우팅 패킷 처리 방식은 제조사 확인 필요")
     else:
         r["N-32"] = (RESULT_BAD, "Source Routing 기본 허용 (no ip source-route 미설정)")
-    if dlink:
+    if nxos:
+        pa = [n for n, sub in l3sub.items() if "ip proxy-arp" in sub or "ip local-proxy-arp" in sub]
+        r["N-33"] = ((RESULT_BAD, f"Proxy ARP 활성 인터페이스: {', '.join(pa)}") if pa
+                     else (RESULT_GOOD, f"L3 인터페이스({ifn}) ip proxy-arp 설정 없음 - NX-OS 기본값 비활성"))
+        rd = [n for n, sub in l3sub.items() if "no ip redirects" not in sub]
+        ur = [n for n, sub in l3sub.items() if "ip unreachables" in sub]
+        r["N-34"] = ((RESULT_BAD, " / ".join(x for x in ((f"ICMP redirect 기본 활성(no ip redirects 미설정): {', '.join(rd)}" if rd else ""),
+                                                           (f"ip unreachables 설정: {', '.join(ur)}" if ur else "")) if x)) if rd or ur
+                     else (RESULT_MANUAL, f"L3 인터페이스({ifn}) no ip redirects 설정 - ip unreachables 기본값은 show ip interface 로 확인"))
+    elif dtype == "L2 스위치" and not dlink:   # 라우팅 미사용: Proxy ARP·redirect 는 라우팅 시에만 동작, unreachable 은 관리 IP 에서도 발송
+        r["N-33"] = (RESULT_GOOD, f"L2 스위치(라우팅 미사용, IP 는 관리용 {ifn}) - Proxy ARP 는 라우팅 시에만 동작")
+        un = [n for n, sub in l3sub.items() if "no ip unreachables" not in sub]
+        r["N-34"] = ((RESULT_BAD, f"no ip unreachables 미설정(관리 IP 인터페이스): {', '.join(un)} - redirect 는 라우팅 미사용으로 해당 없음") if un
+                     else (RESULT_GOOD, f"관리 IP 인터페이스({ifn}) ICMP unreachable 차단, redirect 는 라우팅 미사용으로 해당 없음"))
+    elif dlink:
         pa = [n for n, sub in l3sub.items() if "ip proxy-arp" in sub or "ip local-proxy-arp" in sub]
         r["N-33"] = ((RESULT_BAD, f"Proxy ARP 활성 인터페이스: {', '.join(pa)}") if pa
                      else (RESULT_GOOD, f"{dev}: L3 인터페이스({ifn}) ip proxy-arp·ip local-proxy-arp 설정 없음 - 기본값 비활성 ({DGS_REF})") if dgs3630
