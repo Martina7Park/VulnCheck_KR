@@ -73,13 +73,6 @@ AIX)     PATH="/opt/freeware/bin:$PATH" ;;
 HPUX)    PATH="/usr/local/bin:$PATH" ;;
 esac; export PATH
 HN=$(hostname 2>/dev/null || uname -n)
-# 대표 IPv4 (결과 헤더 '# IP:' — 호스트명이 같은 장비(localhost.localdomain 등)를 컨버터가 구분). Linux 외 hostname -I 는 호스트명 변경 위험이 있어 사용 안 함
-_primary_ip() {
-    case "$(uname -s 2>/dev/null)" in
-    Linux) { hostname -I 2>/dev/null | tr ' ' '\n'; ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}'; } ;;
-    *)     { ifconfig -a 2>/dev/null | awk '/inet / {a = $2; sub(/^addr:/, "", a); print a}'; netstat -in 2>/dev/null | awk 'NR > 1 {print $4}'; } ;;
-    esac | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && !/^127\./ {print; exit}'
-}
 # ── 결과 사본 자동 저장: '> 파일' 리다이렉트를 빠뜨려도 판정 결과가 증적과 같은 위치에 남도록 표준출력을 복사 ──
 _RESF="/tmp/${HN}_u.txt"
 if [ -z "$NO_RESULT_COPY" ] && ! [ /dev/fd/1 -ef "$_RESF" ] 2>/dev/null && ( : > "$_RESF" ) 2>/dev/null; then
@@ -90,7 +83,6 @@ fi
 
 echo "# ============================================================"
 echo "# 점검 대상: ${HN}"
-echo "# IP: $(_primary_ip)"
 echo "# OS: ${OS_FAMILY} / ${OS_DISTRO} ${OS_MAJOR}"
 echo "# OS 상세: $( ( [ -r /etc/os-release ] && . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-$NAME $VERSION_ID}" ) || ( command -v oslevel >/dev/null 2>&1 && echo "AIX $(oslevel -s 2>/dev/null)" ) || ( [ -r /etc/release ] && head -1 /etc/release | sed 's/^ *//' ) || uname -sr 2>/dev/null)"
 echo "# 커널: $(uname -r 2>/dev/null)$( [ "$(uname -s 2>/dev/null)" = SunOS ] && echo " / $(uname -v 2>/dev/null)")"
