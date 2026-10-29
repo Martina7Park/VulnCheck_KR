@@ -137,6 +137,7 @@ SHEET_MAP = {
     "network": "네트워크 장비",
     "security":"정보보호시스템 장비",
     "pc":      None,   # PC는 기준 엑셀에 시트 없음 → 코드 내장 항목 사용
+    "virtualization": None,   # 가상화(HV)는 주요정보 2026 가이드 항목만 사용 (전자금융 시트 매핑 없음)
 }
 
 # PC 점검 항목 정의 (기준 엑셀에 없으므로 코드에서 관리)
@@ -346,7 +347,23 @@ def parse_evidence(evd_path):
     """
     if not os.path.exists(evd_path):
         return {}
-    text = read_text(evd_path)
+    return parse_evidence_text(read_text(evd_path))
+
+
+# 결과 파일 안에 증적을 이어 붙인 경우의 구분 줄 (check_hv_esxi.sh HV_INLINE=1 — SSH 원격 실행 시 결과·증적 한 파일)
+EVIDENCE_MARK = "# ==== EVIDENCE BEGIN ===="
+
+
+def split_inline_evidence(text):
+    """결과 텍스트 → (결과 부분, 인라인 증적 부분 또는 "")"""
+    if EVIDENCE_MARK not in text:
+        return text, ""
+    res, evd = text.split(EVIDENCE_MARK, 1)
+    return res, evd
+
+
+def parse_evidence_text(text):
+    """증적 텍스트 파싱 (parse_evidence 본문)"""
     evidence = {}
     state = {"code": None, "lines": []}
 
@@ -394,6 +411,7 @@ def find_evidence_file(result_path):
         os.path.join(d, f"{base}_server_evidence.txt"),
         os.path.join(d, f"{base}_webwas_evidence.txt"),
         os.path.join(d, f"{base}_dbms_evidence.txt"),
+        os.path.join(d, f"{base}_hv_evidence.txt"),
         os.path.join(d, f"{base}_iss_evidence.txt"),
         os.path.join(d, f"{base}_pc_evidence.txt"),
     ]
@@ -546,6 +564,65 @@ def compose_status(res, evidence, criteria_items, sub_key=None):
             parts.append("[증적]\n" + _condense_evidence(evd))
         out[code] = (rv, "\n".join(parts) if len(parts) > 1 else (why or ""))
     return out
+
+
+# ================================================================
+# 같은 호스트명의 서로 다른 장비 구분
+# ================================================================
+# 기본 호스트명(localhost.localdomain 등)은 장비마다 같으므로 결과 헤더 IP 로 구분
+_GENERIC_HOST_RE = re.compile(r"^(localhost(\.localdomain)?6?|localhost6\.localdomain6|\(none\)|unknown)$", re.I)
+
+
+def _resolve_host(hinfo, codes, reg, fname, all_results, hosts_info, evidences):
+    """
+    결과 파일의 보고서 대상 이름(hinfo["hostname"]) 확정 — 같은 호스트명 결과가 이미 있을 때
+    - 결과 헤더 IP 가 서로 다르면 다른 장비 → '호스트명(IP)' 로 구분 (먼저 들어온 대상도 IP 를 붙여 이름 변경)
+    - IP 가 같거나 없으면 같은 장비로 병합 (전자금융 + 주요정보 결과 등 — 기존 동작)
+      단 기본 호스트명(localhost 등)이고 같은 항목코드를 다시 판정한 파일이면 다른 장비로 보고 파일명으로 구분
+    - 기본 호스트명 + IP 있음 → 'IP(localhost)' 로 표기
+    codes: 결과 파일이 직접 판정한 항목코드 집합, reg: {대상 이름: {"host", "ip", "codes"}} (변환 1회 동안 유지)
+    """
+    h, ip = hinfo["hostname"], hinfo.get("ip", "")
+    generic = bool(_GENERIC_HOST_RE.match(h))
+    if generic and ip:
+        h = f"{ip}({h.split('.')[0]})"
+    alias = lambda host, addr, f: f"{host}({addr or os.path.splitext(f)[0]})"
+    same = [k for k, v in reg.items() if v["host"] == h]
+    target = None
+    for k in same:
+        v = reg[k]
+        if ip and v["ip"]:
+            if ip == v["ip"]:
+                target = k
+                break
+            continue
+        if codes & v["codes"] and generic:
+            continue
+        target = k
+        if codes & v["codes"]:
+            print(f"[경고] {fname}: 같은 호스트({h})의 같은 항목 결과가 이미 있음 - 같은 장비 재점검이면 이전 파일 삭제, 다른 장비면 결과 헤더 '# IP:' 확인")
+        break
+    if target is None and same:   # 같은 호스트명의 다른 장비
+        for k in same:
+            v = reg[k]
+            if k == h and v["ip"]:   # 먼저 들어온 대상도 IP 로 구분
+                nk = alias(h, v["ip"], "")
+                reg[nk] = reg.pop(k)
+                for d in (all_results, evidences):
+                    if k in d:
+                        d[nk] = d.pop(k)
+                for hi in hosts_info:
+                    if hi.get("hostname") == k:
+                        hi["hostname"] = nk
+        target, n = alias(h, ip, fname), 2
+        while target in reg:
+            target, n = f"{alias(h, ip, fname)}~{n}", n + 1
+        print(f"[INFO] {fname}: 호스트명 {hinfo['hostname']} 이(가) 다른 장비와 같음 → '{target}' 로 구분")
+    target = target or h
+    reg.setdefault(target, {"host": h, "ip": ip, "codes": set()})
+    reg[target]["codes"] |= set(codes)
+    reg[target]["ip"] = reg[target]["ip"] or ip
+    hinfo["hostname"] = target
 
 
 # ================================================================
@@ -2687,6 +2764,7 @@ def is_applicable(item, subtype):
 # 기준: 주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드 (한국인터넷진흥원, 2026)
 #       — 2026판 PDF (873쪽, 작성 2025-12-23)
 #       Unix U-01~U-67 / Windows W-01~W-64 / 웹 WEB-01~WEB-26 / 보안장비 S-01~S-23 / 네트워크 N-01~N-38 / PC PC-01~PC-18 / DBMS D-01~D-26
+#       가상화 장비 HV-01~HV-25
 #       ※ 전자금융기반시설 평가기준(SRV/DBM/NET 등)과 항목코드·판단기준이 다름 — 이 표만 사용
 # code: (중요도, 분류, 점검항목) — 주요정보(MI) 모드 보고서는 이 항목 체계로 출력
 KISA_GUIDE_ITEMS = {
@@ -2959,6 +3037,32 @@ KISA_GUIDE_ITEMS = {
     "D-24": ("상", "옵션 관리", "Registry Procedure 권한 제한"),
     "D-25": ("상", "패치 관리", "주기적 보안 패치 및 벤더 권고 사항 적용"),
     "D-26": ("상", "패치 관리", "데이터베이스의 접근, 변경, 삭제 등의 감사 기록이 기관의 감사 기록 정책에 적합하도록 설정"),
+    # HV — 가상화 장비 (11장)
+    "HV-01": ("상", "계정 관리", "계정 로그오프/세션 관리"),
+    "HV-02": ("상", "계정 관리", "가상화 장비 외부접속 차단"),
+    "HV-03": ("상", "계정 관리", "가상화 장비 루트계정 관리"),
+    "HV-04": ("상", "계정 관리", "가상화 장비 계정 권한 관리"),
+    "HV-05": ("상", "계정 관리", "가상화 장비 사용자 인증 강화"),
+    "HV-06": ("상", "계정 관리", "비밀번호 관리정책 설정"),
+    "HV-07": ("상", "계정 관리", "계정 잠금 임계값 설정"),
+    "HV-08": ("중", "시스템 서비스 관리", "시스템 사용 주의사항 출력 설정"),
+    "HV-09": ("중", "시스템 서비스 관리", "NTP 및 시각 동기화 설정"),
+    "HV-10": ("중", "시스템 서비스 관리", "SNMP Community String 복잡성 적용"),
+    "HV-11": ("상", "시스템 서비스 관리", "MOB(Managed Object Browser) 서비스 비활성화"),
+    "HV-12": ("상", "시스템 서비스 관리", "ESXi Shell 비활성화"),
+    "HV-13": ("상", "시스템 서비스 관리", "ESXi Shell 세션 종료 시간 설정"),
+    "HV-14": ("중", "시스템 서비스 관리", "원격 로그 서버 이용"),
+    "HV-15": ("상", "시스템 서비스 관리", "시스템 주요 이벤트 로그 설정"),
+    "HV-16": ("상", "시스템 서비스 관리", "비휘발성 경로 내 로그 파일 저장"),
+    "HV-17": ("상", "가상 머신 관리", "코어덤프 수집 기능 활성화"),
+    "HV-18": ("상", "가상 머신 관리", "가상 머신의 장치 변경 제한 설정"),
+    "HV-19": ("상", "가상 머신 관리", "가상 머신의 불필요한 장치 제거"),
+    "HV-20": ("상", "가상 머신 관리", "가상 머신 콘솔 클립보드 복사&붙여넣기 기능 비활성화"),
+    "HV-21": ("상", "가상 머신 관리", "가상 머신 콘솔 드래그 앤 드롭 기능 비활성화"),
+    "HV-22": ("상", "가상 네트워크 관리", "가상 스위치 MAC 주소 변경 정책 비활성화"),
+    "HV-23": ("상", "가상 네트워크 관리", "가상 스위치 무차별(Promiscuous) 모드 정책 비활성화"),
+    "HV-24": ("상", "가상 네트워크 관리", "가상 스위치 위조전송(Forged Transmits) 모드 정책 비활성화"),
+    "HV-25": ("상", "가상 네트워크 관리", "주기적 보안 패치 및 벤더 권고사항 적용"),
 }
 
 
@@ -3753,6 +3857,82 @@ KISA_GUIDE_CRITERIA = {
     "D-26": ("DBMS의 감사 로그 저장 정책이 수립되어 있으며, 정책 설정이 적용된 경우",
              "DBMS에 대한 감사 로그 저장을 하지 않거나, 정책 설정이 적용되지 않은 경우",
              "DBMS에 대한 감사 로그 저장 정책 수립, 적용"),
+    # HV — 가상화 장비 (가이드 p790~852)
+    "HV-01": ("웹 콘솔 및 사용자 Shell Session Timeout 설정이 600초(10분) 이하로 설정된 경우",
+              "웹 콘솔 및 사용자 Shell Session Timeout 설정이 600초(10분)를 초과하여 설정된 경우",
+              "600초(10분) 동안 입력이 없을 경우 접속된 클라이언트 세션을 끊도록 설정"),
+    "HV-02": ("허용된 IP에서만 관리 콘솔 및 원격 접속이 가능하도록 제한된 경우",
+              "허용된 IP에서만 관리 콘솔 및 원격 접속이 가능하도록 제한되지 않은 경우",
+              "호스트에서 제공하는 방화벽 애플리케이션을 이용하여 서비스 접속 허용 IP 등록 설정"),
+    "HV-03": ("별도의 관리자 계정을 생성하여 가상화 장비가 관리된 경우",
+              "루트 계정으로 가상화 장비가 관리된 경우",
+              "별도의 계정을 생성하여 관리자 권한을 부여하고 루트 계정의 권한은 제거하거나 비활성화"),
+    "HV-04": ("불필요한 공용 계정 및 퇴사자 계정이 존재하지 않은 경우",
+              "불필요한 공용 계정 및 퇴사자 계정이 존재하는 경우",
+              "불필요한 공용 계정 및 퇴사자 계정 제거"),
+    "HV-05": ("계정별 불필요한 권한이 부여되지 않은 경우",
+              "계정별 불필요한 권한이 부여된 경우",
+              "불필요한 권한이 부여된 계정에 대한 권한 제거"),
+    "HV-06": ("로그인 계정 비밀번호 관리 정책이 적용된 경우",
+              "로그인 계정 비밀번호 관리 정책이 적용되지 않은 경우",
+              "로그인 계정 비밀번호를 관리 정책에 맞게 설정 (정책 기준: 영문·숫자·특수문자 2개 조합 시 10자리 이상, 3개 조합 시 8자리 이상, 비밀번호 변경 기간 90일 이하)"),
+    "HV-07": ("로그인 시도 실패 횟수에 따른 계정 잠금 설정이 적용된 경우",
+              "로그인 시도 실패 횟수에 따른 계정 잠금 설정이 적용되지 않은 경우",
+              "로그인 시도 실패 횟수 제한 설정"),
+    "HV-08": ("시스템 사용 주의사항이 출력된 경우",
+              "시스템 사용 주의사항 미출력 또는 표시 문구 내에 시스템 버전 정보가 노출된 경우",
+              "시스템 사용 주의사항 출력 설정"),
+    "HV-09": ("NTP서버와 시간 동기화 설정을 적용한 경우",
+              "NTP 서버와 시간 동기화 설정을 적용하지 않은 경우",
+              "NTP 설정 및 시각 동기화 설정"),
+    "HV-10": ("SNMP Community String이 복잡도를 만족하는 경우",
+              "SNMP Community String이 복잡도를 만족하지 않는 경우",
+              "SNMP Community String을 복잡도를 만족하는 값으로 설정 (SNMP v3 사용 우선 권고)"),
+    "HV-11": ("MOB(Managed Object Browser)가 비활성화된 경우",
+              "MOB(Managed Object Browser)가 활성화된 경우",
+              "MOB(Managed Object Browser)서비스 비활성화 설정"),
+    "HV-12": ("ESXi Shell(TSM, TSM-SSH) 서비스가 비활성화된 경우",
+              "ESXi Shell(TSM, TSM-SSH) 서비스가 활성화된 경우",
+              "ESXi Shell(TSM, TSM-SSH) 서비스 비활성화 설정"),
+    "HV-13": ("Session Timeout 값(ESXiShellInteractiveTimeOut)이 600 이하로 설정된 경우",
+              "Session Timeout 값(ESXiShellInteractiveTimeOut)이 0이거나, 600초과로 설정된 경우",
+              "Session Timeout 값(ESXiShellInteractiveTimeOut)을 600 이하로 설정 (※ 가이드 조치 방법 원문 '900 이하'는 판단기준 600초와 불일치 - 판단기준 적용)"),
+    "HV-14": ("원격 로그 서버 또는 스토리지가 연동 설정된 경우",
+              "원격 로그 서버 또는 스토리지가 연동 설정되지 않은 경우",
+              "원격 로그 서버 또는 스토리지 연동 설정"),
+    "HV-15": ("로그 기록 정책이 내부 정책에 부합하게 설정된 경우",
+              "로그 기록 정책이 내부 정책에 부합하게 설정되지 않은 경우",
+              "로그 기록 정책을 내부 정책에 부합하게 설정"),
+    "HV-16": ("로그 파일 경로가 존재하며, 해당 경로가 비휘발성 경로에 저장된 경우",
+              "로그 파일 경로가 존재하지 않거나, 비휘발성 경로에 저장되지 않은 경우",
+              "로그 파일 경로를 비휘발성 로그 파일 경로로 설정 (※ /scratch, /tmp 등은 휘발성 경로)"),
+    "HV-17": ("코어 덤프 수집 기능이 활성화(true)된 경우",
+              "코어 덤프 수집 기능이 비활성화(false)된 경우",
+              "코어 덤프 수집 기능 활성화 적용"),
+    "HV-18": ("가상 머신의 장치 설정 변경 방지 설정이 활성화(true)된 경우",
+              "가상 머신의 장치 설정 변경 방지 설정이 없거나, 비활성화(false)된 경우",
+              "가상 머신의 장치 설정 변경 방지 활성화 적용"),
+    "HV-19": ("불필요한 장치가 가상 머신에 연결되지 않은 경우",
+              "불필요한 장치가 가상 머신에 연결된 경우",
+              "불필요한 장치 연결 해제 적용"),
+    "HV-20": ("가상 머신 콘솔 복사 기능이 비활성화 되어 있거나, 복사 제한이 설정된 경우",
+              "가상 머신 콘솔 복사 기능이 활성화 되어 있거나, 복사 제한이 설정되지 않은 경우",
+              "가상 머신 콘솔 복사 제한 설정"),
+    "HV-21": ("가상 머신 콘솔 드래그 앤 드롭 기능이 비활성화되어 있거나, 제한 설정된 경우",
+              "가상 머신 콘솔 드래그 앤 드롭 기능이 활성화되어 있거나, 제한 설정되지 않은 경우",
+              "가상 머신 콘솔 드래그 앤 드롭 제한 설정"),
+    "HV-22": ("가상 스위치 MAC 주소 변경 정책이 거부로 설정된 경우",
+              "가상 스위치 MAC 주소 변경 정책이 허용으로 설정된 경우",
+              "가상 스위치 MAC 주소 변경 정책 거부 설정"),
+    "HV-23": ("가상 스위치 무차별(Promiscuous) 모드 정책 설정이 거부로 설정된 경우",
+              "가상 스위치 무차별(Promiscuous) 모드 정책 설정이 허용으로 설정된 경우",
+              "가상 스위치 무차별(Promiscuous) 모드 정책 거부 설정"),
+    "HV-24": ("가상 스위치에 위조 전송(Forged Transmits) 모드 설정이 거부로 설정된 경우",
+              "가상 스위치에 위조 전송(Forged Transmits) 모드 설정이 허용으로 설정된 경우",
+              "위조 전송(Forged Transmits) 모드 거부 설정"),
+    "HV-25": ("패치 절차를 수립하여 주기적으로 패치 및 벤더 권고사항을 확인 및 적용하는 경우",
+              "패치 절차가 수립되어 있지 않거나 주기적으로 패치를 설치하지 않는 경우",
+              "장비별 제공하는 최신 취약점 정보를 파악 후 최신 패치 및 업그레이드를 수행"),
 }
 
 # 가이드 항목별 점검 대상(원문) — DBMS 제품별 대상 여부 판정에 사용
@@ -3789,9 +3969,9 @@ KISA_GUIDE_TARGET = {
 KISA_RISK_SCORE = {"상": 3, "중": 2, "하": 1}
 
 KISA_FAMILY_LABEL = {"U": "Unix 서버", "W": "Windows 서버", "WEB": "웹 서비스", "D": "DBMS", "N": "네트워크 장비",
-                     "S": "보안장비", "PC": "PC"}
-KISA_FAMILY_SHORT = {"U": "Unix", "W": "Windows", "WEB": "WEB", "D": "DBMS", "N": "NET", "S": "SEC", "PC": "PC"}
-KISA_CATEGORY_FAMILY = {"server": None, "webwas": "WEB", "dbms": "D", "network": "N", "security": "S"}
+                     "S": "보안장비", "PC": "PC", "HV": "가상화 장비"}
+KISA_FAMILY_SHORT = {"U": "Unix", "W": "Windows", "WEB": "WEB", "D": "DBMS", "N": "NET", "S": "SEC", "PC": "PC", "HV": "HV"}
+KISA_CATEGORY_FAMILY = {"server": None, "webwas": "WEB", "dbms": "D", "network": "N", "security": "S", "virtualization": "HV"}
 
 KISA_EF_SOURCES = {   # 2026 상세가이드 항목 → 판정 근거로 참조할 전자금융 스크립트 항목 (평가기준 엑셀 '과기정통부 고시 제2025-62호' 연계 열) — 판단기준은 가이드 기준
     "U-01": ['SRV-026', 'WST-023'],
@@ -4904,6 +5084,7 @@ FILL_LIGHT_BLUE = PatternFill("solid", fgColor="D6E4F0")
 CAT_LABEL = {
     "server":"서버", "webwas":"웹/WAS", "dbms":"DBMS",
     "network":"네트워크 장비", "security":"보안장비", "pc":"PC(업무용 단말)",
+    "virtualization":"가상화 장비",
 }
 
 
@@ -4937,6 +5118,8 @@ def _parse_header_info(text):
             info["standard"] = v
         elif "dbms" in kl or "dbms 종류" in k:
             info["dbms"] = v
+        elif kl in ("ip", "ip 주소") and v and not v.startswith("확인"):
+            info["ip"] = v
         elif "버전" in k and not info.get("version"):
             info["version"] = v
     if info.get("dbms") and info.get("version"):
@@ -5134,6 +5317,7 @@ _KISA_ENV_RULES = [
     (r"MYSQL|MARIADB", r"^MySQL"), (r"POSTGRE|PGSQL", r"^PostgreSQL"), (r"\bORACLE\b(?! LINUX)", r"^Oracle DB"),
     (r"MSSQL|SQL ?SERVER", r"^MSSQL"), (r"TIBERO", r"^Tibero"), (r"ALTIBASE", r"^Altibase"), (r"CUBRID", r"^Cubrid"),
     (r"CISCO", r"^Cisco"), (r"JUNIPER|JUNOS", r"^Juniper"), (r"ALTEON|RADWARE", r"Alteon"), (r"PIOLINK", r"^Piolink"), (r"PASSPORT", r"^Passport"),
+    (r"ESXI", r"^VMware ESXi"), (r"VCENTER|VCSA", r"VMware vCenter|vCenter$"),
 ]
 
 
@@ -5454,7 +5638,7 @@ def _create_overview_sheet(wb, mode, category, hosts_info, criteria_items=None, 
         basis = "주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드(2026, 과기정통부 고시 제2025-62호)"
     ws.cell(r, 2).value = (
         f"본 보고서는 {basis}에 따라 {cat_str}"
-        f"{'' if category in ('network', 'pc') else ' 시스템'}에 대해 "
+        f"{'' if category in ('network', 'pc', 'virtualization') else ' 시스템'}에 대해 "
         "기술적 취약점 점검을 실시하고, 발견된 취약점에 대한 위험도 분석 및 "
         "개선 방안을 제시하여 정보보호 수준을 향상하는 것을 목적으로 합니다."
     )
@@ -7241,6 +7425,7 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
     all_results = {}
     evidences   = {}
     hosts_info  = []
+    host_reg    = {}
 
     for fname in input_files:
         pure = os.path.splitext(fname)[0]
@@ -7257,6 +7442,7 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
         res = parse_pipe(text)
         if _category_mismatch(res, criteria_items, fname):
             continue
+        raw_codes = set(res)
         evd_path = os.path.join(input_dir, fname) if evidence_only else find_evidence_file(os.path.join(input_dir, fname))
         if evd_path:
             evidence = parse_evidence(evd_path)
@@ -7280,6 +7466,7 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
                     res[code] = (RESULT_NA, f"현재 유형({web_disp}/{was_disp})에 해당 없는 항목")
 
         res = run_eos_check("webwas", res, text, base_dir)
+        _resolve_host(hinfo, raw_codes, host_reg, fname, all_results, hosts_info, evidences)
 
         detected_sub = detect_srv_os(text)
         if detected_sub:
@@ -7292,7 +7479,7 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
             if forced:
                 print(f"[INFO] {fname} → 평가대상 아닌 항목 {forced}건 N-A 보정")
         if mode == "MI":   # 가이드 항목 변환 후 현황 구성
-            evidences[hinfo["hostname"]] = evidence
+            evidences[hinfo["hostname"]] = {**evidences.get(hinfo["hostname"], {}), **(evidence or {})}
         else:
             res = compose_status(res, evidence, criteria_items, detected_sub)
         _h = hinfo["hostname"]
@@ -7300,8 +7487,6 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
             _old_res, _old_sub = all_results[_h]
             res = {**_old_res, **res}
             detected_sub = detected_sub or _old_sub
-            if _h in evidences:
-                evidences[_h] = {**evidences[_h], **(evidence or {})}
             for _hi in hosts_info:
                 if _hi.get("hostname") == _h:
                     for _k, _v in hinfo.items():
@@ -7685,7 +7870,7 @@ def _no_results_stop(mode, category):
 def run_convert(mode, category, base_dir, criteria_excel):
     """
     mode: "EF" or "MI"
-    category: "server", "webwas", "dbms", "network", "security", "pc"
+    category: "server", "webwas", "dbms", "network", "security", "pc", "virtualization"
     base_dir: convert/ 루트 폴더
     criteria_excel: 기준 엑셀 경로
     """
@@ -7697,6 +7882,11 @@ def run_convert(mode, category, base_dir, criteria_excel):
     # PC는 기준 엑셀 없이 코드 내장 항목으로 처리
     if category == "pc":
         run_pc_convert(mode, base_dir)
+        return
+
+    # 가상화 장비: 주요정보 2026 가이드(HV-01~25) 항목만 지원 (전자금융 평가기준 가상화 분야와 항목 체계 다름)
+    if category == "virtualization" and mode != "MI":
+        print("[ERROR] 가상화 장비(HV) 결과는 '2. 주요정보통신기반시설' 기준으로만 변환합니다 - 평가 기반을 2 로 선택하세요.")
         return
 
     cat_dir    = os.path.join(base_dir, category)
@@ -7736,9 +7926,10 @@ def run_convert(mode, category, base_dir, criteria_excel):
     kisa_mode   = mode == "MI" and category in KISA_CATEGORY_FAMILY
     if kisa_mode:
         # 주요정보: 판정 기준은 2026 상세가이드. 전자금융 점검 스크립트 결과는 가이드 항목 판정 근거 자료로만 사용
-        criteria_items = load_criteria(criteria_excel, sheet_name, "EF")
+        criteria_items = load_criteria(criteria_excel, sheet_name, "EF") if sheet_name else {}
         print("[INFO] 판정 기준: 주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드(2026)")
-        print(f"[INFO] 전자금융 점검 스크립트 결과가 있으면 판정 근거 자료로 사용 ({len(criteria_items)}개 항목 코드 인식)")
+        if criteria_items:
+            print(f"[INFO] 전자금융 점검 스크립트 결과가 있으면 판정 근거 자료로 사용 ({len(criteria_items)}개 항목 코드 인식)")
     else:
         print(f"[INFO] 기준 엑셀 로드: {sheet_name}")
         criteria_items = load_criteria(criteria_excel, sheet_name, mode)
@@ -7749,13 +7940,15 @@ def run_convert(mode, category, base_dir, criteria_excel):
     all_results = {}
     evidences   = {}
     hosts_info  = []
+    host_reg    = {}
     for fname in sorted(input_files):
         path  = os.path.join(input_dir, fname)
         pure  = os.path.splitext(fname)[0]
         text  = read_text(path)
         if evidence_only:
             text = _evidence_to_pipe_text(text)
-            pure = re.sub(r"(_(srv|server|u|w|kisa|webwas|dbms|iss|pc))?_evidence$", "", pure, flags=re.I)
+            pure = re.sub(r"(_(srv|server|u|w|kisa|webwas|dbms|hv|iss|pc))?_evidence$", "", pure, flags=re.I)
+        text, inline_evd = split_inline_evidence(text)
         lines = text.splitlines()
 
         hinfo = _parse_header_info(text)
@@ -7767,10 +7960,14 @@ def run_convert(mode, category, base_dir, criteria_excel):
             res = parse_pipe(text)
             if _category_mismatch(res, known_codes, fname):
                 continue
+            raw_codes = set(res)
             if not kisa_mode and any(k in KISA_GUIDE_ITEMS for k in res) and not any(k in criteria_items for k in res):
                 continue
             evd_path = path if evidence_only else find_evidence_file(path)
-            if evd_path:
+            if inline_evd:
+                evidence = parse_evidence_text(inline_evd)
+                print(f"[INFO] {fname} → 결과 파일 안 증적 병합 ({len(evidence)}건)")
+            elif evd_path:
                 evidence = parse_evidence(evd_path)
                 print(f"[INFO] {fname} → 증적 파일 병합: {os.path.basename(evd_path)} ({len(evidence)}건)")
             if category == "server":
@@ -7824,6 +8021,7 @@ def run_convert(mode, category, base_dir, criteria_excel):
         else:  # network config
             vendor = detect_net_vendor(text)
             res    = build_net_checks(lines, text)
+            raw_codes = set(res)
             sub_key = None
             # 판정된 항목도 평가대상(장비 유형·벤더 그룹) 아니면 N-A
             for code in list(res):
@@ -7852,10 +8050,11 @@ def run_convert(mode, category, base_dir, criteria_excel):
             print(f"[INFO] {fname} → 벤더: {vendor}, 취약: {sum(1 for v in res.values() if v[0]==RESULT_BAD)}건")
 
         res = run_eos_check(category, res, text, base_dir)
+        _resolve_host(hinfo, raw_codes, host_reg, fname, all_results, hosts_info, evidences)
 
         detected_sub = sub_key if input_mode == "pipe" else "GENERIC"
         if kisa_mode:   # 가이드 항목 변환 후 현황 구성
-            evidences[hinfo["hostname"]] = evidence
+            evidences[hinfo["hostname"]] = {**evidences.get(hinfo["hostname"], {}), **(evidence or {})}
         else:
             res = compose_status(res, evidence, criteria_items, detected_sub)
         _h = hinfo["hostname"]
@@ -7863,8 +8062,6 @@ def run_convert(mode, category, base_dir, criteria_excel):
             _old_res, _old_sub = all_results[_h]
             res = {**_old_res, **res}
             detected_sub = detected_sub or _old_sub
-            if _h in evidences:
-                evidences[_h] = {**evidences[_h], **(evidence or {})}
             for _hi in hosts_info:
                 if _hi.get("hostname") == _h:
                     for _k, _v in hinfo.items():
@@ -7875,9 +8072,9 @@ def run_convert(mode, category, base_dir, criteria_excel):
             continue
         all_results[_h] = (res, detected_sub)
         hosts_info.append(hinfo)
-        total = sum(1 for k in res if k in criteria_items)
-        bad   = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_BAD)
-        good  = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_GOOD)
+        total = sum(1 for k in res if k in known_codes)
+        bad   = sum(1 for k, v in res.items() if k in known_codes and v[0] == RESULT_BAD)
+        good  = sum(1 for k, v in res.items() if k in known_codes and v[0] == RESULT_GOOD)
         print(f"[INFO] {fname} → 총 {total}개 / 양호 {good} / 취약 {bad}")
 
     if not all_results:
@@ -7972,12 +8169,11 @@ def main():
                              if "취약점" in f and "평가기준" in f and f.endswith(".xlsx")]
     criteria_excel = next((p for p in criteria_candidates if os.path.exists(p)), None)
 
-    if not criteria_excel:
-        print("[ERROR] 기준 엑셀 파일을 찾을 수 없습니다.")
-        print("  → 이 스크립트와 같은 폴더에 '전자금융기반시설_보안_취약점_평가기준_제2026-1호.xlsx' 를 넣어주세요.")
-        sys.exit(1)
-
-    print(f"\n[기준 엑셀] {os.path.basename(criteria_excel)}")
+    if criteria_excel:
+        print(f"\n[기준 엑셀] {os.path.basename(criteria_excel)}")
+    else:   # PC·가상화 장비는 기준 엑셀 없이 변환 (코드 내장 항목 / 2026 가이드 항목)
+        print("\n[경고] 기준 엑셀 파일 없음 - PC·가상화 장비만 변환할 수 있습니다.")
+        print("  → 다른 분야는 이 스크립트와 같은 폴더에 '전자금융기반시설_보안_취약점_평가기준_제2026-1호.xlsx' 를 넣어주세요.")
 
     # ── 1단계: 평가 기반 선택 ─────────────────────────────────
     print("\n[1단계] 평가 기반 선택")
@@ -7992,19 +8188,20 @@ def main():
     # ── 2단계: 점검 대상 선택 ─────────────────────────────────
     print(f"\n[2단계] 점검 대상 선택 ({mode_name})")
     if mode == "MI":   # 2026 상세가이드 항목코드
-        codes = ["U-01~67 / W-01~64", "WEB-01~26", "D-01~26", "N-01~38", "S-01~23", "PC-01~18"]
+        codes = ["U-01~67 / W-01~64", "WEB-01~26", "D-01~26", "N-01~38", "S-01~23", "PC-01~18", "HV-01~25"]
     else:
-        codes = ["SRV-xxx", "WST-xxx", "DBM-xxx", "NET-xxx", "ISS-xxx", "PC-xx"]
+        codes = ["SRV-xxx", "WST-xxx", "DBM-xxx", "NET-xxx", "ISS-xxx", "PC-xx", "주요정보 기준 전용"]
     print(f"  1. 서버           ({codes[0]}: Linux/Unix/Windows - AIX, HP-UX, LINUX, Solaris, Windows)")
     print(f"  2. 웹서버/WAS     ({codes[1]}: Apache, Nginx, WebtoB, Tomcat, JEUS, IIS)")
     print(f"  3. 데이터베이스   ({codes[2]}: Oracle, MSSQL, MySQL, MariaDB, PostgreSQL, Tibero)")
     print(f"  4. 네트워크 장비  ({codes[3]}: Cisco, A10, Alteon, Juniper, D-Link)")
     print(f"  5. 보안장비       ({codes[4]}: FW, VPN, IDS, IPS, DDoS, WAF)")
     print(f"  6. PC(업무용단말) ({codes[5]}: Windows 10/11, macOS)")
-    print("  7. EoS 현황       (서버·웹/WAS·DBMS·네트워크 OS·버전·커널 → 지원 종료 대수 .txt)")
+    print(f"  7. 가상화 장비    ({codes[6]}: VMware ESXi)")
+    print("  8. EoS 현황       (서버·웹/WAS·DBMS·네트워크 OS·버전·커널 → 지원 종료 대수 .txt)")
     while True:
-        sel = input("  선택 (1~7): ").strip()
-        if sel == "7":
+        sel = input("  선택 (1~8): ").strip()
+        if sel == "8":
             write_eos_inventory(base_dir)
             return
         if sel == "1": category = "server";   cat_name = "서버"; break
@@ -8013,7 +8210,13 @@ def main():
         if sel == "4": category = "network";  cat_name = "네트워크 장비"; break
         if sel == "5": category = "security"; cat_name = "보안장비"; break
         if sel == "6": category = "pc";       cat_name = "PC(업무용 단말)"; break
-        print("  1~7 중 하나를 입력하세요.")
+        if sel == "7": category = "virtualization"; cat_name = "가상화 장비"; break
+        print("  1~8 중 하나를 입력하세요.")
+
+    if not criteria_excel and category not in ("pc", "virtualization"):
+        print("[ERROR] 기준 엑셀 파일을 찾을 수 없습니다.")
+        print("  → 이 스크립트와 같은 폴더에 '전자금융기반시설_보안_취약점_평가기준_제2026-1호.xlsx' 를 넣어주세요.")
+        sys.exit(1)
 
     print(f"\n[실행] {mode_name} / {cat_name} 점검 컨버팅 시작")
     sub = "config" if category == "network" else "output"

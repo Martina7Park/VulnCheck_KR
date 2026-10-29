@@ -118,6 +118,13 @@ get_owner() {
 }
 
 HN=$(hostname 2>/dev/null || uname -n)
+# 대표 IPv4 (결과 헤더 '# IP:' — 호스트명이 같은 장비(localhost.localdomain 등)를 컨버터가 구분). Linux 외 hostname -I 는 호스트명 변경 위험이 있어 사용 안 함
+_primary_ip() {
+    case "$(uname -s 2>/dev/null)" in
+    Linux) { hostname -I 2>/dev/null | tr ' ' '\n'; ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}'; } ;;
+    *)     { ifconfig -a 2>/dev/null | awk '/inet / {a = $2; sub(/^addr:/, "", a); print a}'; netstat -in 2>/dev/null | awk 'NR > 1 {print $4}'; } ;;
+    esac | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && !/^127\./ {print; exit}'
+}
 # ── 결과 사본 자동 저장: '> 파일' 리다이렉트를 빠뜨려도 판정 결과가 증적과 같은 위치에 남도록 표준출력을 복사 ──
 # ── 점검 기준 선택: 인자 ef|mi|all (또는 1|2|3), 미지정 시 메뉴 / 터미널이 아니면(자동 실행) all ──
 _KMODE="${1:-${CHECK_MODE:-}}"
@@ -153,6 +160,7 @@ fi
 
 echo "# ================================================================"
 echo "# 점검 대상: ${HN}"
+echo "# IP: $(_primary_ip)"
 echo "# DBMS 종류: ${DBMS_TYPE}"
 echo "# OS: ${OS_FAMILY}"
 echo "# OS 상세: $( ( [ -r /etc/os-release ] && . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-$NAME $VERSION_ID}" ) || ( command -v oslevel >/dev/null 2>&1 && echo "AIX $(oslevel -s 2>/dev/null)" ) || ( [ -r /etc/release ] && head -1 /etc/release | sed 's/^ *//' ) || uname -sr 2>/dev/null)"
@@ -249,7 +257,7 @@ _flush_results() {
     local k line _hasd=0
     case " $_ORDER" in *" D-"*) _hasd=1 ;; esac
     if [ "$_KMODE" = "mi" ] && [ "$_hasd" = 0 ]; then
-        echo "# [안내] ${DBMS_TYPE:-DBMS}: 가이드 D 항목 직접 판정 미지원(MySQL·MariaDB·PostgreSQL 만 지원) - 전자금융 DBM 결과를 출력하며, 컨버터 주요정보 모드가 가이드 D 항목으로 변환"
+        echo "# [안내] ${DBMS_TYPE:-DBMS}: 가이드 D 항목 직접 판정 미지원(Oracle·MySQL·MariaDB·PostgreSQL 만 지원) - 전자금융 DBM 결과를 출력하며, 컨버터 주요정보 모드가 가이드 D 항목으로 변환"
     fi
     for k in $_ORDER; do
         case "$_KMODE:$k" in
@@ -2153,6 +2161,228 @@ kisa_pgsql() {
                      || _kput "D-26" "취약" "logging_collector=${_lc:-확인 불가} - 감사 로그 저장 미설정"
 }
 
+# 주요정보 상세가이드(2026) D 항목 — Oracle (check_oracle 이 만든 run_q·run_qa·_prof·_ora_net·_ora_dbs 사용)
+kisa_oracle() {
+    _KDB="Oracle"
+    if [ "${_DB_CONN:-0}" != 1 ]; then
+        _kisa_fail "DB 접속 실패/sqlplus 미탐지 - 접속 정보 확인 후 재점검" "D-01 D-02 D-03 D-04 D-05 D-06 D-07 D-08 D-09 D-10 D-11 D-12"
+        _KNA D-13
+        _kisa_fail "DB 접속 실패/sqlplus 미탐지 - 접속 정보 확인 후 재점검" "D-14 D-15"
+        _KNA D-16
+        _kisa_fail "DB 접속 실패/sqlplus 미탐지 - 접속 정보 확인 후 재점검" "D-17 D-18 D-19 D-20 D-21 D-22"
+        _KNA D-23 D-24
+        _kisa_fail "DB 접속 실패/sqlplus 미탐지 - 접속 정보 확인 후 재점검" "D-25 D-26"
+        return
+    fi
+    # Oracle 기본 제공 계정·역할 제외 조건 (12c+: ORACLE_MAINTAINED, 11g: 고정 목록)
+    local _omu _omr _dba="(SELECT GRANTEE FROM DBA_ROLE_PRIVS WHERE GRANTED_ROLE='DBA')"
+    if [ "${DB_MAJ:-0}" -ge 12 ] 2>/dev/null; then
+        _omu="(SELECT USERNAME FROM DBA_USERS WHERE ORACLE_MAINTAINED='Y')"
+        _omr="(SELECT ROLE FROM DBA_ROLES WHERE ORACLE_MAINTAINED='Y')"
+    else
+        _omu="('SYS','SYSTEM','OUTLN','DBSNMP','MDSYS','CTXSYS','ORDSYS','ORDPLUGINS','ORDDATA','XDB','WMSYS','OLAPSYS','EXFSYS','LBACSYS','SYSMAN','MGMT_VIEW','APPQOSSYS','ORACLE_OCM','DIP','XS\$NULL','ANONYMOUS','SI_INFORMTN_SCHEMA','SPATIAL_CSW_ADMIN_USR','SPATIAL_WFS_ADMIN_USR','FLOWS_FILES','APEX_PUBLIC_USER','OWBSYS','OWBSYS_AUDIT','TSMSYS','MDDATA')"
+        _omr="('DBA','CONNECT','RESOURCE','SELECT_CATALOG_ROLE','EXECUTE_CATALOG_ROLE','DELETE_CATALOG_ROLE','EXP_FULL_DATABASE','IMP_FULL_DATABASE','AQ_ADMINISTRATOR_ROLE','AQ_USER_ROLE','SCHEDULER_ADMIN','GATHER_SYSTEM_STATISTICS','LOGSTDBY_ADMINISTRATOR','RECOVERY_CATALOG_OWNER','HS_ADMIN_ROLE','OEM_MONITOR','OEM_ADVISOR','WM_ADMIN_ROLE','XDBADMIN','XDB_SET_INVOKER','XDB_WEBSERVICES','XDB_WEBSERVICES_OVER_HTTP','XDB_WEBSERVICES_WITH_PUBLIC','DATAPUMP_EXP_FULL_DATABASE','DATAPUMP_IMP_FULL_DATABASE','JAVA_ADMIN','JAVA_DEPLOY','JAVASYSPRIV','JAVAUSERPRIV','JAVADEBUGPRIV','JAVAIDPRIV','EJBCLIENT','CTXAPP','OLAP_DBA','OLAP_USER','OLAP_XS_ADMIN','MGMT_USER','ADM_PARALLEL_EXECUTE_TASK','DBFS_ROLE','HS_ADMIN_SELECT_ROLE','HS_ADMIN_EXECUTE_ROLE','AUTHENTICATEDUSER','CSW_USR_ROLE','SPATIAL_CSW_ADMIN','SPATIAL_WFS_ADMIN','WFS_USR_ROLE','JMXSERVER','ORDADMIN','PLUSTRACE')"
+    fi
+    _ql() { run_qa "$1" | grep -v '^[[:space:]]*$'; }   # 결과 줄 (ORA- 오류 줄 포함 → 호출부에서 판별)
+    _qerr() { echo "$1" | grep -m1 -oE '(ORA|SP2)-[0-9]+[^,]*'; }
+
+    # D-01 기본 계정 초기 비밀번호 변경 또는 잠금
+    local _dp _dpo
+    _dp=$(_ql "SELECT d.USERNAME FROM DBA_USERS_WITH_DEFPWD d JOIN DBA_USERS u ON u.USERNAME=d.USERNAME WHERE u.ACCOUNT_STATUS='OPEN' ORDER BY 1;")
+    _dpo=$(_ql "SELECT USERNAME||'('||ACCOUNT_STATUS||')' FROM DBA_USERS WHERE USERNAME IN ('SYS','SYSTEM','DBSNMP','SCOTT','OUTLN','MDSYS','CTXSYS','ORDSYS','ORDPLUGINS','TRACESVR','LBACSYS','ADAMS','BLAKE','CLARK','JONES') ORDER BY 1;" | grep -v 'ORA-')
+    evd_q "D-01" "초기 비밀번호 사용 OPEN 계정(DBA_USERS_WITH_DEFPWD) / 기본 계정 상태" "${_dp:-없음} / $(echo "$_dpo" | _csv)"
+    if [ -n "$(_qerr "$_dp")" ]; then _kput "D-01" "수동확인" "DBA_USERS_WITH_DEFPWD 조회 실패($(_qerr "$_dp")) - 기본 계정 비밀번호 변경·잠금 확인"
+    elif [ -n "$_dp" ]; then _kput "D-01" "취약" "초기(기본) 비밀번호를 사용하는 활성 계정: $(echo "$_dp" | _csv)"
+    else _kput "D-01" "양호" "초기 비밀번호 사용 활성 계정 없음 (DBA_USERS_WITH_DEFPWD) - 기본 계정: $(echo "${_dpo:-없음}" | _csv)"; fi
+
+    # D-02 불필요 계정 (데모·테스트 계정 = 취약, 그 외 인가 여부 확인)
+    local _ou _demo
+    _ou=$(_ql "SELECT USERNAME FROM DBA_USERS WHERE ACCOUNT_STATUS='OPEN' AND USERNAME NOT IN ${_omu} ORDER BY 1;")
+    _demo=$(echo "$_ou" | grep -v 'ORA-' | grep -iE '(^|\])(SCOTT|PM|ADAMS|CLARK|BLAKE|JONES|HR|OE|SH|IX|GUEST|DEMO[A-Z0-9_]*|SAMPLE[A-Z0-9_]*|TEMP|TMP|TEST[A-Z0-9_]*|[A-Z0-9_]*_TEST)$')
+    evd_q "D-02" "OPEN 상태 사용자 계정 (Oracle 기본 제공 제외, CDB\$ROOT + [PDB])" "${_ou:-없음}"
+    if [ -n "$(_qerr "$_ou")" ]; then _kput "D-02" "수동확인" "계정 목록 조회 실패($(_qerr "$_ou")) - DBA_USERS 확인"
+    elif [ -n "$_demo" ]; then _kput "D-02" "취약" "데모·테스트성 활성 계정: $(echo "$_demo" | _csv) - 불필요 시 삭제(DROP USER) 또는 잠금"
+    else _kput "D-02" "수동확인" "활성 사용자 계정 $(echo "$_ou" | grep -c .)개: $(echo "$_ou" | head -15 | _csv) - 인가되지 않은 계정·퇴직자·미사용 계정 여부 확인 (없으면 양호)"; fi
+
+    # D-03 비밀번호 사용 기간(90일 이하)·복잡도(검증 함수)
+    local _lt _vf _blt _bvf
+    _lt=$(_prof PASSWORD_LIFE_TIME); _vf=$(_prof PASSWORD_VERIFY_FUNCTION)
+    evd_q "D-03" "OPEN 계정별 PASSWORD_LIFE_TIME / PASSWORD_VERIFY_FUNCTION (적용 프로파일, DEFAULT 상속 반영)" "$(echo "$_lt" | _csv) / $(echo "$_vf" | _csv)"
+    _blt=$(echo "$_lt" | awk -F= '$2=="UNLIMITED" || $2+0>90 {print}' | head -8)
+    _bvf=$(echo "$_vf" | awk -F= '$2=="" || $2=="NULL" {print $1}' | head -8)
+    if [ -z "$_lt$_vf" ]; then _kput "D-03" "수동확인" "프로파일(PASSWORD_LIFE_TIME·PASSWORD_VERIFY_FUNCTION) 조회 실패 - 수동 확인"
+    elif [ -n "$_blt$_bvf" ]; then _kput "D-03" "취약" "비밀번호 정책 미적용:${_blt:+ 사용 기간 90일 초과/무제한 $(echo "$_blt" | _csv)}${_bvf:+ / 복잡도 검증 함수 미적용 $(echo "$_bvf" | _csv)} - 서비스(응용) 계정은 기관 정책상 예외 여부 확인"
+    else _kput "D-03" "양호" "OPEN 계정 PASSWORD_LIFE_TIME 90일 이하·PASSWORD_VERIFY_FUNCTION 적용 ($(echo "$_vf" | cut -d= -f2 | sort -u | _csv))"; fi
+
+    # D-04 관리자 권한 (가이드: SYSDBA 비DBA 계정·ADMIN OPTION 시스템 권한 보유 비DBA 계정 = 취약, DBA 역할 보유는 필요성 확인)
+    local _sd _ao _dg
+    _sd=$(run_q "SELECT USERNAME FROM V\$PWFILE_USERS WHERE SYSDBA='TRUE' AND USERNAME<>'INTERNAL' AND USERNAME NOT IN ${_dba} ORDER BY 1;" | grep -v '^[[:space:]]*$')
+    _ao=$(_ql "SELECT GRANTEE||':'||PRIVILEGE FROM DBA_SYS_PRIVS WHERE ADMIN_OPTION='YES' AND GRANTEE NOT IN ('SYS','SYSTEM','AQ_ADMINISTRATOR_ROLE','DBA','MDSYS','LBACSYS','SCHEDULER_ADMIN','WMSYS') AND GRANTEE NOT IN ${_omu} AND GRANTEE NOT IN ${_omr} AND GRANTEE NOT IN ${_dba} ORDER BY 1;")
+    _dg=$(_ql "SELECT GRANTEE FROM DBA_ROLE_PRIVS WHERE GRANTED_ROLE='DBA' AND GRANTEE NOT IN ('SYS','SYSTEM') AND GRANTEE NOT IN ${_omu} ORDER BY 1;")
+    evd_q "D-04" "SYSDBA 비DBA 계정(V\$PWFILE_USERS) / ADMIN OPTION 시스템 권한 비DBA 계정 / DBA 역할 보유 계정" "${_sd:-없음} / ${_ao:-없음} / ${_dg:-없음}"
+    if [ -n "$(_qerr "$_sd$_ao$_dg")" ]; then _kput "D-04" "수동확인" "관리자 권한 조회 실패($(_qerr "$_sd$_ao$_dg")) - DBA_ROLE_PRIVS·DBA_SYS_PRIVS·V\$PWFILE_USERS 확인"
+    elif [ -n "$_sd$_ao" ]; then _kput "D-04" "취약" "관리자 권한이 불필요한 계정에 부여:${_sd:+ SYSDBA $(echo "$_sd" | _csv)}${_ao:+ / ADMIN OPTION 시스템 권한 $(echo "$_ao" | head -10 | _csv)}"
+    elif [ -n "$_dg" ]; then _kput "D-04" "수동확인" "SYS·SYSTEM 외 DBA 역할 보유: $(echo "$_dg" | _csv) - 관리자 권한 필요성 확인 (불필요 시 취약)"
+    else _kput "D-04" "양호" "관리자 권한(SYSDBA·DBA·ADMIN OPTION)이 SYS·SYSTEM 등 관리자 계정에만 부여"; fi
+
+    # D-05 비밀번호 재사용 제한 (가이드: REUSE_TIME 365일·REUSE_MAX 10회 이상, 둘 다 UNLIMITED = 제한 없음)
+    local _rm _rt _b5
+    _rm=$(_prof PASSWORD_REUSE_MAX); _rt=$(_prof PASSWORD_REUSE_TIME)
+    evd_q "D-05" "OPEN 계정별 PASSWORD_REUSE_MAX / PASSWORD_REUSE_TIME" "$(echo "$_rm" | _csv) / $(echo "$_rt" | _csv)"
+    _b5=$(join -t= <(echo "$_rm" | sort -t= -k1,1) <(echo "$_rt" | sort -t= -k1,1) 2>/dev/null | awk -F= '($2=="UNLIMITED" && $3=="UNLIMITED") || ($2 ~ /^[0-9.]+$/ && $3 ~ /^[0-9.]+$/ && ($2+0<10 || $3+0<365)) {print $1"(MAX="$2",TIME="$3")"}' | head -8)
+    if [ -z "$_rm" ]; then _kput "D-05" "수동확인" "PASSWORD_REUSE_MAX/TIME 조회 실패 - 수동 확인"
+    elif [ -n "$_b5" ]; then _kput "D-05" "취약" "비밀번호 재사용 제한 미흡 계정: $(echo "$_b5" | _csv) - 가이드 권고 PASSWORD_REUSE_TIME 365, PASSWORD_REUSE_MAX 10"
+    else _kput "D-05" "양호" "OPEN 계정 비밀번호 재사용 제한 적용 (REUSE_MAX 10회·REUSE_TIME 365일 이상 또는 한쪽 UNLIMITED=재사용 불가)"; fi
+
+    # D-06 사용자별 계정 (공용 계정 여부)
+    evd_q "D-06" "OPEN 상태 사용자 계정" "${_ou:-없음}"
+    _kput "D-06" "수동확인" "활성 사용자 계정: $(echo "$_ou" | grep -v 'ORA-' | head -15 | _csv) - 사용자·응용프로그램별 개별 계정 사용 여부(공용 계정 사용 시 취약) 확인"
+
+    # D-07 root 권한 구동 제한 (ora_pmon·tnslsnr 구동 계정)
+    local _pu; _pu=$(ps -eo user=,args= 2>/dev/null | awk '$2 ~ /^ora_pmon_/ || $2 ~ /tnslsnr$/ {print $1}' | sort -u | tr '\n' ' ')
+    evd "D-07" "ps -eo user,args 2>/dev/null | grep -E 'ora_pmon_|tnslsnr' | grep -v grep"
+    if echo " $_pu " | grep -qw root; then _kput "D-07" "취약" "Oracle 프로세스가 root 로 구동: ${_pu% }"
+    elif [ -n "$_pu" ]; then _kput "D-07" "양호" "Oracle(ora_pmon·tnslsnr) 구동 계정: ${_pu% }"
+    else _kput "D-07" "수동확인" "Oracle 프로세스 구동 계정 확인 불가"; fi
+
+    # D-08 SHA-256 이상 (PASSWORD_VERSIONS: 10G=DES, 11G=SHA-1, 12C=SHA-512 기반)
+    local _pv _w8 _alv=""
+    _pv=$(_ql "SELECT USERNAME||'='||PASSWORD_VERSIONS FROM DBA_USERS WHERE ACCOUNT_STATUS='OPEN' AND AUTHENTICATION_TYPE='PASSWORD' ORDER BY 1;")
+    local _n; for _n in $(_ora_net); do [ -f "$_n/sqlnet.ora" ] && _alv=$(grep -iE '^[[:space:]]*SQLNET\.ALLOWED_LOGON_VERSION(_SERVER)?[[:space:]]*=' "$_n/sqlnet.ora" | tail -1 | tr -d ' ') && [ -n "$_alv" ] && break; done
+    evd_q "D-08" "OPEN 계정별 PASSWORD_VERSIONS / sqlnet.ora ALLOWED_LOGON_VERSION" "${_pv:-없음} / ${_alv:-미설정}"
+    _w8=$(echo "$_pv" | grep -v 'ORA-' | awk -F= '$2 ~ /10G|11G/ {gsub(/ +$/,"",$2); print $1"("$2")"}' | head -10)
+    if echo "$_pv" | grep -q 'ORA-00904'; then _kput "D-08" "취약" "Oracle ${DB_VER} - PASSWORD_VERSIONS 미지원(10g 이하 DES 기반 해시)"
+    elif [ -n "$(_qerr "$_pv")" ]; then _kput "D-08" "수동확인" "PASSWORD_VERSIONS 조회 실패($(_qerr "$_pv"))"
+    elif [ -n "$_w8" ]; then _kput "D-08" "취약" "SHA-256 미만 해시(10G=DES·11G=SHA-1) 보유 계정: $(echo "$_w8" | _csv) - SQLNET.ALLOWED_LOGON_VERSION_SERVER=12 이상 설정 후 비밀번호 재설정 (현재 ${_alv:-미설정})"
+    else _kput "D-08" "양호" "OPEN 계정 비밀번호 해시 12C(SHA-512 기반)만 사용 (${_alv:-ALLOWED_LOGON_VERSION 기본값})"; fi
+
+    # D-09 로그인 실패 잠금 (FAILED_LOGIN_ATTEMPTS 설정)
+    local _fl _b9
+    _fl=$(_prof FAILED_LOGIN_ATTEMPTS)
+    evd_q "D-09" "OPEN 계정별 FAILED_LOGIN_ATTEMPTS" "$(echo "$_fl" | _csv)"
+    _b9=$(echo "$_fl" | awk -F= '$2=="UNLIMITED" || $2=="" {print $1}' | head -8)
+    if [ -z "$_fl" ]; then _kput "D-09" "수동확인" "FAILED_LOGIN_ATTEMPTS 조회 실패 - 수동 확인"
+    elif [ -n "$_b9" ]; then _kput "D-09" "취약" "로그인 실패 횟수 제한 없음(UNLIMITED): $(echo "$_b9" | _csv)"
+    else _kput "D-09" "양호" "OPEN 계정 로그인 실패 횟수 제한 설정 (FAILED_LOGIN_ATTEMPTS $(echo "$_fl" | cut -d= -f2 | sort -u | _csv)회)"; fi
+
+    # D-10 원격 접속 IP 제한 (sqlnet.ora TCP.VALIDNODE_CHECKING + INVITED/EXCLUDED_NODES)
+    local _sn="" _vc _iv
+    for _n in $(_ora_net); do [ -f "$_n/sqlnet.ora" ] && _sn="$_n/sqlnet.ora" && break; done
+    _vc=$(grep -iE '^[[:space:]]*TCP\.VALIDNODE_CHECKING' "${_sn:-/nonexistent}" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
+    _iv=$(grep -iE '^[[:space:]]*TCP\.(INVITED|EXCLUDED)_NODES' "${_sn:-/nonexistent}" 2>/dev/null | head -2 | tr '\n' ' ')
+    evd "D-10" "grep -iE '^[[:space:]]*TCP\.(VALIDNODE_CHECKING|INVITED_NODES|EXCLUDED_NODES)' ${_sn:-/nonexistent} 2>/dev/null"
+    if [ "${_vc,,}" = "yes" ] && [ -n "$_iv" ]; then _kput "D-10" "양호" "지정 IP 만 접속 허용: TCP.VALIDNODE_CHECKING=yes, ${_iv% }"
+    elif [ -z "$_sn" ]; then _kput "D-10" "수동확인" "sqlnet.ora 미발견 - 원격 접속 IP 제한(sqlnet.ora·방화벽·접근제어 솔루션) 확인"
+    else _kput "D-10" "취약" "sqlnet.ora 접속 IP 제한 미설정 (TCP.VALIDNODE_CHECKING=${_vc:-미설정}, ${_sn}) - 방화벽·DB 접근제어 솔루션으로 제한 시 증빙 확인 후 양호"; fi
+
+    # D-11 시스템 테이블 접근 (가이드 쿼리: SYS 소유·DBA_% 객체에 대한 비DBA 권한, EXECUTE 제외)
+    local _st
+    _st=$(_ql "SELECT GRANTEE||':'||OWNER||'.'||TABLE_NAME||'('||PRIVILEGE||')' FROM DBA_TAB_PRIVS WHERE (OWNER='SYS' OR TABLE_NAME LIKE 'DBA_%') AND PRIVILEGE<>'EXECUTE' AND GRANTEE NOT IN ('PUBLIC','AQ_ADMINISTRATOR_ROLE','AQ_USER_ROLE','AURORA\$JIS\$UTILITY\$','OSE\$HTTP\$ADMIN','TRACESVR','CTXSYS','DBA','DELETE_CATALOG_ROLE','EXECUTE_CATALOG_ROLE','EXP_FULL_DATABASE','GATHER_SYSTEM_STATISTICS','HS_ADMIN_ROLE','IMP_FULL_DATABASE','LOGSTDBY_ADMINISTRATOR','MDSYS','ODM','OEM_MONITOR','OLAPSYS','ORDSYS','OUTLN','RECOVERY_CATALOG_OWNER','SELECT_CATALOG_ROLE','SNMPAGENT','SYSTEM','WKSYS','WKUSER','WMSYS','WM_ADMIN_ROLE','XDB','LBACSYS','PERFSTAT','XDBADMIN') AND GRANTEE NOT IN ${_omu} AND GRANTEE NOT IN ${_omr} AND GRANTEE NOT IN ${_dba} ORDER BY 1;")
+    evd_q "D-11" "DBA 외 시스템 테이블(SYS 소유·DBA_%) 권한 (Oracle 기본 제공 계정·역할 제외)" "$(echo "${_st:-없음}" | head -40)"
+    if [ -n "$(_qerr "$_st")" ]; then _kput "D-11" "수동확인" "DBA_TAB_PRIVS 조회 실패($(_qerr "$_st"))"
+    elif [ -n "$_st" ]; then _kput "D-11" "취약" "DBA 외 계정·역할의 시스템 테이블 접근 권한 $(echo "$_st" | grep -c .)건: $(echo "$_st" | head -8 | _csv)"
+    else _kput "D-11" "양호" "시스템 테이블 접근 권한이 DBA·Oracle 기본 역할에만 부여"; fi
+
+    # D-12 Listener 비밀번호 (12c R2 이후 미지원 → 해당 없음)
+    local _v1 _v2 _lo="" _pw _ar
+    _v1=$(echo "$DB_VER" | cut -d. -f1); _v2=$(echo "$DB_VER" | cut -d. -f2)
+    for _n in $(_ora_net); do [ -f "$_n/listener.ora" ] && _lo="$_n/listener.ora" && break; done
+    _pw=$(grep -iE '^[[:space:]]*PASSWORDS_[A-Za-z0-9_]+[[:space:]]*=' "${_lo:-/nonexistent}" 2>/dev/null | head -1)
+    _ar=$(grep -iE '^[[:space:]]*ADMIN_RESTRICTIONS_[A-Za-z0-9_]+[[:space:]]*=[[:space:]]*ON' "${_lo:-/nonexistent}" 2>/dev/null | head -1)
+    evd "D-12" "grep -iE '^[[:space:]]*(PASSWORDS|ADMIN_RESTRICTIONS)_' ${_lo:-/nonexistent} 2>/dev/null | sed -E 's/^([[:space:]]*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][Ss]_[^=]*=).*/\\1 (마스킹)/'"
+    if [ -z "$_v1" ]; then _kput "D-12" "수동확인" "Oracle 버전 확인 실패 - Listener 비밀번호 설정 확인"
+    elif [ "$_v1" -gt 12 ] 2>/dev/null || { [ "$_v1" -eq 12 ] && [ "${_v2:-0}" -ge 2 ]; } 2>/dev/null; then _kput "D-12" "N-A" "Oracle ${DB_VER} - 12c R2 이후 버전은 Listener 비밀번호 미지원 (가이드: 해당사항 없음)"
+    elif [ -z "$_lo" ]; then _kput "D-12" "수동확인" "Oracle ${DB_VER} - listener.ora 미발견, Listener 비밀번호 설정 확인"
+    elif [ -n "$_pw" ]; then _kput "D-12" "양호" "Oracle ${DB_VER} - listener.ora PASSWORDS_ 설정 (${_lo})"
+    else _kput "D-12" "취약" "Oracle ${DB_VER} - Listener 비밀번호 미설정 (${_lo})"; fi
+
+    _KNA D-13
+    # D-14 주요 파일 권한 (설정·비밀번호·파라미터·제어·redo·데이터 파일: 그룹·일반 사용자 수정 권한 제거)
+    local _fl14="" _dbf _w14
+    for _n in $(_ora_net); do _fl14="$_fl14 $_n $_n/listener.ora $_n/sqlnet.ora $_n/tnsnames.ora"; done
+    for _n in $(_ora_dbs); do _fl14="$_fl14 $(ls -d "$_n"/init*.ora "$_n"/spfile*.ora "$_n"/orapw* 2>/dev/null | tr '\n' ' ')"; done
+    _dbf=$(run_q "SELECT NAME FROM V\$CONTROLFILE UNION ALL SELECT MEMBER FROM V\$LOGFILE UNION ALL SELECT NAME FROM V\$DATAFILE;" | grep '^/' | head -100 | tr '\n' ' ')
+    evd "D-14" "ls -ldL $_fl14 2>/dev/null; ls -lL $(echo "$_dbf" | tr ' ' '\n' | head -20 | tr '\n' ' ') 2>/dev/null"
+    _w14=$(_kisa_perm_w $_fl14 $_dbf)
+    if [ -z "${_fl14// /}" ]; then _kput "D-14" "수동확인" "Oracle 설정 파일 미발견 (ORACLE_HOME·TNS_ADMIN 확인)"
+    elif [ -n "$_w14" ]; then _kput "D-14" "취약" "주요 파일·디렉터리에 그룹·일반 사용자 수정 권한: ${_w14}"
+    else _kput "D-14" "양호" "주요 설정·비밀번호·파라미터 파일 및 데이터·redo·제어 파일 일반 사용자 수정 권한 없음 (가이드 권고: init*.ora 640, network/admin 755/644)"; fi
+
+    # D-15 Listener 설정 파일 권한 + ADMIN_RESTRICTIONS_<리스너>=ON
+    local _w15; _w15=$(_kisa_perm_w $(_ora_net) $_lo)
+    if [ -z "$_lo" ]; then _kput "D-15" "수동확인" "listener.ora 미발견 - ADMIN_RESTRICTIONS 설정·파일 권한 확인"
+    elif [ -z "$_ar" ] || [ -n "$_w15" ]; then _kput "D-15" "취약" "Listener 파라미터 변경 제한 미흡:${_ar:- ADMIN_RESTRICTIONS_<리스너>=ON 미설정}${_w15:+ / 그룹·일반 사용자 수정 권한 ${_w15}} (${_lo})"
+    else _kput "D-15" "양호" "ADMIN_RESTRICTIONS=ON, Listener 설정 파일 관리자만 수정 가능 (${_lo})"; fi
+
+    _KNA D-16
+    # D-17 Audit Table(AUD$) 접근 권한 관리자 제한
+    local _aow _ag
+    _aow=$(run_q "SELECT OWNER FROM DBA_TABLES WHERE TABLE_NAME='AUD\$';" | grep -v '^[[:space:]]*$' | grep -v 'ORA-' | _csv)
+    _ag=$(_ql "SELECT GRANTEE||':'||OWNER||'.'||TABLE_NAME||'('||PRIVILEGE||')' FROM DBA_TAB_PRIVS WHERE TABLE_NAME IN ('AUD\$','FGA_LOG\$','AUD\$UNIFIED') AND GRANTEE NOT IN ('SYS','SYSTEM','DBA','DELETE_CATALOG_ROLE','AUDIT_ADMIN','AUDIT_VIEWER','AUDSYS') AND GRANTEE NOT IN ${_dba} ORDER BY 1;")
+    evd_q "D-17" "AUD\$ 소유자 / 관리자 외 Audit Table 권한" "owner=${_aow:-미확인} / ${_ag:-없음}"
+    if [ -n "$(_qerr "$_ag")" ]; then _kput "D-17" "수동확인" "Audit Table 권한 조회 실패($(_qerr "$_ag"))"
+    elif [ -n "$_aow" ] && ! echo "$_aow" | grep -qE '^(SYS|SYSTEM|AUDSYS)(,|$)'; then _kput "D-17" "취약" "AUD\$ 소유자가 관리자 계정 아님: ${_aow}"
+    elif [ -n "$_ag" ]; then _kput "D-17" "취약" "관리자 외 계정의 Audit Table 접근 권한: $(echo "$_ag" | head -8 | _csv)"
+    else _kput "D-17" "양호" "Audit Table(AUD\$) 소유자 ${_aow:-SYS}, 관리자 외 접근 권한 없음"; fi
+
+    # D-18 PUBLIC 에 Role 부여 금지
+    local _pr; _pr=$(_ql "SELECT GRANTED_ROLE FROM DBA_ROLE_PRIVS WHERE GRANTEE='PUBLIC' ORDER BY 1;")
+    evd_q "D-18" "SELECT granted_role FROM dba_role_privs WHERE grantee='PUBLIC'" "${_pr:-없음}"
+    if [ -n "$(_qerr "$_pr")" ]; then _kput "D-18" "수동확인" "DBA_ROLE_PRIVS 조회 실패($(_qerr "$_pr"))"
+    elif [ -n "$_pr" ]; then _kput "D-18" "취약" "PUBLIC 에 Role 부여: $(echo "$_pr" | _csv)"
+    else _kput "D-18" "양호" "PUBLIC 에 부여된 Role 없음"; fi
+
+    # D-19 OS_ROLES·REMOTE_OS_AUTHENT·REMOTE_OS_ROLES = FALSE
+    local _os; _os=$(run_q "SELECT NAME||'='||VALUE FROM V\$PARAMETER WHERE NAME IN ('os_roles','remote_os_authent','remote_os_roles') ORDER BY 1;" | grep '=' | tr -d ' ')
+    evd_q "D-19" "os_roles / remote_os_authent / remote_os_roles" "$(echo "$_os" | _csv)"
+    if [ -z "$_os" ]; then _kput "D-19" "수동확인" "OS_ROLES·REMOTE_OS_AUTHENT·REMOTE_OS_ROLES 조회 실패"
+    elif echo "$_os" | grep -qi '=TRUE'; then _kput "D-19" "취약" "OS 인증·역할 파라미터 TRUE: $(echo "$_os" | grep -i '=TRUE' | _csv)"
+    else _kput "D-19" "양호" "$(echo "$_os" | _csv)$(echo "$_os" | grep -qi remote_os_authent || echo ', remote_os_authent 미지원(폐지) 버전')"; fi
+
+    # D-20 Object Owner 제한 (가이드 쿼리: 기본 스키마·DBA 외 Object 소유 계정 = 취약)
+    local _ow
+    _ow=$(_ql "SELECT OWNER||'('||COUNT(*)||')' FROM DBA_OBJECTS WHERE OWNER NOT IN ('SYS','SYSTEM','MDSYS','CTXSYS','ORDSYS','ORDPLUGINS','AURORA\$JIS\$UTILITY\$','HR','ODM','ODM_MTR','OE','APDBA','OLAPSYS','OSE\$HTTP\$ADMIN','OUTLN','LBACSYS','MTSYS','PM','PUBLIC','QS','QS_ADM','QS_CB','QS_CBADM','DBSNMP','QS_CS','QS_ES','QS_OS','QS_WS','RMAN','SH','WKSYS','WMSYS','XDB') AND OWNER NOT IN ${_omu} AND OWNER NOT IN ${_dba} GROUP BY OWNER ORDER BY 1;")
+    evd_q "D-20" "관리자 외 Object Owner (가이드 기본 스키마·Oracle 기본 제공·DBA 제외)" "${_ow:-없음}"
+    if [ -n "$(_qerr "$_ow")" ]; then _kput "D-20" "수동확인" "DBA_OBJECTS 조회 실패($(_qerr "$_ow"))"
+    elif [ -n "$_ow" ]; then _kput "D-20" "취약" "일반 사용자 소유 Object 존재: $(echo "$_ow" | head -10 | _csv) - 가이드: Object Owner 를 SYS·SYSTEM·관리자 계정으로 제한"
+    else _kput "D-20" "양호" "Object Owner 가 SYS·SYSTEM·관리자 계정으로 제한"; fi
+
+    # D-21 GRANT OPTION (사용자 계정에 직접 부여된 GRANTABLE 객체 권한 = 취약, ROLE 경유는 양호)
+    local _gr
+    _gr=$(_ql "SELECT GRANTEE||':'||OWNER||'.'||TABLE_NAME||'('||PRIVILEGE||')' FROM DBA_TAB_PRIVS WHERE GRANTABLE='YES' AND OWNER NOT IN ('SYS','MDSYS','ORDPLUGINS','ORDSYS','SYSTEM','WMSYS','SDB','LBACSYS') AND OWNER NOT IN ${_omu} AND GRANTEE NOT IN ${_dba} AND GRANTEE NOT IN (SELECT ROLE FROM DBA_ROLES) ORDER BY 1;")
+    evd_q "D-21" "WITH GRANT OPTION 객체 권한 (사용자 직접 부여, DBA·Oracle 기본 스키마 제외)" "$(echo "${_gr:-없음}" | head -40)"
+    if [ -n "$(_qerr "$_gr")" ]; then _kput "D-21" "수동확인" "DBA_TAB_PRIVS 조회 실패($(_qerr "$_gr"))"
+    elif [ -n "$_gr" ]; then _kput "D-21" "취약" "ROLE 이 아닌 사용자에게 WITH GRANT OPTION 부여 $(echo "$_gr" | grep -c .)건: $(echo "$_gr" | head -8 | _csv)"
+    else _kput "D-21" "양호" "WITH GRANT OPTION 이 ROLE 로만 부여 (사용자 직접 부여 없음)"; fi
+
+    # D-22 RESOURCE_LIMIT = TRUE
+    local _rl; _rl=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='resource_limit';" | tr -d ' \n')
+    evd_q "D-22" "resource_limit" "${_rl:-조회 불가}"
+    case "${_rl^^}" in
+    TRUE)  _kput "D-22" "양호" "RESOURCE_LIMIT=TRUE" ;;
+    FALSE) _kput "D-22" "취약" "RESOURCE_LIMIT=FALSE - 자원 제한 기능 비활성" ;;
+    *)     _kput "D-22" "수동확인" "RESOURCE_LIMIT 조회 실패" ;;
+    esac
+
+    _KNA D-23 D-24
+    # D-25 보안 패치 (19c 미만 = 지원 종료, 그 외 최신 RU 적용 여부 확인)
+    local _pl; _pl=$(run_q "SELECT * FROM (SELECT TO_CHAR(ACTION_TIME,'YYYY-MM-DD')||' '||DESCRIPTION FROM DBA_REGISTRY_SQLPATCH ORDER BY ACTION_TIME DESC) WHERE ROWNUM=1;" | grep -v '^[[:space:]]*$' | grep -v 'ORA-' | head -1)
+    evd_q "D-25" "Oracle 버전 / 최근 SQL 패치(DBA_REGISTRY_SQLPATCH)" "${DB_VER:-미확인} / ${_pl:-이력 없음}"
+    if [ -n "$DB_MAJ" ] && [ "$DB_MAJ" -lt 19 ] 2>/dev/null; then _kput "D-25" "취약" "Oracle ${DB_VER} - 보안 패치가 제공되지 않는 지원 종료 버전 (19c 이상 장기 지원 버전으로 업그레이드 필요)"
+    else _kput "D-25" "수동확인" "Oracle ${DB_VER:-버전 미확인}, 최근 SQL 패치: ${_pl:-이력 없음} - 분기별 보안 패치(RU/CPU) 적용 여부 확인"; fi
+
+    # D-26 감사 기록 (audit_trail 또는 통합 감사 정책 적용)
+    local _ua _at _pc=""
+    _ua=$(run_q "SELECT VALUE FROM V\$OPTION WHERE PARAMETER='Unified Auditing';" | tr -d ' \n')
+    _at=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='audit_trail';" | tr -d ' \n')
+    [ "${DB_MAJ:-0}" -ge 12 ] 2>/dev/null && _pc=$(run_q "SELECT COUNT(DISTINCT POLICY_NAME) FROM AUDIT_UNIFIED_ENABLED_POLICIES;" | tr -d ' \n' | grep -E '^[0-9]+$')
+    evd_q "D-26" "audit_trail / Unified Auditing / 활성 통합 감사 정책 수" "${_at:-?} / ${_ua:-?} / ${_pc:-해당 없음}"
+    if { [ -n "$_at" ] && [ "${_at^^}" != "NONE" ]; } || [ "${_pc:-0}" -gt 0 ] 2>/dev/null; then
+        _kput "D-26" "양호" "감사 기록 적용: audit_trail=${_at:-?}${_pc:+, 통합 감사 정책 ${_pc}개} - 기관 감사 기록 정책 수립 여부는 인터뷰 확인"
+    elif [ -z "$_at$_pc" ]; then _kput "D-26" "수동확인" "감사 설정 조회 실패"
+    else _kput "D-26" "취약" "감사 기록 미설정 (audit_trail=${_at:-NONE}, 통합 감사 정책 없음)"; fi
+}
+
 # ── 실행 분기 ────────────────────────────────────────────────────
 case "$DBMS_TYPE" in
 oracle)  check_oracle ;;
@@ -2180,8 +2410,9 @@ mssql|sqlserver) check_mssql ;;
     fi ;;
 esac
 
-# 주요정보 상세가이드(2026) D-01~26 (MySQL·MariaDB·PostgreSQL)
+# 주요정보 상세가이드(2026) D-01~26 (Oracle·MySQL·MariaDB·PostgreSQL)
 [ "$_KMODE" != "ef" ] && case "$DBMS_TYPE" in
+oracle) kisa_oracle ;;
 mysql|mariadb) kisa_mysql ;;
 pgsql|postgresql) kisa_pgsql ;;
 esac

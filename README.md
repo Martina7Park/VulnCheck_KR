@@ -17,6 +17,7 @@
 | [`network/`](network) | 네트워크 장비 — 스크립트 없음, config 추출 안내 | 장비 콘솔 | — |
 | [`security/`](security) | 보안장비 config 점검 (FortiGate·Palo Alto 등) | 점검자 PC | `check_security.sh` |
 | [`pc/`](pc) | 업무용 PC 점검 (Windows·macOS·iOS) | 사용자 PC | `run_pc.bat` / `run_pc_kisa.bat` / `check_pc_mac*.sh` |
+| [`virtualization/`](virtualization) | 가상화 장비 점검 (VMware ESXi, 주요정보 HV-01~25) | 점검자 PC → ESXi SSH | `run_hv_esxi.sh` / `run_hv_esxi.bat` |
 | [`converter/`](converter) | 결과 → 상세보고서 엑셀 변환, EoS 판정, 결과 비교 | 점검자 PC | `convert_v4.py` |
 
 각 폴더를 열면 파일별 용도가 README 로 정리되어 있습니다. `.sh` 는 Linux/Unix·macOS, `.bat`·`.ps1` 은 Windows 용이며, Windows 는 `run_*.bat` 만 실행하면 됩니다.
@@ -29,6 +30,7 @@
 ① 대상 시스템            ② 결과 회수                     ③ 점검자 PC
 server/ webwas/ dbms/  →  결과 .txt + 증적 _evidence.txt  →  converter/<분야>/output/ 에 넣고
 pc/ 스크립트 실행          (네트워크·보안장비는 config)        python convert_v4.py
+(ESXi 는 virtualization/ 을 점검자 PC 에서 SSH 로 실행)
                                                             → 상세보고서_<기준>_<분야>_<일시>.xlsx
 ```
 
