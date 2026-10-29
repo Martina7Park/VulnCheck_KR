@@ -75,40 +75,140 @@ case "$(echo "$_KMODE" | tr 'A-Z' 'a-z')" in
 3|all) _KMODE="all" ;;
 *) echo "사용법: $0 [ef|mi|all]  (ef=전자금융, mi=주요정보 2026 상세가이드, all=둘 다)" >&2; exit 1 ;;
 esac
-_RESF="/tmp/${HN}_webwas.txt"
+# ── 웹서버/WAS 탐지 ─────────────────────────────────────────────
+# 실행 중인 프로세스(실제 바이너리·설정 경로) 우선 → 없으면 기본 설치 경로
+# (소스 설치 /app·/sw·/home 경로, sudo 실행 시 PATH·환경변수 없음 대응)
+# 대상 직접 지정(같은 서버의 다른 인스턴스·제품 점검): APACHE_CONF= NGINX_CONF= TOMCAT_HOME= JEUS_HOME= WEBTOBDIR= 환경변수
+WEB_SRV=""  # apache/webtob/nginx/none
+WAS_SRV=""  # tomcat/jeus/none
+APACHE_CONF="${APACHE_CONF:-}" NGINX_CONF="${NGINX_CONF:-}" TOMCAT_HOME="${TOMCAT_HOME:-}" JEUS_HOME="${JEUS_HOME:-}"
+APACHE_BIN="" NGINX_BIN="" _WT_HOME="" _WT_M="" _INST=""
+_AP_RUN=0; _NG_RUN=0; _WT_RUN=0   # 0=미탐지 1=실행 중 2=사용자 지정
+for _v in APACHE_CONF NGINX_CONF TOMCAT_HOME JEUS_HOME; do   # 잘못 지정된 경로는 무시 (자동 탐지)
+    eval "_x=\$$_v"
+    [ -n "$_x" ] && [ ! -e "$_x" ] && { echo "[경고] ${_v}=${_x} 경로 없음 - 무시하고 자동 탐지" >&2; eval "$_v=''"; }
+done
+[ -n "$APACHE_CONF" ] && _AP_RUN=2
+[ -n "$NGINX_CONF" ] && _NG_RUN=2
+_U_TOMCAT="$TOMCAT_HOME"
+
+_pids() { ps -eo pid=,comm= 2>/dev/null | awk -v r="^($1)\$" '{c=$2; sub(/.*\//, "", c)} c ~ r {print $1}'; }   # 프로세스명(정규식) → PID
+_pexe() {   # PID → 실행 파일 절대 경로 (Linux /proc, 그 외는 ps 인자 첫 단어가 절대 경로일 때)
+    local e; e=$(readlink "/proc/$1/exe" 2>/dev/null); e="${e% (deleted)}"
+    [ -z "$e" ] && e=$(ps -o args= -p "$1" 2>/dev/null | awk '{print $1}')
+    case "$e" in /*) echo "$e" ;; esac
+}
+_parg() { ps -o args= -p "$1" 2>/dev/null | awk -v o="$2" '{for (i = 1; i < NF; i++) if ($i == o) {print $(i+1); exit}}'; }   # PID 의 옵션 값 (-f, -c 등)
+
+# Apache: 실행 중인 httpd/apache2 → -f 인자 또는 -V 의 HTTPD_ROOT + SERVER_CONFIG_FILE
+if [ "$_AP_RUN" = 0 ]; then
+    for _p in $(_pids 'httpd|apache2|httpd\.worker|httpd\.event'); do
+        _b=$(_pexe "$_p"); [ -x "$_b" ] || continue
+        _vv=$("$_b" -V 2>/dev/null)
+        _r=$(_parg "$_p" -d); [ -z "$_r" ] && _r=$(echo "$_vv" | sed -n 's/.*HTTPD_ROOT="\([^"]*\)".*/\1/p')
+        _f=$(_parg "$_p" -f); [ -z "$_f" ] && _f=$(echo "$_vv" | sed -n 's/.*SERVER_CONFIG_FILE="\([^"]*\)".*/\1/p')
+        case "$_f" in ''|/*) ;; *) _f="$_r/$_f" ;; esac
+        [ -f "$_f" ] && { APACHE_CONF="$_f"; APACHE_BIN="$_b"; _AP_RUN=1; break; }
+    done
+fi
+# Nginx: 실행 중인 nginx → -c 인자 또는 -V 의 --conf-path (없으면 --prefix/conf/nginx.conf)
+if [ "$_NG_RUN" = 0 ]; then
+    for _p in $(_pids nginx); do
+        _b=$(_pexe "$_p"); [ -x "$_b" ] || continue
+        _vv=$("$_b" -V 2>&1)
+        _px=$(echo "$_vv" | grep -oE -- '--prefix=[^ ]+' | head -1 | cut -d= -f2); _px="${_px:-/usr/local/nginx}"
+        _c=$(_parg "$_p" -c); [ -z "$_c" ] && _c=$(echo "$_vv" | grep -oE -- '--conf-path=[^ ]+' | head -1 | cut -d= -f2)
+        _c="${_c:-conf/nginx.conf}"; case "$_c" in /*) ;; *) _c="$_px/$_c" ;; esac
+        [ -f "$_c" ] && { NGINX_CONF="$_c"; NGINX_BIN="$_b"; _NG_RUN=1; break; }
+    done
+fi
+# WebtoB: 실행 중인 wsm/htl/hth → <WEBTOBDIR>/bin/… (sudo 실행 시 PATH 에 wsadmin 없음)
+[ -n "$WEBTOBDIR" ] && [ -f "$WEBTOBDIR/config/http.m" ] && { _WT_HOME="$WEBTOBDIR"; _WT_M="$WEBTOBDIR/config/http.m"; }
+for _p in $(_pids 'wsm|htl|hth|htmls'); do
+    _b=$(_pexe "$_p"); _d="${_b%/bin/*}"
+    [ -f "$_d/config/http.m" ] || _d=$( { tr '\0' '\n' < "/proc/$_p/environ"; } 2>/dev/null | sed -n 's/^WEBTOBDIR=//p')
+    [ -n "$_d" ] && [ -f "$_d/config/http.m" ] && { _WT_HOME="$_d"; _WT_M="$_d/config/http.m"; _WT_RUN=1; break; }
+done
+
+_WEB_ALSO=""
+if   [ "$_AP_RUN" = 2 ]; then WEB_SRV="apache"
+elif [ "$_NG_RUN" = 2 ]; then WEB_SRV="nginx"
+elif [ "$_AP_RUN" = 1 ]; then WEB_SRV="apache"
+elif [ "$_NG_RUN" = 1 ]; then WEB_SRV="nginx"
+elif [ "$_WT_RUN" = 1 ]; then WEB_SRV="webtob"
+fi
+[ -n "$WEB_SRV" ] && for _w in apache:$_AP_RUN nginx:$_NG_RUN webtob:$_WT_RUN; do
+    [ "${_w%%:*}" != "$WEB_SRV" ] && [ "${_w#*:}" = 1 ] && _WEB_ALSO="${_WEB_ALSO} ${_w%%:*}"
+done
+if [ -z "$WEB_SRV" ]; then   # 실행 중인 웹서버 없음 → 설치 경로
+    for d in /etc/httpd/conf /etc/apache2 /usr/local/apache/conf /usr/local/apache2/conf \
+              /usr/local/httpd/conf /opt/httpd/conf /app/apache*/conf /sw/apache*/conf /home/*/apache*/conf; do
+        [ -f "$d/httpd.conf" ] && APACHE_CONF="$d/httpd.conf" && WEB_SRV="apache" && break
+        [ -f "$d/apache2.conf" ] && APACHE_CONF="$d/apache2.conf" && WEB_SRV="apache" && break
+    done
+    [ -z "$WEB_SRV" ] && for _c in /etc/nginx/nginx.conf /usr/local/nginx/conf/nginx.conf /app/nginx*/conf/nginx.conf /sw/nginx*/conf/nginx.conf; do
+        [ -f "$_c" ] && NGINX_CONF="$_c" && WEB_SRV="nginx" && break
+    done
+    if [ -z "$WEB_SRV" ] && [ -z "$_WT_M" ]; then
+        for _d in /home/tmax/webtob /root/webtob /opt/tmax/webtob /sw/webtob /sw/webtob5 /home/webtob/webtob /app/webtob; do
+            [ -f "$_d/config/http.m" ] && { _WT_HOME="$_d"; _WT_M="$_d/config/http.m"; break; }
+        done
+    fi
+    [ -z "$WEB_SRV" ] && { [ -n "$_WT_M" ] || command -v wsadmin >/dev/null 2>&1; } && WEB_SRV="webtob"
+fi
+[ "$WEB_SRV" != "apache" ] && [ "$_AP_RUN" != 2 ] && { APACHE_CONF=""; APACHE_BIN=""; }   # 점검 대상 아닌 Apache 설정이 다른 항목 판정에 섞이지 않도록
+[ "$WEB_SRV" = "nginx" ] || NGINX_BIN=""
+NGINX_CONF="${NGINX_CONF:-/etc/nginx/nginx.conf}"
+NGX_DIR=$(dirname "$NGINX_CONF")   # Nginx 설정 디렉터리 (conf.d·sites-enabled 기준)
+if [ "$WEB_SRV" = "nginx" ] && [ -z "$NGINX_BIN" ]; then   # 미실행 → 설치 폴더의 sbin/nginx (nginx -T 로 include 해석)
+    for _b in "$(dirname "$NGX_DIR")/sbin/nginx" "$(command -v nginx 2>/dev/null)"; do [ -x "$_b" ] && NGINX_BIN="$_b" && break; done
+fi
+# 실행 중인 바이너리를 PATH 와 관계없이 사용 (점검 명령의 httpd / nginx 호출이 실제 대상에 적용되도록)
+if [ -n "$APACHE_BIN" ] && [ "${APACHE_BIN##*/}" != "apache2" ]; then
+    httpd() { "$APACHE_BIN" -f "$APACHE_CONF" "$@"; }
+fi
+if [ -n "$NGINX_BIN" ]; then
+    nginx() { case "$1" in -t|-T) "$NGINX_BIN" "$@" -c "$NGINX_CONF" ;; *) "$NGINX_BIN" "$@" ;; esac; }
+fi
+
+# Tomcat 탐지 - 실행중인 프로세스(catalina.base) 먼저, 없으면 설치 경로
+_TC_RUN=""
+for d in $(ps -eo args= 2>/dev/null | grep -oE '\-Dcatalina\.base=[^ ]+' | cut -d= -f2); do
+    [ -f "$d/conf/server.xml" ] && case " $_TC_RUN " in *" $d "*) ;; *) _TC_RUN="${_TC_RUN} $d" ;; esac
+done
+if [ -n "$TOMCAT_HOME" ]; then
+    [ -f "$TOMCAT_HOME/conf/server.xml" ] && WAS_SRV="tomcat"
+else
+    for d in $_TC_RUN $(ps -eo args= 2>/dev/null | grep -oE '\-Dcatalina\.home=[^ ]+' | cut -d= -f2) \
+             /opt/tomcat /usr/local/tomcat /srv/tomcat /var/lib/tomcat* /opt/apache-tomcat* \
+             /home/*/tomcat* /home/*/apache-tomcat* /app/tomcat* /app/apache-tomcat*; do
+        [ -f "$d/conf/server.xml" ] && TOMCAT_HOME="$d" && WAS_SRV="tomcat" && break
+    done
+fi
+[ -z "$WAS_SRV" ] && [ -n "$CATALINA_HOME" ] && [ -f "$CATALINA_HOME/conf/server.xml" ] && \
+    TOMCAT_HOME="$CATALINA_HOME" && WAS_SRV="tomcat"
+_TC_N=$(echo $_TC_RUN | wc -w | tr -d ' ')
+# 같은 서버의 Tomcat 인스턴스를 TOMCAT_HOME= 으로 골라 점검하면 결과 파일·점검 대상명에 인스턴스명 표시 (결과 구분)
+[ -n "$_U_TOMCAT" ] && [ "$_TC_N" -gt 1 ] && _INST="$(basename "$TOMCAT_HOME")"
+# JEUS 탐지 (sudo 로 돌리면 JEUS_HOME 환경변수 없어서 프로세스·설치 경로에서도 찾음)
+[ -z "$JEUS_HOME" ] && JEUS_HOME=$(ps -eo args= 2>/dev/null | grep -oE '\-Djeus\.home=[^ ]+' | head -1 | cut -d= -f2)
+if [ -z "$JEUS_HOME" ]; then
+    for d in /home/jeus*/jeus* /home/tmax/jeus* /sw/jeus* /app/jeus* /opt/jeus* /jeus*; do
+        [ -x "$d/bin/jeusadmin" ] && JEUS_HOME="$d" && break
+    done
+fi
+[ -z "$WAS_SRV" ] && [ -n "$JEUS_HOME" ] && WAS_SRV="jeus"
+
+# 다른 웹서버가 실행 중인 서버에서 APACHE_CONF= / NGINX_CONF= 로 골라 점검 → 인스턴스명에 제품 표시
+{ [ "$_AP_RUN" = 2 ] || [ "$_NG_RUN" = 2 ]; } && [ -n "$_WEB_ALSO" ] && _INST="${_INST:+${_INST}_}${WEB_SRV}"
+_HNF="${HN}${_INST:+_${_INST}}"            # 결과·증적 파일명
+_HND="${HN}${_INST:+ [${_INST}]}"          # 점검 대상 표시명
+_RESF="/tmp/${_HNF}_webwas.txt"
 if [ -z "$NO_RESULT_COPY" ] && ! [ /dev/fd/1 -ef "$_RESF" ] 2>/dev/null && ( : > "$_RESF" ) 2>/dev/null; then
     exec > >(tee "$_RESF"); _TEEPID=$!
 else
     _RESF=""
 fi
-
-# 웹서버 종류 탐지
-WEB_SRV=""  # apache/webtob/nginx/none
-WAS_SRV=""  # tomcat/jeus/none
-APACHE_CONF="" NGINX_CONF="" TOMCAT_HOME="" JEUS_HOME=""
-
-# Apache 탐지
-for d in /etc/httpd/conf /etc/apache2 /usr/local/apache/conf /usr/local/apache2/conf \
-          /usr/local/httpd/conf /opt/httpd/conf; do
-    [ -f "$d/httpd.conf" ] && APACHE_CONF="$d/httpd.conf" && WEB_SRV="apache" && break
-    [ -f "$d/apache2.conf" ] && APACHE_CONF="$d/apache2.conf" && WEB_SRV="apache" && break
-done
-# Nginx 탐지
-[ -z "$WEB_SRV" ] && [ -f /etc/nginx/nginx.conf ] && WEB_SRV="nginx" && NGINX_CONF="/etc/nginx/nginx.conf"
-# WebtoB 탐지
-[ -z "$WEB_SRV" ] && command -v wsadmin >/dev/null 2>&1 && WEB_SRV="webtob"
-
-# Tomcat 탐지 - 실행중인 프로세스(catalina.base) 먼저, 없으면 설치 경로
-for d in $(ps -eo args= 2>/dev/null | grep -oE '\-Dcatalina\.(base|home)=[^ ]+' | cut -d= -f2) \
-         /opt/tomcat /usr/local/tomcat /srv/tomcat /var/lib/tomcat* /opt/apache-tomcat* \
-         /home/*/tomcat* /home/*/apache-tomcat* /app/tomcat* /app/apache-tomcat*; do
-    [ -f "$d/conf/server.xml" ] && TOMCAT_HOME="$d" && WAS_SRV="tomcat" && break
-done
-[ -z "$WAS_SRV" ] && [ -n "$CATALINA_HOME" ] && [ -f "$CATALINA_HOME/conf/server.xml" ] && \
-    TOMCAT_HOME="$CATALINA_HOME" && WAS_SRV="tomcat"
-# JEUS 탐지 (sudo 로 돌리면 JEUS_HOME 환경변수 없어서 프로세스에서도 찾음)
-[ -z "$JEUS_HOME" ] && JEUS_HOME=$(ps -eo args= 2>/dev/null | grep -oE '\-Djeus\.home=[^ ]+' | head -1 | cut -d= -f2)
-[ -z "$WAS_SRV" ] && [ -n "$JEUS_HOME" ] && WAS_SRV="jeus"
 
 if [ "$OS_FAMILY" = "WINDOWS" ]; then
     echo "# [경고] Windows 환경(Git Bash)에서 실행됨 — Linux/Unix 전용 스크립트"
@@ -116,12 +216,17 @@ if [ "$OS_FAMILY" = "WINDOWS" ]; then
 fi
 
 echo "# ================================================================"
-echo "# 점검 대상: ${HN}"
+echo "# 점검 대상: ${_HND}"
+echo "# IP: $( { [ "$(uname -s)" = Linux ] && hostname -I 2>/dev/null | awk '{print $1}'; ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}'; ifconfig -a 2>/dev/null | awk '/inet / {a=$2; sub(/^addr:/, "", a); if (a ~ /^[0-9]/ && a !~ /^127\./) {print a; exit}}'; netstat -in 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+\./ && $4 !~ /^127\./ {print $4; exit}'; } | head -1)"   # 동일 호스트명(localhost 등) 다른 장비 구분용
 echo "# OS: ${OS_FAMILY} / ${OS_DISTRO} ${OS_MAJOR}"
 echo "# OS 상세: $( ( [ -r /etc/os-release ] && . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-$NAME $VERSION_ID}" ) || ( command -v oslevel >/dev/null 2>&1 && echo "AIX $(oslevel -s 2>/dev/null)" ) || ( [ -r /etc/release ] && head -1 /etc/release | sed 's/^ *//' ) || uname -sr 2>/dev/null)"
 echo "# 커널: $(uname -r 2>/dev/null)$( [ "$(uname -s 2>/dev/null)" = SunOS ] && echo " / $(uname -v 2>/dev/null)")"
 echo "# 웹서버: ${WEB_SRV:-미탐지}"
 echo "# WAS: ${WAS_SRV:-미탐지}"
+_cp=$(case "$WEB_SRV" in apache) echo "${APACHE_CONF}${APACHE_BIN:+ (실행: ${APACHE_BIN})}" ;; nginx) echo "${NGINX_CONF}${NGINX_BIN:+ (실행: ${NGINX_BIN})}" ;; webtob) echo "WebtoB ${_WT_M:-http.m 미확인}" ;; esac)
+[ "$WAS_SRV" = tomcat ] && _cp="${_cp:+${_cp} / }Tomcat ${TOMCAT_HOME}"
+[ "$WAS_SRV" = jeus ] && _cp="${_cp:+${_cp} / }JEUS ${JEUS_HOME}"
+echo "# 설정 경로: ${_cp:-없음}"
 case "$_KMODE" in
 ef)  echo "# 점검 기준: 전자금융기반시설 보안 취약점 평가기준 제2026-1호 [웹서버-WAS]" ;;
 mi)  echo "# 점검 기준: 주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드(2026) [웹 서비스 WEB-01~WEB-26]" ;;
@@ -129,20 +234,22 @@ mi)  echo "# 점검 기준: 주요정보통신기반시설 기술적 취약점 �
 esac
 echo "# 점검 일시: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "# ================================================================"
+[ -n "$_WEB_ALSO" ] && echo "# [안내] 함께 실행 중인 웹서버:${_WEB_ALSO} - 이번 점검 대상 아님. 해당 제품은 sudo env APACHE_CONF=<httpd.conf> 또는 NGINX_CONF=<nginx.conf> bash $0 ${_KMODE} 로 따로 점검"
+[ "${_TC_N:-0}" -gt 1 ] && echo "# [안내] Tomcat 인스턴스 ${_TC_N}개 실행 중:${_TC_RUN} - 이번 점검: ${TOMCAT_HOME}. 나머지는 sudo env TOMCAT_HOME=<경로> bash $0 ${_KMODE} 로 각각 점검 (결과 파일·점검 대상명에 인스턴스명 표시)"
 
 # ── 결과 카운터 ──────────────────────────────────────────────────
 _CP=0; _CF=0; _CM=0; _CN=0
 
-_EVD="/tmp/${HN}_webwas_evidence.txt"
+_EVD="/tmp/${_HNF}_webwas_evidence.txt"
 # 증적 파일 쓰기 불가(다른 사용자 소유 기존 파일, /tmp 용량 부족 등) → 대체 경로 (쓰기 실패로 판정 중복 방지)
 if ! ( : >> "$_EVD" ) 2>/dev/null; then
-    _EVD=$(mktemp "${TMPDIR:-/tmp}/${HN}_evidence.XXXXXX" 2>/dev/null || echo "./${HN}_evidence_$$.txt")
+    _EVD=$(mktemp "${TMPDIR:-/tmp}/${_HNF}_evidence.XXXXXX" 2>/dev/null || echo "./${_HNF}_evidence_$$.txt")
     echo "# [경고] 기본 증적 파일에 쓸 수 없어 대체 경로 사용: $_EVD"
 fi
 _NONROOT=0; [ "$(id -u 2>/dev/null)" != "0" ] && { _NONROOT=1; echo "# [경고] root 권한 아님 — /etc/shadow·타 계정 홈 등 조회 불가 항목(WST 계정·환경파일·umask)은 수동확인 처리, root 로 재점검 권고"; }
 echo "# ================================================================" > "$_EVD"
 echo "# 웹서버/WAS 증적 파일 (감사 추적용)" >> "$_EVD"
-echo "# 대상: ${HN} / ${OS_FAMILY} ${OS_DISTRO} ${OS_MAJOR}" >> "$_EVD"
+echo "# 대상: ${_HND} / ${OS_FAMILY} ${OS_DISTRO} ${OS_MAJOR}" >> "$_EVD"
 echo "# 웹서버: ${WEB_SRV:-미탐지} / WAS: ${WAS_SRV:-미탐지}" >> "$_EVD"
 echo "# 생성: $(date '+%Y-%m-%d %H:%M:%S')" >> "$_EVD"
 echo "# ================================================================" >> "$_EVD"
@@ -2691,7 +2798,7 @@ check_SRV036() {
 
 # SRV-038: 웹서비스 디렉터리 리스팅
 check_SRV038() {
-    evd "SRV-038" "grep -riE 'Options.*Indexes|autoindex' /etc/httpd/conf/ /etc/apache2/ /etc/nginx/ 2>/dev/null | grep -v '^#' | head -10"
+    evd "SRV-038" "grep -riE 'Options.*Indexes|autoindex' /etc/httpd/conf/ /etc/apache2/ ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -10"
     local web_running=0
     is_running httpd || is_running apache2 && web_running=1
     is_running nginx && web_running=1
@@ -2703,7 +2810,7 @@ check_SRV038() {
         [ -f "$cf" ] || continue
         grep -v "^#" "$cf" 2>/dev/null | grep -qi "Options.*Indexes" && vuln="${vuln} ${cf}"
     done
-    for cf in /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
+    for cf in ${NGINX_CONF} ${NGX_DIR}/conf.d/*.conf ${NGX_DIR}/sites-enabled/*; do
         [ -f "$cf" ] || continue
         grep -v "^#" "$cf" 2>/dev/null | grep -qi "autoindex.*on" && vuln="${vuln} ${cf}"
     done
@@ -2771,22 +2878,22 @@ check_SRV042() {
 
 # SRV-043: 파일 업로드/다운로드 제한
 check_SRV043() {
-    evd "SRV-043" "grep -riE 'LimitRequestBody|client_max_body_size' /etc/httpd/conf/ /etc/apache2/ /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+    evd "SRV-043" "grep -riE 'LimitRequestBody|client_max_body_size' /etc/httpd/conf/ /etc/apache2/ ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
     is_running httpd || is_running apache2 || is_running nginx || { result "SRV-043|N-A|웹서비스 미실행"; return; }
     local found=""
     grep -riE 'LimitRequestBody' /etc/httpd/conf/ /etc/apache2/ 2>/dev/null | grep -v "^#" | head -1 | grep -q "LimitRequestBody" && found="Apache"
-    grep -riE 'client_max_body_size' /etc/nginx/ 2>/dev/null | grep -v "^#" | head -1 | grep -q "client_max_body_size" && found="${found:+$found/}Nginx"
+    grep -riE 'client_max_body_size' ${NGX_DIR}/ 2>/dev/null | grep -v "^#" | head -1 | grep -q "client_max_body_size" && found="${found:+$found/}Nginx"
     [ -n "$found" ] && result "SRV-043|양호|업로드 제한 설정됨 (${found})" || \
         result "SRV-043|취약|파일 업로드 크기 제한 미설정"
 }
 
 # SRV-044: 웹서비스 영역 분리
 check_SRV044() {
-    evd "SRV-044" "grep -iE '^\s*DocumentRoot' /etc/httpd/conf/httpd.conf /etc/apache2/sites-enabled/*.conf 2>/dev/null | grep -v '^#'; grep -iE '^\s*root\s' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null | grep -v '^#'"
+    evd "SRV-044" "grep -iE '^\s*DocumentRoot' /etc/httpd/conf/httpd.conf /etc/apache2/sites-enabled/*.conf 2>/dev/null | grep -v '^#'; grep -iE '^\s*root\s' ${NGX_DIR}/sites-enabled/* ${NGX_DIR}/conf.d/*.conf 2>/dev/null | grep -v '^#'"
     is_running httpd || is_running apache2 || is_running nginx || { result "SRV-044|N-A|웹서비스 미실행"; return; }
     local docroot=""
     docroot=$(grep -iE '^\s*DocumentRoot' /etc/httpd/conf/httpd.conf /etc/apache2/sites-enabled/*.conf 2>/dev/null | grep -v '^#' | awk '{print $NF}' | tr -d '"' | tail -1)
-    [ -z "$docroot" ] && docroot=$(grep -iE '^\s*root\s' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null | grep -v '^#' | awk '{print $NF}' | tr -d ';' | tail -1)
+    [ -z "$docroot" ] && docroot=$(grep -iE '^\s*root\s' ${NGX_DIR}/sites-enabled/* ${NGX_DIR}/conf.d/*.conf 2>/dev/null | grep -v '^#' | awk '{print $NF}' | tr -d ';' | tail -1)
     if [ "$docroot" = "/" ]; then
         result "SRV-044|취약|DocumentRoot=/ (루트 디렉터리 설정)"
     elif [ -n "$docroot" ]; then
@@ -3057,7 +3164,7 @@ check_SRV068() {
 
 # SRV-071
 check_SRV071() {
-    evd "SRV-071" "grep -riE 'Indexes|autoindex' /etc/httpd/conf/ /etc/apache2/ /etc/nginx/ 2>/dev/null | grep -v '^#' | head -10"
+    evd "SRV-071" "grep -riE 'Indexes|autoindex' /etc/httpd/conf/ /etc/apache2/ ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -10"
     if ! is_running httpd && ! is_running apache2 && ! is_running nginx; then
         result "SRV-071|N-A|웹서버 미실행"; return
     fi
@@ -3066,7 +3173,7 @@ check_SRV071() {
         [ -f "$cf" ] || continue
         grep -v '^\s*#' "$cf" 2>/dev/null | grep -qi "Options.*Indexes" && vuln="${vuln} ${cf}"
     done
-    for cf in /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
+    for cf in ${NGINX_CONF} ${NGX_DIR}/conf.d/*.conf ${NGX_DIR}/sites-enabled/*; do
         [ -f "$cf" ] || continue
         grep -v '^\s*#' "$cf" 2>/dev/null | grep -qi "autoindex.*on" && vuln="${vuln} ${cf}"
     done
@@ -3976,7 +4083,7 @@ if [ -n "$WEB_SRV$WAS_SRV" ]; then
 
 # WST-031: 디렉토리 리스팅 방지
 check_dir_listing() {
-    evd_file "WST-031" "${APACHE_CONF:-/etc/nginx/nginx.conf}"
+    evd_file "WST-031" "${APACHE_CONF:-${NGINX_CONF}}"
     case "$WEB_SRV" in
     apache)
         [ -z "$APACHE_CONF" ] && { result "WST-031|수동확인|Apache 설정파일 미탐지"; return; }
@@ -3989,14 +4096,14 @@ check_dir_listing() {
             result "WST-031|양호|디렉토리 리스팅 비활성화 (Options -Indexes)"
         fi ;;
     nginx)
-        if grep -r "autoindex on" /etc/nginx/ 2>/dev/null | grep -qv "^#"; then
+        if grep -r "autoindex on" ${NGX_DIR}/ 2>/dev/null | grep -qv "^#"; then
             result "WST-031|취약|Nginx autoindex on 설정됨"
         else
             result "WST-031|양호|Nginx autoindex off (기본 또는 명시)"
         fi ;;
     webtob)
         # WebtoB: DIRECTORY.INDEX 설정
-        wt_cfg=$(find /usr/local/tmax /opt/tmax -name "*.m" 2>/dev/null | head -1)
+        wt_cfg="${_WT_M:-$(find /usr/local/tmax /opt/tmax -name "*.m" 2>/dev/null | head -1)}"
         if [ -n "$wt_cfg" ] && grep -qi "DIRECTORY.INDEX" "$wt_cfg" 2>/dev/null; then
             result "WST-031|양호|WebtoB DIRECTORY.INDEX 설정됨"
         else
@@ -4009,7 +4116,7 @@ check_dir_listing
 
 # WST-033: 상위 디렉토리 접근 제한
 check_dir_traverse() {
-    evd "WST-033" "grep -rE 'AllowOverride|FollowSymLinks' ${APACHE_CONF:-/etc/nginx/nginx.conf} $(dirname ${APACHE_CONF:-/etc/nginx/nginx.conf}) 2>/dev/null | grep -v '^#' | head -5"
+    evd "WST-033" "grep -rE 'AllowOverride|FollowSymLinks' ${APACHE_CONF:-${NGINX_CONF}} $(dirname ${APACHE_CONF:-${NGINX_CONF}}) 2>/dev/null | grep -v '^#' | head -5"
     case "$WEB_SRV" in
     apache)
         if grep -r "AllowOverride\s*All\|Options.*FollowSymLinks" "$APACHE_CONF" $(dirname "$APACHE_CONF") 2>/dev/null | grep -qv "^#"; then
@@ -4045,7 +4152,7 @@ check_web_user() {
             result "WST-036|수동확인|Apache 실행 계정 수동 확인"
         fi ;;
     nginx)
-        nuser=$(grep -E "^\s*user\s" /etc/nginx/nginx.conf 2>/dev/null | awk '{print $2}' | tr -d ';')
+        nuser=$(grep -E "^\s*user\s" ${NGINX_CONF} 2>/dev/null | awk '{print $2}' | tr -d ';')
         if [ "$nuser" = "root" ]; then
             result "WST-036|취약|Nginx root 계정으로 실행됨"
         elif [ -n "$nuser" ]; then
@@ -4113,7 +4220,7 @@ check_server_info() {
             result "WST-102|수동확인|ServerTokens 설정 수동 확인"
         fi ;;
     nginx)
-        if grep -r "server_tokens off" /etc/nginx/ 2>/dev/null | grep -qv "^#"; then
+        if grep -r "server_tokens off" ${NGX_DIR}/ 2>/dev/null | grep -qv "^#"; then
             result "WST-102|양호|Nginx server_tokens off 설정됨"
         else
             result "WST-102|취약|Nginx server_tokens off 미설정 (버전 노출)"
@@ -4127,7 +4234,7 @@ check_server_info
 
 # WST-121: 프록시 설정 제한
 check_proxy() {
-    evd "WST-121" "grep -rE 'ProxyRequests|proxy_pass' ${APACHE_CONF:-/etc/nginx/nginx.conf} $(dirname ${APACHE_CONF:-/etc/nginx/nginx.conf}) /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+    evd "WST-121" "grep -rE 'ProxyRequests|proxy_pass' ${APACHE_CONF:-${NGINX_CONF}} $(dirname ${APACHE_CONF:-${NGINX_CONF}}) ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
     case "$WEB_SRV" in
     apache)
         confdir=$(dirname "$APACHE_CONF")
@@ -4145,7 +4252,7 @@ check_proxy
 
 # WST-122: SSI(Server Side Include) 제한
 check_ssi() {
-    evd "WST-122" "grep -rE 'Includes|AddHandler.*shtml' ${APACHE_CONF:-/etc/nginx/nginx.conf} $(dirname ${APACHE_CONF:-/etc/nginx/nginx.conf}) 2>/dev/null | grep -v '^#' | head -5"
+    evd "WST-122" "grep -rE 'Includes|AddHandler.*shtml' ${APACHE_CONF:-${NGINX_CONF}} $(dirname ${APACHE_CONF:-${NGINX_CONF}}) 2>/dev/null | grep -v '^#' | head -5"
     case "$WEB_SRV" in
     apache)
         confdir=$(dirname "$APACHE_CONF")
@@ -4161,7 +4268,7 @@ check_ssi
 
 # WST-123: 기본 에러 페이지 노출 방지
 check_error_page() {
-    evd "WST-123" "grep -rE 'ErrorDocument|error_page' ${APACHE_CONF:-/etc/nginx/nginx.conf} $(dirname ${APACHE_CONF:-/etc/nginx/nginx.conf}) /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+    evd "WST-123" "grep -rE 'ErrorDocument|error_page' ${APACHE_CONF:-${NGINX_CONF}} $(dirname ${APACHE_CONF:-${NGINX_CONF}}) ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
     case "$WEB_SRV" in
     apache)
         confdir=$(dirname "$APACHE_CONF")
@@ -4169,7 +4276,7 @@ check_error_page() {
         [ -n "$ep" ] && result "WST-123|양호|ErrorDocument 설정됨: ${ep}" || \
             result "WST-123|취약|ErrorDocument 미설정 (기본 에러 페이지 노출)"  ;;
     nginx)
-        ep=$(grep -r "error_page" /etc/nginx/ 2>/dev/null | grep -v "^#" | head -1)
+        ep=$(grep -r "error_page" ${NGX_DIR}/ 2>/dev/null | grep -v "^#" | head -1)
         [ -n "$ep" ] && result "WST-123|양호|error_page 설정됨" || result "WST-123|취약|Nginx error_page 미설정" ;;
     *) result "WST-123|수동확인|에러 페이지 설정 수동 확인" ;;
     esac
@@ -4177,7 +4284,7 @@ check_error_page() {
 check_error_page
 
 # WST-124: LDAP 알고리즘 제한
-evd "WST-124" "grep -rE 'ldap|LDAP' ${APACHE_CONF:-/dev/null} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/ 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-124" "grep -rE 'ldap|LDAP' ${APACHE_CONF:-/dev/null} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/ 2>/dev/null | grep -v '^#' | head -5"
 result "WST-124|수동확인|웹 서비스 LDAP 연동 시 알고리즘 설정 수동 확인"
 
 # WST-125: 업로드 경로/권한 설정
@@ -4367,7 +4474,7 @@ fi
 
 # WST-AUTO-001: TLS 1.0/1.1 비활성화 확인
 check_tls_version() {
-    evd "WST-034" "grep -rE 'SSLProtocol|ssl_protocols' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+    evd "WST-034" "grep -rE 'SSLProtocol|ssl_protocols' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
     case "$WEB_SRV" in
     apache)
         confdir=$(dirname "$APACHE_CONF")
@@ -4380,7 +4487,7 @@ check_tls_version() {
             result "WST-034|수동확인|SSLProtocol 설정 수동 확인"
         fi ;;
     nginx)
-        proto=$(grep -r "ssl_protocols" /etc/nginx/ 2>/dev/null | grep -v "^#" | head -1)
+        proto=$(grep -r "ssl_protocols" ${NGX_DIR}/ 2>/dev/null | grep -v "^#" | head -1)
         if [ -n "$proto" ]; then
             echo "$proto" | grep -qiE "TLSv1\b|TLSv1\.0|SSLv3" && \
                 result "WST-034|취약|취약한 TLS 버전 허용: ${proto}" || \
@@ -4395,7 +4502,7 @@ check_tls_version
 
 # WST-AUTO-002: HTTP 보안 헤더 설정 확인
 check_security_headers() {
-    evd "WST-035" "grep -rEi 'X-Content-Type|X-Frame-Options|Strict-Transport|Content-Security-Policy' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+    evd "WST-035" "grep -rEi 'X-Content-Type|X-Frame-Options|Strict-Transport|Content-Security-Policy' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
     case "$WEB_SRV" in
     apache)
         confdir=$(dirname "$APACHE_CONF")
@@ -4408,9 +4515,9 @@ check_security_headers() {
         ;;
     nginx)
         _missing=""
-        grep -rqi "X-Content-Type-Options" /etc/nginx/ 2>/dev/null || _missing="${_missing} X-Content-Type-Options"
-        grep -rqi "X-Frame-Options\|Content-Security-Policy.*frame-ancestors" /etc/nginx/ 2>/dev/null || _missing="${_missing} X-Frame-Options"
-        grep -rqi "Strict-Transport-Security" /etc/nginx/ 2>/dev/null || _missing="${_missing} HSTS"
+        grep -rqi "X-Content-Type-Options" ${NGX_DIR}/ 2>/dev/null || _missing="${_missing} X-Content-Type-Options"
+        grep -rqi "X-Frame-Options\|Content-Security-Policy.*frame-ancestors" ${NGX_DIR}/ 2>/dev/null || _missing="${_missing} X-Frame-Options"
+        grep -rqi "Strict-Transport-Security" ${NGX_DIR}/ 2>/dev/null || _missing="${_missing} HSTS"
         [ -n "$_missing" ] && result "WST-035|취약|HTTP 보안 헤더 미설정:${_missing}" || \
             result "WST-035|양호|HTTP 보안 헤더 설정됨"
         ;;
@@ -4442,7 +4549,7 @@ check_tomcat_ajp
 
 # WST-AUTO-004: 웹서버 TRACE/TRACK 메서드 차단 확인
 check_trace_method() {
-    evd "WST-038" "grep -rEi 'TraceEnable|request_method.*TRACE|LimitExcept' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+    evd "WST-038" "grep -rEi 'TraceEnable|request_method.*TRACE|LimitExcept' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
     case "$WEB_SRV" in
     apache)
         confdir=$(dirname "$APACHE_CONF")
@@ -4452,7 +4559,7 @@ check_trace_method() {
             result "WST-038|취약|Apache TRACE 메서드 차단 미설정 (TraceEnable Off 권고)"
         fi ;;
     nginx)
-        if grep -rqE "if.*\\\$request_method.*TRACE|limit_except" /etc/nginx/ 2>/dev/null; then
+        if grep -rqE "if.*\\\$request_method.*TRACE|limit_except" ${NGX_DIR}/ 2>/dev/null; then
             result "WST-038|양호|Nginx TRACE 메서드 제한 설정됨"
         else
             result "WST-038|수동확인|Nginx TRACE 메서드 제한 수동 확인 (Nginx 기본 차단)"
@@ -4464,14 +4571,14 @@ check_trace_method
 
 # WST-AUTO-005: 웹서버 SSL 인증서 만료 확인
 check_ssl_cert_expiry() {
-    evd "WST-040" "grep -rE 'SSLCertificateFile|ssl_certificate' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -3"
+    evd "WST-040" "grep -rE 'SSLCertificateFile|ssl_certificate' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -3"
     case "$WEB_SRV" in
     apache)
         confdir=$(dirname "$APACHE_CONF")
         cert_file=$(grep -r "SSLCertificateFile" "$confdir"/ 2>/dev/null | grep -v "^#" | awk '{print $NF}' | head -1)
         ;;
     nginx)
-        cert_file=$(grep -r "ssl_certificate\b" /etc/nginx/ 2>/dev/null | grep -v "^#\|ssl_certificate_key" | awk '{print $NF}' | tr -d ';' | head -1)
+        cert_file=$(grep -r "ssl_certificate\b" ${NGX_DIR}/ 2>/dev/null | grep -v "^#\|ssl_certificate_key" | awk '{print $NF}' | tr -d ';' | head -1)
         ;;
     esac
     if [ -n "$cert_file" ] && [ -f "$cert_file" ]; then
@@ -4525,19 +4632,19 @@ evd "WST-004" "named -v 2>/dev/null; ps -ef 2>/dev/null | grep named | grep -v g
 result "WST-004|수동확인|DNS 소프트웨어 보안 버전 수동 확인 (위 현황 참조)"
 
 # WST-005: SQL Injection 방지
-evd "WST-005" "grep -rE 'mod_security|modsecurity' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -3"
+evd "WST-005" "grep -rE 'mod_security|modsecurity' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -3"
 result "WST-005|수동확인|SQL Injection 방지 설정(WAF/입력값 검증) 수동 확인 (위 현황 참조)"
 
 # WST-006: XSS 방지
-evd "WST-006" "grep -rEi 'X-XSS-Protection|Content-Security-Policy' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -3"
+evd "WST-006" "grep -rEi 'X-XSS-Protection|Content-Security-Policy' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -3"
 result "WST-006|수동확인|XSS 방지 설정(보안헤더/입력값 검증) 수동 확인 (위 현황 참조)"
 
 # WST-007: 파일 업로드 제한
-evd "WST-007" "grep -rEi 'LimitRequestBody|client_max_body_size|maxFileSize' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/ 2>/dev/null | grep -v '^#' | head -3"
+evd "WST-007" "grep -rEi 'LimitRequestBody|client_max_body_size|maxFileSize' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/ 2>/dev/null | grep -v '^#' | head -3"
 result "WST-007|수동확인|파일 업로드 크기/확장자 제한 설정 수동 확인 (위 현황 참조)"
 
 # WST-008: 쿠키 보안 설정
-evd "WST-008" "grep -rEi 'HttpOnly|Secure|SameSite|session-config' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/web.xml 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-008" "grep -rEi 'HttpOnly|Secure|SameSite|session-config' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/web.xml 2>/dev/null | grep -v '^#' | head -5"
 result "WST-008|수동확인|쿠키 보안 속성(HttpOnly/Secure/SameSite) 수동 확인 (위 현황 참조)"
 
 # WST-009: 세션 관리
@@ -4577,7 +4684,7 @@ evd "WST-043" "ls -la /var/log/httpd/ /var/log/apache2/ /var/log/nginx/ ${TOMCAT
 result "WST-043|수동확인|웹서버/WAS 로그 검토/보관 정책 수동 확인 (위 현황 참조)"
 
 # WST-045: Session Timeout 설정
-evd "WST-045" "grep -rEi 'session-timeout|timeout|keepalive' ${TOMCAT_HOME:-/dev/null}/conf/web.xml ${APACHE_CONF:-/dev/null} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-045" "grep -rEi 'session-timeout|timeout|keepalive' ${TOMCAT_HOME:-/dev/null}/conf/web.xml ${APACHE_CONF:-/dev/null} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
 result "WST-045|수동확인|웹 세션 타임아웃 설정 적정성 수동 확인 (위 현황 참조)"
 
 # WST-046: 백업 관리
@@ -4609,23 +4716,23 @@ evd "WST-065" "grep -A5 '<session-config>' ${TOMCAT_HOME:-/dev/null}/conf/web.xm
 result "WST-065|수동확인|세션 쿠키 보안 속성(Secure/HttpOnly) 수동 확인 (위 현황 참조)"
 
 # WST-066: 웹 서비스 불필요 HTTP 메서드 제한
-evd "WST-066" "grep -rEi 'LimitExcept|limit_except|http-method' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/web.xml 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-066" "grep -rEi 'LimitExcept|limit_except|http-method' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/web.xml 2>/dev/null | grep -v '^#' | head -5"
 result "WST-066|수동확인|불필요 HTTP 메서드(PUT/DELETE/OPTIONS) 제한 수동 확인 (위 현황 참조)"
 
 # WST-067: 웹 캐시 설정
-evd "WST-067" "grep -rEi 'Cache-Control|Pragma|Expires|proxy_cache' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-067" "grep -rEi 'Cache-Control|Pragma|Expires|proxy_cache' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
 result "WST-067|수동확인|웹 캐시 보안 설정(Cache-Control) 수동 확인 (위 현황 참조)"
 
 # WST-068: 웹 서비스 인증 설정
-evd "WST-068" "grep -rEi 'AuthType|auth_basic|Realm' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-068" "grep -rEi 'AuthType|auth_basic|Realm' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
 result "WST-068|수동확인|웹 서비스 인증 메커니즘 수동 확인 (위 현황 참조)"
 
 # WST-069: 웹 서비스 접근 로그 설정
-evd "WST-069" "grep -rEi 'CustomLog|access_log|AccessLogValve' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-069" "grep -rEi 'CustomLog|access_log|AccessLogValve' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -5"
 result "WST-069|수동확인|웹 서비스 접근 로그 형식/저장 설정 수동 확인 (위 현황 참조)"
 
 # WST-070: 웹 서비스 에러 로그 설정
-evd "WST-070" "grep -rEi 'ErrorLog|error_log|logging.properties' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-070" "grep -rEi 'ErrorLog|error_log|logging.properties' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
 result "WST-070|수동확인|웹 서비스 에러 로그 설정 수동 확인 (위 현황 참조)"
 
 # WST-071: 소스 코드 내 중요 정보 노출
@@ -4637,7 +4744,7 @@ evd "WST-072" "find /var/www/html ${TOMCAT_HOME:-/dev/null}/webapps -maxdepth 2 
 result "WST-072|수동확인|디버그/테스트 페이지 존재 여부 수동 확인 (위 현황 참조)"
 
 # WST-073: 불필요 HTTP 헤더 노출
-evd "WST-073" "grep -rEi 'ServerTokens|server_tokens|X-Powered-By' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-073" "grep -rEi 'ServerTokens|server_tokens|X-Powered-By' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -5"
 result "WST-073|수동확인|불필요 HTTP 응답 헤더(X-Powered-By 등) 노출 수동 확인 (위 현황 참조)"
 
 # WST-074: 웹 서비스 접속 포트 관리
@@ -4661,7 +4768,7 @@ evd "WST-079" "find /etc/ssl /etc/pki -name '*.crt' -o -name '*.pem' 2>/dev/null
 result "WST-079|수동확인|SSL/TLS 인증서 관리(갱신/폐기) 수동 확인 (위 현황 참조)"
 
 # WST-080: 웹 서비스 가용성 관리
-evd "WST-080" "grep -rEi 'MaxClients|MaxRequestWorkers|worker_connections|maxThreads' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-080" "grep -rEi 'MaxClients|MaxRequestWorkers|worker_connections|maxThreads' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -5"
 result "WST-080|수동확인|웹 서비스 가용성 설정(MaxClients/worker) 수동 확인 (위 현황 참조)"
 
 # WST-081: 웹 서비스 장애 대응 절차
@@ -4669,15 +4776,15 @@ evd "WST-081" "systemctl is-enabled httpd nginx tomcat 2>/dev/null; ls /etc/syst
 result "WST-081|수동확인|웹 서비스 장애 대응 및 복구 절차 수동 확인"
 
 # WST-084: 웹 서비스 이중화 설정
-evd "WST-084" "grep -rEi 'upstream|BalancerMember|ProxyPass' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-084" "grep -rEi 'upstream|BalancerMember|ProxyPass' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
 result "WST-084|수동확인|웹 서비스 이중화/로드밸런싱 설정 수동 확인 (위 현황 참조)"
 
 # WST-085: 웹 서비스 암호화 통신
-evd "WST-085" "grep -rEi 'SSLEngine|ssl on|ssl_certificate' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-085" "grep -rEi 'SSLEngine|ssl on|ssl_certificate' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
 result "WST-085|수동확인|웹 서비스 암호화 통신(HTTPS) 적용 수동 확인 (위 현황 참조)"
 
 # WST-086: 웹 서비스 설정파일 백업
-evd "WST-086" "find ${APACHE_CONF:+$(dirname $APACHE_CONF)} /etc/nginx /etc/httpd ${TOMCAT_HOME:-/dev/null}/conf -name '*.bak' -o -name '*.old' -o -name '*.orig' 2>/dev/null | head -5"
+evd "WST-086" "find ${APACHE_CONF:+$(dirname $APACHE_CONF)} ${NGX_DIR} /etc/httpd ${TOMCAT_HOME:-/dev/null}/conf -name '*.bak' -o -name '*.old' -o -name '*.orig' 2>/dev/null | head -5"
 result "WST-086|수동확인|웹 서비스 설정파일 백업/변경 관리 수동 확인 (위 현황 참조)"
 
 # WST-088: 웹 서비스 운영 계정 관리
@@ -4685,7 +4792,7 @@ evd "WST-088" "ps -ef 2>/dev/null | grep -E 'httpd|apache|nginx|tomcat|java' | g
 result "WST-088|수동확인|웹 서비스 운영 전용 계정 분리 수동 확인 (위 현황 참조)"
 
 # WST-089: 웹 서비스 접근 IP 제한
-evd "WST-089" "grep -rEi 'Require ip|allow from|deny from|allow |deny ' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-089" "grep -rEi 'Require ip|allow from|deny from|allow |deny ' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
 result "WST-089|수동확인|웹 서비스 관리 페이지 접근 IP 제한 수동 확인 (위 현황 참조)"
 
 # WST-091: 웹 서비스 robots.txt 설정
@@ -4721,43 +4828,43 @@ evd "WST-098" "echo '보안 교육 훈련은 관리적 점검 항목'"
 result "WST-098|수동확인|웹 서비스 운영자 보안 교육/훈련 수동 확인"
 
 # WST-103: 웹 서비스 개인정보 보호
-evd "WST-103" "grep -rEi 'SSLEngine|ssl on|https' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -3"
+evd "WST-103" "grep -rEi 'SSLEngine|ssl on|https' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -3"
 result "WST-103|수동확인|개인정보 전송 시 암호화 적용 여부 수동 확인 (위 현황 참조)"
 
 # WST-104: 관리자 페이지 접근 제한
-evd "WST-104" "grep -rEi 'manager|admin|console' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/ 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-104" "grep -rEi 'manager|admin|console' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/ 2>/dev/null | grep -v '^#' | head -5"
 result "WST-104|수동확인|관리자 페이지 접근 IP/인증 제한 수동 확인 (위 현황 참조)"
 
 # WST-105: 웹 서비스 취약한 암호 알고리즘
-evd "WST-105" "grep -rEi 'SSLCipherSuite|ssl_ciphers' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -3"
+evd "WST-105" "grep -rEi 'SSLCipherSuite|ssl_ciphers' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -3"
 result "WST-105|수동확인|취약한 암호 알고리즘(DES/RC4/MD5) 사용 여부 수동 확인 (위 현황 참조)"
 
 # WST-106: 웹 서비스 CORS 설정
-evd "WST-106" "grep -rEi 'Access-Control-Allow-Origin|add_header.*Origin' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -3"
+evd "WST-106" "grep -rEi 'Access-Control-Allow-Origin|add_header.*Origin' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -3"
 result "WST-106|수동확인|CORS 설정 적정성 수동 확인 (위 현황 참조)"
 
 # WST-108: 웹 서비스 리다이렉트 설정
-evd "WST-108" "grep -rEi 'Redirect|RewriteRule|return 301|return 302' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-108" "grep -rEi 'Redirect|RewriteRule|return 301|return 302' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -5"
 result "WST-108|수동확인|HTTP→HTTPS 리다이렉트 및 오픈 리다이렉트 수동 확인 (위 현황 참조)"
 
 # WST-110: 웹 서비스 다운로드 제한
-evd "WST-110" "grep -rEi 'download|attachment|X-Download' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ 2>/dev/null | grep -v '^#' | head -3"
+evd "WST-110" "grep -rEi 'download|attachment|X-Download' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ 2>/dev/null | grep -v '^#' | head -3"
 result "WST-110|수동확인|웹 서비스 파일 다운로드 경로/권한 제한 수동 확인 (위 현황 참조)"
 
 # WST-111: 웹 서비스 URI 길이 제한
-evd "WST-111" "grep -rEi 'LimitRequestLine|large_client_header|maxHttpHeaderSize' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -3"
+evd "WST-111" "grep -rEi 'LimitRequestLine|large_client_header|maxHttpHeaderSize' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -3"
 result "WST-111|수동확인|URI/요청 헤더 길이 제한 설정 수동 확인 (위 현황 참조)"
 
 # WST-112: 웹 서비스 요청 본문 크기 제한
-evd "WST-112" "grep -rEi 'LimitRequestBody|client_max_body|maxPostSize' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -3"
+evd "WST-112" "grep -rEi 'LimitRequestBody|client_max_body|maxPostSize' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -3"
 result "WST-112|수동확인|요청 본문(POST body) 크기 제한 수동 확인 (위 현황 참조)"
 
 # WST-113: 웹 서비스 동시 연결 제한
-evd "WST-113" "grep -rEi 'MaxClients|MaxRequestWorkers|worker_connections|maxThreads|acceptCount' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-113" "grep -rEi 'MaxClients|MaxRequestWorkers|worker_connections|maxThreads|acceptCount' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -5"
 result "WST-113|수동확인|웹 서비스 동시 연결 수 제한 수동 확인 (위 현황 참조)"
 
 # WST-114: 웹 서비스 Keep-Alive 설정
-evd "WST-114" "grep -rEi 'KeepAlive|keepalive_timeout|connectionTimeout' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -5"
+evd "WST-114" "grep -rEi 'KeepAlive|keepalive_timeout|connectionTimeout' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -5"
 result "WST-114|수동확인|Keep-Alive/연결 타임아웃 설정 수동 확인 (위 현황 참조)"
 
 # WST-115: 웹 서비스 로그 무결성
@@ -4765,11 +4872,11 @@ evd "WST-115" "ls -la /var/log/httpd/ /var/log/apache2/ /var/log/nginx/ ${TOMCAT
 result "WST-115|수동확인|웹 서비스 로그 무결성/변조 방지 수동 확인 (위 현황 참조)"
 
 # WST-116: 웹 서비스 보안 모듈
-evd "WST-116" "httpd -M 2>/dev/null | grep -iE 'security|evasive|modsec' || ls /etc/nginx/modsec* /etc/nginx/owasp* 2>/dev/null"
+evd "WST-116" "httpd -M 2>/dev/null | grep -iE 'security|evasive|modsec' || ls ${NGX_DIR}/modsec* ${NGX_DIR}/owasp* 2>/dev/null"
 result "WST-116|수동확인|웹 서비스 보안 모듈(ModSecurity/WAF) 적용 수동 확인 (위 현황 참조)"
 
 # WST-117: 웹 서비스 클라이언트 인증서 인증
-evd "WST-117" "grep -rEi 'SSLVerifyClient|ssl_verify_client|clientAuth' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} /etc/nginx/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -3"
+evd "WST-117" "grep -rEi 'SSLVerifyClient|ssl_verify_client|clientAuth' ${APACHE_CONF:-/dev/null} ${APACHE_CONF:+$(dirname "$APACHE_CONF")} ${NGX_DIR}/ ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null | grep -v '^#' | head -3"
 result "WST-117|수동확인|클라이언트 인증서 인증 설정 수동 확인 (위 현황 참조)"
 
 fi
@@ -4807,7 +4914,7 @@ _web_conf_files() {  # 실제 로드되는 설정 파일만 (Apache: DUMP_INCLUD
             [ -n "$dump" ] && echo "$dump" || _apache_includes "$APACHE_CONF"
         fi
         if [ "$WEB_SRV" = "nginx" ]; then
-            nginx -T 2>/dev/null | grep -E '^# configuration file ' | awk '{print $4}' | tr -d ':' | grep . || find /etc/nginx -name "*.conf" 2>/dev/null
+            nginx -T 2>/dev/null | grep -E '^# configuration file ' | awk '{print $4}' | tr -d ':' | grep . || find ${NGX_DIR} -name "*.conf" 2>/dev/null
         fi
     } | grep -v '^$' | sort -u
 }
@@ -4884,13 +4991,13 @@ else
 fi
 
 # WST-035: 파일 업로드·다운로드 용량 제한 (LimitRequestBody / client_max_body_size / maxPostSize)
-evd "WST-035" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*LimitRequestBody' $(dirname "$APACHE_CONF") 2>/dev/null;" ) grep -rhE 'client_max_body_size' /etc/nginx 2>/dev/null; grep -hoE 'maxPostSize=\"[^\"]*\"' ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null"
+evd "WST-035" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*LimitRequestBody' $(dirname "$APACHE_CONF") 2>/dev/null;" ) grep -rhE 'client_max_body_size' ${NGX_DIR} 2>/dev/null; grep -hoE 'maxPostSize=\"[^\"]*\"' ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null"
 _lim=""; _miss=""
 case "$WEB_SRV" in
 apache) _grep_conf "^\s*LimitRequestBody\s+[1-9]" 2>/dev/null | head -1 | grep -q . && _lim="${_lim} Apache LimitRequestBody" || _miss="${_miss} Apache(LimitRequestBody)" ;;
 nginx)  # client_max_body_size 미설정 시 기본 1m 제한, 0 이면 제한 해제
-        if grep -rhE "^\s*client_max_body_size\s+0\s*;" /etc/nginx 2>/dev/null | grep -q .; then _miss="${_miss} Nginx(client_max_body_size 0 - 제한 해제)"
-        else _cmb=$(grep -rhoE '^\s*client_max_body_size\s+\S+' /etc/nginx 2>/dev/null | awk '{print $2}' | tr -d ';' | head -1); _lim="${_lim} Nginx client_max_body_size=${_cmb:-1m(기본)}"; fi ;;
+        if grep -rhE "^\s*client_max_body_size\s+0\s*;" ${NGX_DIR} 2>/dev/null | grep -q .; then _miss="${_miss} Nginx(client_max_body_size 0 - 제한 해제)"
+        else _cmb=$(grep -rhoE '^\s*client_max_body_size\s+\S+' ${NGX_DIR} 2>/dev/null | awk '{print $2}' | tr -d ';' | head -1); _lim="${_lim} Nginx client_max_body_size=${_cmb:-1m(기본)}"; fi ;;
 esac
 [ "$WAS_SRV" = "tomcat" ] && printf '[WST-035] (참고-Tomcat 비대상) maxPostSize: %s
 
@@ -4904,7 +5011,7 @@ elif [ -n "$_lim" ]; then result "WST-035|양호|용량 제한 설정됨:${_lim}
 else result "WST-035|수동확인|${WEB_SRV:-$WAS_SRV} 용량 제한 설정 수동 확인"; fi
 
 # WST-037: 웹 서비스 경로 설정 적절성 (DocumentRoot가 "/" 등 업무 영역과 분리되지 않은 경로)
-evd "WST-037" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*DocumentRoot' $(dirname "$APACHE_CONF") 2>/dev/null;" ) grep -rhE '^\s*root\s' /etc/nginx 2>/dev/null; grep -hoE 'appBase=\"[^\"]*\"|docBase=\"[^\"]*\"' ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null"
+evd "WST-037" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*DocumentRoot' $(dirname "$APACHE_CONF") 2>/dev/null;" ) grep -rhE '^\s*root\s' ${NGX_DIR} 2>/dev/null; grep -hoE 'appBase=\"[^\"]*\"|docBase=\"[^\"]*\"' ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null"
 if [ -z "$WEB_SRV$WAS_SRV" ]; then
     result "WST-037|N-A|웹서버/WAS 미탐지"
 else
@@ -4951,12 +5058,12 @@ _tc_webxml_active() {  # Tomcat conf/web.xml 및 앱 web.xml 에서 주석 블�
 }
 
 # WST-031: 디렉터리 리스팅 (Apache Options Indexes / Nginx autoindex / Tomcat listings)
-evd "WST-031" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*Options' $(dirname "$APACHE_CONF") 2>/dev/null;" ) grep -rhE '^\s*autoindex' /etc/nginx 2>/dev/null; grep -A1 -i '<param-name>listings' ${TOMCAT_HOME:-/dev/null}/conf/web.xml 2>/dev/null"
+evd "WST-031" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*Options' $(dirname "$APACHE_CONF") 2>/dev/null;" ) grep -rhE '^\s*autoindex' ${NGX_DIR} 2>/dev/null; grep -A1 -i '<param-name>listings' ${TOMCAT_HOME:-/dev/null}/conf/web.xml 2>/dev/null"
 _r=""
 case "$WEB_SRV" in
 apache) _o=$(_active "Options\s" | grep -iE "(^|[[:space:]+])Indexes" | grep -vi -- "-Indexes" | head -1)
         [ -n "$_o" ] && _r="취약|Apache 디렉터리 리스팅 허용: $(echo $_o)" || _r="양호|Apache Options Indexes 미사용" ;;
-nginx)  grep -rhE "^\s*autoindex\s+on" /etc/nginx 2>/dev/null | grep -q . && _r="취약|Nginx autoindex on" || _r="양호|Nginx autoindex off" ;;
+nginx)  grep -rhE "^\s*autoindex\s+on" ${NGX_DIR} 2>/dev/null | grep -q . && _r="취약|Nginx autoindex on" || _r="양호|Nginx autoindex off" ;;
 webtob) _r="수동확인|WebtoB http.m Options INDEX 여부 수동 확인" ;;
 esac
 if [ "$WAS_SRV" = "tomcat" ] && [ -n "$TOMCAT_HOME" ]; then
@@ -4967,14 +5074,14 @@ fi
 result "WST-031|${_r:-수동확인|디렉터리 리스팅 설정 수동 확인}"
 
 # WST-121: 불필요한 프록시 설정 (오픈 프록시=취약, 역프록시 매핑=필요성 확인)
-evd "WST-121" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*(LoadModule proxy|ProxyRequests|ProxyPass)' $(dirname "$APACHE_CONF") /etc/httpd/conf.modules.d 2>/dev/null;" ) grep -rhE '^\s*proxy_pass' /etc/nginx 2>/dev/null"
+evd "WST-121" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*(LoadModule proxy|ProxyRequests|ProxyPass)' $(dirname "$APACHE_CONF") /etc/httpd/conf.modules.d 2>/dev/null;" ) grep -rhE '^\s*proxy_pass' ${NGX_DIR} 2>/dev/null"
 case "$WEB_SRV" in
 apache)
     if _active "ProxyRequests\s+On" | grep -q .; then result "WST-121|취약|ProxyRequests On (포워드/오픈 프록시 허용)"
     elif _active "ProxyPass(Match)?\s" | grep -q .; then result "WST-121|수동확인|역프록시 매핑 존재: $(_active 'ProxyPass(Match)?\s' | head -2 | tr '\n' ' ')- 필요성 확인"
     else result "WST-121|양호|프록시 설정(ProxyRequests On/ProxyPass) 없음"; fi ;;
 nginx)
-    grep -rhE "^\s*proxy_pass" /etc/nginx 2>/dev/null | grep -q . \
+    grep -rhE "^\s*proxy_pass" ${NGX_DIR} 2>/dev/null | grep -q . \
         && result "WST-121|수동확인|Nginx proxy_pass 매핑 존재 - 필요성 확인" || result "WST-121|양호|Nginx 프록시 설정 없음" ;;
 *)  result "WST-121|수동확인|${WEB_SRV:-$WAS_SRV} 프록시 설정 수동 확인" ;;
 esac
@@ -4987,7 +5094,7 @@ if [ "$WEB_SRV" = "apache" ]; then
     _o=$(_active "Options\s" | grep -iE "(^|[[:space:]+])Includes(NOEXEC)?" | grep -vi -- "-Includes" | head -1)
     [ -n "$_o" ] && _r="취약|Apache SSI 활성: $(echo $_o)" || _r="양호|Apache Options Includes 미사용 (SSI 비활성)"
 elif [ "$WEB_SRV" = "nginx" ]; then
-    grep -rhE "^\s*ssi\s+on" /etc/nginx 2>/dev/null | grep -q . && _r="취약|Nginx ssi on" || _r="양호|Nginx ssi 미사용"
+    grep -rhE "^\s*ssi\s+on" ${NGX_DIR} 2>/dev/null | grep -q . && _r="취약|Nginx ssi on" || _r="양호|Nginx ssi 미사용"
 elif [ -n "$WEB_SRV" ]; then _r="수동확인|${WEB_SRV} SSI 설정 수동 확인"; fi
 if [ "$WAS_SRV" = "tomcat" ] && [ -n "$TOMCAT_HOME" ]; then
     _f=$(_tc_webxml_active "SSIServlet|SSIFilter") && _r="$(_worse "$_r" "취약|Tomcat SSI 활성: ${_f}")" || _r="$(_worse "$_r" "양호|Tomcat SSIServlet/SSIFilter 미사용")"
@@ -4995,14 +5102,14 @@ fi
 result "WST-122|${_r:-수동확인|SSI 설정 수동 확인}"
 
 # WST-123: 기본 에러 페이지 노출 방지 (ErrorDocument / error_page / Tomcat <error-page>)
-evd "WST-123" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*ErrorDocument' $(dirname "$APACHE_CONF") 2>/dev/null;" ) grep -rhE '^\s*error_page' /etc/nginx 2>/dev/null; grep -n '<error-page>' ${TOMCAT_HOME:-/dev/null}/conf/web.xml 2>/dev/null"
+evd "WST-123" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*ErrorDocument' $(dirname "$APACHE_CONF") 2>/dev/null;" ) grep -rhE '^\s*error_page' ${NGX_DIR} 2>/dev/null; grep -n '<error-page>' ${TOMCAT_HOME:-/dev/null}/conf/web.xml 2>/dev/null"
 _r=""
 case "$WEB_SRV" in
 apache) _ed=$(_active "ErrorDocument\s+[45][0-9][0-9]" | grep -vE 'ErrorDocument\s+403\s+/\.noindex\.html' | awk '{print $2}' | sort -u | tr '
 ' ' ')
         _mis=""; echo " $_ed" | grep -q ' 404' || _mis="${_mis} 404"; echo " $_ed" | grep -qE ' 5[0-9][0-9]' || _mis="${_mis} 500"
         [ -z "$_mis" ] && _r="양호|Apache 사용자 정의 에러 페이지 설정 (ErrorDocument ${_ed% })" || _r="취약|Apache ErrorDocument 미설정 코드:${_mis} (기본 에러 페이지 노출${_ed:+, 설정: ${_ed% }})" ;;
-nginx)  _ep=$(grep -rhE "^\s*error_page\s" /etc/nginx 2>/dev/null | grep -oE '\b[45][0-9][0-9]\b' | sort -u | tr '\n' ' ')
+nginx)  _ep=$(grep -rhE "^\s*error_page\s" ${NGX_DIR} 2>/dev/null | grep -oE '\b[45][0-9][0-9]\b' | sort -u | tr '\n' ' ')
         _mis=""; echo " $_ep" | grep -q ' 404' || _mis="${_mis} 404"; echo " $_ep" | grep -qE ' 5[0-9][0-9]' || _mis="${_mis} 500"
         [ -z "$_mis" ] && _r="양호|Nginx error_page 설정 (${_ep% })" || _r="취약|Nginx error_page 미설정 코드:${_mis}${_ep:+ (설정: ${_ep% })}" ;;
 webtob) _r="수동확인|WebtoB 상태코드별 에러 페이지 매핑 수동 확인" ;;
@@ -5030,7 +5137,7 @@ else
 fi
 
 # WST-102: 웹 서비스 정보 노출 방지 (Apache: ServerTokens Prod 외 → 노출)
-evd "WST-102" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*Server(Tokens|Signature)' $(dirname "$APACHE_CONF") 2>/dev/null;" ) grep -rh 'server_tokens' /etc/nginx 2>/dev/null; grep -hoE 'server=\"[^\"]*\"' ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null"
+evd "WST-102" "$( [ -n "$APACHE_CONF" ] && echo "grep -rhiE '^\s*Server(Tokens|Signature)' $(dirname "$APACHE_CONF") 2>/dev/null;" ) grep -rh 'server_tokens' ${NGX_DIR} 2>/dev/null; grep -hoE 'server=\"[^\"]*\"' ${TOMCAT_HOME:-/dev/null}/conf/server.xml 2>/dev/null"
 case "$WEB_SRV" in
 apache)
     _tok=$(_grep_conf "^\s*ServerTokens\s" 2>/dev/null | tail -1 | awk '{print $2}')
@@ -5040,7 +5147,7 @@ apache)
     *)                result "WST-102|취약|Apache ServerTokens=${_tok} (Prod 외 설정 - 버전 정보 노출)" ;;
     esac ;;
 nginx)
-    grep -rhE "^\s*server_tokens\s+off" /etc/nginx 2>/dev/null | grep -q . \
+    grep -rhE "^\s*server_tokens\s+off" ${NGX_DIR} 2>/dev/null | grep -q . \
         && result "WST-102|양호|Nginx server_tokens off" || result "WST-102|취약|Nginx server_tokens off 미설정 (버전 노출)" ;;
 webtob)
     result "WST-102|수동확인|WebtoB http.m ServerTokens(Min/OS/Full 여부) 수동 확인" ;;
@@ -5113,9 +5220,8 @@ esac
 if [ "$_KMODE" != "ef" ]; then   # 전자금융 모드는 가이드 WEB 판정 생략
 _PHASE="final"
 exec </dev/null   # 설정 파일 목록이 비었을 때 grep 등이 표준입력을 기다리며 멈추지 않도록
-# WebtoB 설정 파일(http.m) / JEUS 홈 추가 탐지
-_WT_M=""
-for _d in "$WEBTOBDIR" /home/tmax/webtob /root/webtob /opt/tmax/webtob /sw/webtob /sw/webtob5 /home/webtob/webtob; do
+# WebtoB 설정 파일(http.m) / JEUS 홈 추가 탐지 (시작 부분 탐지에서 못 찾은 경우)
+[ -z "$_WT_M" ] && for _d in "$WEBTOBDIR" /home/tmax/webtob /root/webtob /opt/tmax/webtob /sw/webtob /sw/webtob5 /home/webtob/webtob; do
     [ -n "$_d" ] && [ -f "$_d/config/http.m" ] && { _WT_M="$_d/config/http.m"; _WT_HOME="$_d"; break; }
 done
 [ "$WEB_SRV" = "webtob" ] && [ -z "$_WT_M" ] && _WT_M=$(find /home /opt /sw /root -maxdepth 5 -name http.m -path '*config*' 2>/dev/null | head -1) && _WT_HOME="${_WT_M%/config/http.m}"
@@ -5127,7 +5233,7 @@ fi
 _JX() { [ -n "$JEUS_HOME" ] && find "$JEUS_HOME" -maxdepth 7 -name "$1" 2>/dev/null | head -${2:-20}; }   # JEUS 설정 파일 검색
 _wtm() { [ -f "$_WT_M" ] && grep -v '^[[:space:]]*#' "$_WT_M" 2>/dev/null | grep -iE "$1"; }        # WebtoB http.m 활성 줄
 _tcx() { [ -n "$TOMCAT_HOME" ] && awk '/<!--/{c=1} !c{print} /-->/{c=0}' "$TOMCAT_HOME/conf/$1" 2>/dev/null; }   # Tomcat conf 파일(주석 제거)
-_ngx() { if [ "$WEB_SRV" = nginx ]; then { nginx -T 2>/dev/null || cat /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* 2>/dev/null; } | sed 's/#.*//' | grep -iE "$1"; fi; }
+_ngx() { if [ "$WEB_SRV" = nginx ]; then { nginx -T 2>/dev/null || cat ${NGINX_CONF} ${NGX_DIR}/conf.d/*.conf ${NGX_DIR}/sites-enabled/* 2>/dev/null; } | sed 's/#.*//' | grep -iE "$1"; fi; }
 _mask_pw() { sed -E 's/(password|credential)="[^"]*"/\1="****"/Ig; s#(<password>)[^<]*(</password>)#\1****\2#Ig'; }
 
 # 탐지 제품 중 가이드 점검 대상 (대상 문자열: "Apache Tomcat Nginx JEUS WebtoB")
@@ -5348,7 +5454,7 @@ _bad=""; _def=""
 for _d in $_roots; do
     case "${_d%/}" in
     ""|/|/etc|/usr|/bin|/sbin|/root|/home|/var|/opt|/tmp|/boot|/lib|/lib64|/proc|/sys|/dev) _bad="${_bad} ${_d}" ;;
-    /var/www/html|/var/www|/usr/local/apache*/htdocs|/usr/local/httpd/htdocs|/usr/share/nginx/html|/etc/nginx/html|*/webtob/docs|html) _def="${_def} ${_d}" ;;
+    /var/www/html|/var/www|/usr/local/apache*/htdocs|/usr/local/httpd/htdocs|/usr/share/nginx/html|"${NGX_DIR}"/html|*/webtob/docs|html) _def="${_def} ${_d}" ;;
     esac
 done
 if [ -n "$_bad" ]; then _r="취약|웹 서비스 경로가 시스템·업무 영역과 분리되지 않음:${_bad}"
@@ -5520,7 +5626,7 @@ _kres "WEB-24" "Apache Tomcat Nginx IIS JEUS WebtoB" "$_r"
 
 # ── WEB-25 주기적 보안 패치 및 벤더 권고사항 적용 ──
 _jv=""; [ "$WAS_SRV" = jeus ] && _jv=$( { jeusadmin -version 2>/dev/null || "$JEUS_HOME/bin/jeusadmin" -version 2>/dev/null; } | head -1)
-_wv2=""; [ "$WEB_SRV" = webtob ] && _wv2=$( { wscfl -version 2>&1 || "$_WT_HOME/bin/wscfl" -version 2>&1; } | grep -iE 'webtob|version' | head -1)
+_wv2=""; [ "$WEB_SRV" = webtob ] && _wv2=$( { if command -v wscfl >/dev/null 2>&1; then wscfl -version 2>&1; elif [ -x "$_WT_HOME/bin/wscfl" ]; then "$_WT_HOME/bin/wscfl" -version 2>&1; fi; } | grep -iE 'webtob|version' | head -1)   # 실행 파일 없을 때 셸 오류 문구(경로에 webtob 포함)가 버전으로 잡히지 않도록
 evd "WEB-25" "httpd -v 2>/dev/null || apache2 -v 2>/dev/null; nginx -v 2>&1; sh ${TOMCAT_HOME:-/nonexistent}/bin/version.sh 2>/dev/null | head -5; echo 'JEUS: $_jv'; echo 'WebtoB: $_wv2'"
 _r=""
 case "$WEB_SRV" in
