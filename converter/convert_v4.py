@@ -1062,6 +1062,9 @@ def build_net_checks(lines, text):
         return build_dlink_checks(lines, text)
 
     dtype  = detect_net_dtype(lines)
+    # IOS 유사 문법 D-Link DGS-3630: 제조사 기본값이 Cisco 와 다름 (CLI Reference Guide R2.25)
+    _brand, _model, _fw = _net_brand(text)
+    _dgs = _brand == "D-LINK" and "DGS-3630" in (_model or "").upper()
 
     def any_m(pat, flags=re.I):
         return any(re.search(pat, l, flags) for l in lines)
@@ -1276,22 +1279,25 @@ def build_net_checks(lines, text):
         users = find_lines(r'^\s*username\s+\S+')
 
     if users:
-        # 계정별 권한/타입 요약
-        user_summary = []
-        for u in users[:5]:
-            name_m = re.search(r'username\s+(\S+)', u, re.I)
+        # 계정별 권한/타입 요약 — D-Link·Junos 등은 한 계정을 여러 줄(비밀번호 줄·권한 줄)로 저장 → 계정명 기준으로 합침
+        acct = {}
+        for u in users:
+            name_m = re.search(r'(?:username|login user)\s+(\S+)', u, re.I)
+            if not name_m:
+                continue
+            a = acct.setdefault(name_m.group(1), {"priv": "", "type": ""})
             priv_m = re.search(r'privilege\s+(\d+)', u, re.I)
             type_m = re.search(r'secret\s+(\d+)|password\s+(\d+)', u, re.I)
-            if name_m:
-                name = name_m.group(1)
-                priv = f"priv{priv_m.group(1)}" if priv_m else ""
-                stype = f"secret-type{type_m.group(1) or type_m.group(2)}" if type_m else ""
-                user_summary.append(f"{name}({priv}{stype})")
+            if priv_m: a["priv"] = f"priv{priv_m.group(1)}"
+            if type_m: a["type"] = f"secret-type{type_m.group(1) or type_m.group(2)}"
+        user_summary = [n + (f"({', '.join(x for x in (a['priv'], a['type']) if x)})" if a['priv'] or a['type'] else "")
+                        for n, a in list(acct.items())[:5]]
+        n_acct = len(acct) or len(users)
         summary = ", ".join(user_summary) if user_summary else users[0][:60]
         results['NET-007'] = mc(fmt(
-            f"로컬 계정 {len(users)}개: {summary}",
+            f"로컬 계정 {n_acct}개: {summary}",
             "운영자 1인 1계정, 계정별 권한 적정(모니터링 계정에 관리자 권한 금지)",
-            f"로컬 계정 {len(users)}개 - 1인 1계정·권한(privilege 15) 적정성 인터뷰 확인"
+            f"로컬 계정 {n_acct}개 - 1인 1계정·권한(privilege 15) 적정성 인터뷰 확인"
         ))
     else:
         results['NET-007'] = ng(fmt(
@@ -1354,8 +1360,7 @@ def build_net_checks(lines, text):
     no_pw_lines = [l for l in no_pw_lines
                    if not (re.match(r'\s*username\s+(\S+)', l, re.I) and re.match(r'\s*username\s+(\S+)', l, re.I).group(1) in pw_users)]
     # D-Link DGS-3630: 라인에 인증 방식 미지정 + AAA default 목록 없음 → 로컬 계정 DB 로 로그인 인증 (CLI Reference R2.25 aaa authentication login)
-    _brand, _model, _ = _net_brand(text)
-    dlink_local_auth = _brand == "D-LINK" and "DGS-3630" in (_model or "").upper() and bool(pw_users)
+    dlink_local_auth = _dgs and bool(pw_users)
 
     def line_blocks(kind):
         blks, cur = [], None
@@ -1403,8 +1408,9 @@ def build_net_checks(lines, text):
             "로컬 계정 없음 - AAA 사용 여부 확인"
         ))
     else:
+        n_acct = len({m.group(1) for l in all_user_lines for m in [re.match(r'\s*username\s+(\S+)', l, re.I)] if m}) or len(all_user_lines)
         results['NET-009'] = mc(fmt(
-            f"계정 {len(all_user_lines)}개·Line 모두 비밀번호(인증) 설정",
+            f"계정 {n_acct}개·Line 모두 비밀번호(인증) 설정",
             "계정·모드별 비밀번호 설정 및 중복 사용 금지",
             "미설정 없음 - 해시 salt 로 중복 여부 판정 불가, 사용자·관리자 비밀번호 중복 인터뷰 확인"
         ))
@@ -1652,10 +1658,13 @@ def build_net_checks(lines, text):
         else:
             svc_disabled.append("SNMP(v3또는미사용)")
 
-        # 3. 웹서비스 HTTP
+        # 3. 웹서비스 HTTP (D-Link DGS-3630: 기본 활성 - no ip http server 로만 비활성)
         if any_m(r"^\s*ip http serve"):
             svc_enabled.append("HTTP서버")
             svc_detail["HTTP서버"] = fline(r"ip http server") or "ip http server"
+        elif _dgs and not any_m(r"^\s*no ip http server\b"):
+            svc_enabled.append("HTTP서버")
+            svc_detail["HTTP서버"] = "no ip http server 미설정(기본 활성)"
         else:
             svc_disabled.append("HTTP서버")
 
@@ -1678,8 +1687,14 @@ def build_net_checks(lines, text):
         else:
             svc_disabled.append("DHCP서버")
 
-        # 6. Domain lookup (기본 활성 - 명시 비활성화 없으면 취약)
-        if not any_m(r"no ip domain.?lookup|no ip domain lookup"):
+        # 6. Domain lookup (IOS 기본 활성 - 명시 비활성화 없으면 취약 / D-Link DGS-3630 기본 비활성 - ip domain lookup 설정 시만 활성)
+        if _dgs:
+            if any_m(r"^\s*ip domain[- ]?lookup\b"):
+                svc_enabled.append("Domain-lookup")
+                svc_detail["Domain-lookup"] = fline(r"^\s*ip domain[- ]?lookup") or "ip domain lookup"
+            else:
+                svc_disabled.append("Domain-lookup(D-Link 기본 비활성)")
+        elif not any_m(r"no ip domain.?lookup|no ip domain lookup"):
             svc_enabled.append("Domain-lookup")
             svc_detail["Domain-lookup"] = "no ip domain-lookup 미설정 (기본 활성화 상태)"
         else:
@@ -1834,7 +1849,7 @@ def build_net_checks(lines, text):
     elif vendor == "JUNIPER":
         log_hosts = find_lines(r'set system syslog host\s+\S+')
     else:
-        log_hosts = find_lines(r'logging host\s+\S+')
+        log_hosts = find_lines(r'^\s*logging (host|server)\s+\S+')   # D-Link: logging server
 
     if log_hosts:
         hosts_str = "; ".join(log_hosts[:3])
@@ -2270,8 +2285,8 @@ def build_net_checks(lines, text):
                 results[_c] = mc(f"{vendor} 설정 문법 자동 판정 미지원 - 수동 확인 (IOS 기준 참고: {_v[1][:120]})")
 
     # IOS 유사 문법 D-Link(DGS-3630 등): Cisco 기본값(미설정 = 활성) 가정 항목은 수동확인, CDP 는 미지원
-    if _net_brand(text)[0] == "D-LINK":
-        for _c in ("NET-022", "NET-026", "NET-034", "NET-043", "NET-044", "NET-051"):
+    if _brand == "D-LINK":
+        for _c in ("NET-022", "NET-026", "NET-034", "NET-037", "NET-043", "NET-044", "NET-051"):
             if results.get(_c, ("",))[0] == RESULT_BAD:
                 results[_c] = mc(f"D-Link 장비 - Cisco 기본값 기준 판정 불가, 장비 기본값 확인 필요 (IOS 기준 참고: {results[_c][1][:120]})")
         if results.get('NET-057', ("",))[0] == RESULT_BAD:
@@ -2283,9 +2298,74 @@ def build_net_checks(lines, text):
                                   ok(fmt("CDP 미지원 장비(D-Link), 기타 기준 취약 서비스 미사용",
                                          "취약 서비스(CDP/LLDP/TFTP/Finger/identd/Smart Install 등) 비활성화", "양호")))
 
+    # D-Link DGS-3630: 제조사 기본값으로 판정 (CLI Reference Guide R2.25 - 주요정보 N-xx 판정과 같은 기준)
+    #   Telnet 서버 기본 활성·SSH 서버 기본 비활성 / 라인 session-timeout 기본 3분 / logging on·버퍼 로깅(warnings) 기본 활성
+    #   로그 날짜·시간 항상 기록 / Proxy ARP·Directed Broadcast 기본 비활성 / 로그인 실패 잠금 명령 없음
+    if _dgs:
+        _dev = f"D-Link {_model}"
+        _ref = "D-Link DGS-3630 CLI Reference Guide R2.25"
+        telnet_on = not any_m(r'^\s*no\s+ip\s+telnet\s+server\b')
+        ssh_on = any_m(r'^\s*ip\s+ssh\s+server\b')
+        _on_s = "·".join(s for s, f in (("Telnet", telnet_on), ("SSH", ssh_on)) if f)
+        _remote = _cfg_blocks(lines, r"^line\s+(telnet|ssh)\b")
+        _acl = [x for _, sub in _remote for x in sub if x.lower().startswith("access-class")] \
+            or [x for x in [fline(r'^\s*(ip\s+)?(ssh|telnet)\s+.*access-class\b|^\s*ip\s+(ssh|telnet)\s+acl\b|trusted-host')] if x]
+        if not _on_s:
+            results['NET-013'] = ok(fmt("Telnet 서버 비활성(no ip telnet server), SSH 서버 설정(ip ssh server) 없음 - 기본 비활성",
+                                        "원격 접속 접근 ACL 적용", f"원격 CLI 접속 경로 없음 ({_ref}) - 웹 관리 서비스는 NET-030 참조"))
+        elif _acl:
+            results['NET-013'] = ok(fmt(f"{_on_s} 원격 접속 접근 제한: {'; '.join(_acl[:3])}", "원격 접속 라인에 access-class 적용", "접근 ACL 적용 - 허가 IP 적정성 확인"))
+        else:
+            results['NET-013'] = ng(fmt(f"{_on_s} 서버 활성, line telnet/ssh access-class 미설정", "원격 접속 라인에 access-class 적용", "접근 ACL 없음 - 모든 IP 에서 원격 접근 가능"))
+        _tos, _over = [], []
+        for h, sub in _cfg_blocks(lines, r"^line\s+(console|telnet|ssh)\b"):
+            m = next((re.match(r"session-timeout\s+(\d+)", x, re.I) for x in sub if re.match(r"session-timeout\s+\d+", x, re.I)), None)
+            v = int(m.group(1)) if m else 3
+            (_over if v == 0 or v > 15 else _tos).append(f"{h}: {'무제한' if v == 0 else f'{v}분'}{'' if m else '(기본값)'}")
+        if _over:
+            results['NET-014'] = ng(fmt(f"타임아웃 미흡: {'; '.join(_over)}", "세션 타임아웃 15분(900초) 이하 (내부 규정이 더 짧으면 그 기준)", "타임아웃 초과/무제한 라인 존재"))
+        elif _tos:
+            results['NET-014'] = ok(fmt('; '.join(_tos), "세션 타임아웃 15분 이하", f"모든 라인 타임아웃 기준 충족 (session-timeout 기본 3분, {_ref})"))
+        if telnet_on:
+            results['NET-015'] = ng(fmt("no ip telnet server 미설정 (Telnet 서버 기본 활성)", "암호화 프로토콜(SSH)만 허용", "Telnet 평문 접속 허용"))
+        elif ssh_on:
+            results['NET-015'] = ok(fmt("no ip telnet server / ip ssh server", "SSH 전용", "SSH 전용 접속"))
+        else:
+            results['NET-015'] = na(fmt("Telnet·SSH 서버 모두 비활성 (원격 CLI 접속 불가)", "Telnet 미허용", "원격 CLI 미사용"))
+        results['NET-012'] = mc(fmt(f"{_dev}: 비밀번호 복잡성 정책 설정 기능 없음 ({_ref})", "비밀번호 복잡도 정책 적용",
+                                    "기관 복잡도 기준(2종 10자 / 3종 8자 이상) 비밀번호 사용 여부 확인"))
+        _l3 = [(h.split(None, 1)[1], sub) for h, sub in _cfg_blocks(lines, r"^interface\s+\S+")
+               if any(re.match(r"ip address\s+\d", x, re.I) for x in sub)
+               and not re.match(r"(?i)(mgmt|management|loopback|null)", h.split(None, 1)[1])]
+        if _l3 and results.get('NET-026', ("",))[0] != RESULT_NA:
+            _pa = [n for n, sub in _l3 if any(re.match(r"ip (local-)?proxy-arp\b", x, re.I) for x in sub)]
+            results['NET-026'] = ng(fmt(f"Proxy ARP 활성: {', '.join(_pa)}", "Proxy ARP 비활성화", "Proxy ARP 허용 - ARP 스푸핑 위험")) if _pa \
+                else ok(fmt(f"IP 인터페이스 {len(_l3)}개 ip proxy-arp·ip local-proxy-arp 설정 없음", "Proxy ARP 비활성화", f"기본값 비활성 ({_ref})"))
+        if _l3 and results.get('NET-027', ("",))[0] != RESULT_NA:
+            _db = [n for n, sub in _l3 if any(re.match(r"ip directed-broadcast\b", x, re.I) for x in sub)]
+            results['NET-027'] = ng(fmt(f"ip directed-broadcast 활성: {', '.join(_db)}", "Directed Broadcast 차단", "Directed Broadcast 허용 - Smurf 공격 취약")) if _db \
+                else ok(fmt(f"IP 인터페이스 {len(_l3)}개 ip directed-broadcast 설정 없음", "Directed Broadcast 차단", f"기본값 비활성 ({_ref})"))
+        if any_m(r'^\s*no logging on\b'):
+            results['NET-033'] = ng(fmt("no logging on", "logging 활성화 필요", "시스템 로깅 비활성"))
+        elif results.get('NET-033', ("",))[0] != RESULT_GOOD:
+            results['NET-033'] = ok(fmt("no logging on 미설정 (logging on 기본 활성)", "logging on 또는 logging server 설정", f"로깅 활성 - 기본값 ({_ref})"))
+        results['NET-034'] = ok(fmt("시스템 로그에 날짜·시간 항상 기록 (별도 timestamp 명령 없음)", "로그에 시간 정보 기록", f"로그 시간 기록 - 기본 동작 ({_ref})"))
+        if any_m(r'^\s*no logging buffered\b'):
+            results['NET-035'] = ng(fmt("no logging buffered", "logging buffered 설정", "버퍼 로그 비활성 - 메모리 로그 없음"))
+        elif results.get('NET-035', ("",))[0] != RESULT_GOOD:
+            results['NET-035'] = ok(fmt("logging buffered 기본 활성 (severity warnings 이상, 버퍼 크기 설정 인자 없음)", "logging buffered 설정",
+                                        f"버퍼 로그 기본 활성 - 평가기준상 크기 무관 ({_ref})"))
+        if results.get('NET-058', ("",))[0] == RESULT_BAD:
+            if any_m(r'^\s*aaa\s+authentication\s+login\s+default\s+group\b'):
+                results['NET-058'] = mc(fmt(f"{_dev}: 로그인 실패 잠금 명령 없음 / AAA 서버 인증 사용", "로그인 실패 시 차단 설정",
+                                            "인증 서버(RADIUS/TACACS+) 측 로그인 실패 잠금 정책 확인"))
+            else:
+                results['NET-058'] = ng(fmt(f"{_dev}: 로그인 실패 잠금 명령 없음 ({_ref}), AAA 서버 인증 미사용", "로그인 실패 시 차단 설정",
+                                            "무제한 로그인 시도 허용 - 인증 서버 잠금 정책 적용 필요"))
+
     # NET-059: EoS
     results['NET-059'] = mc(fmt(
-        f"장비 벤더: {vendor}, 운영체제: config 상단 version 확인",
+        (f"장비: D-Link {_model}{f', 펌웨어 {_fw}' if _fw else ''}" if _brand == "D-LINK" else f"장비 벤더: {vendor}, 운영체제: config 상단 version 확인"),
         "벤더 EoL/EoS 기준 지원 종료 이전 장비 사용",
         "벤더 EoL 페이지 대조 수동 확인 필요"
     ))
@@ -2360,12 +2440,18 @@ def build_net_kisa_checks(lines, text):
     # ── 접근 관리 ──
     remote = _cfg_blocks(lines, r"^line\s+(vty|telnet|ssh)\b")
     rnames = ", ".join(h for h, _ in remote)
+    # DGS-3630: Telnet 서버 기본 활성(no ip telnet server 로 비활성)·SSH 서버 기본 비활성(ip ssh server 로 활성)
+    dgs_cli_off = dgs3630 and bool(on(r"^\s*no\s+ip\s+telnet\s+server\b")) and not on(r"^\s*ip\s+ssh\s+server\b")
     if remote:
         acl = [x for _, sub in remote for x in sub if x.lower().startswith("access-class")] \
             or [on(r"^\s*(ip\s+)?(ssh|telnet)\s+.*access-class\b|^\s*ip\s+(ssh|telnet)\s+acl\b|.*trusted-host")]
         acl = [a for a in acl if a]
-        r["N-06"] = ((RESULT_GOOD, f"원격 접속 접근 제한 설정: {acl[0]}") if acl
-                     else (RESULT_BAD, f"원격 접속 라인({rnames})에 접근 제한 ACL(access-class) 미설정"))
+        if acl:
+            r["N-06"] = (RESULT_GOOD, f"원격 접속 접근 제한 설정: {acl[0]}")
+        elif dgs_cli_off:
+            r["N-06"] = (RESULT_GOOD, f"{dev}: Telnet 서버 비활성(no ip telnet server)·SSH 서버 설정(ip ssh server) 없음(기본 비활성) - 원격 CLI 접속 경로 없음 (웹 관리 접근은 N-27)")
+        else:
+            r["N-06"] = (RESULT_BAD, f"원격 접속 라인({rnames})에 접근 제한 ACL(access-class) 미설정")
         tos = []
         for h, sub in remote:
             m = next((re.match(r"exec-timeout\s+(\d+)(?:\s+(\d+))?", x, re.I) for x in sub
@@ -2386,6 +2472,8 @@ def build_net_kisa_checks(lines, text):
             r["N-08"] = (RESULT_GOOD, "VTY 접속 프로토콜 SSH만 허용 (transport input ssh)")
         elif any(re.search(r"(?i)\b(telnet|all)\b", x) for x in ti):
             r["N-08"] = (RESULT_BAD, f"VTY 접속 시 평문 프로토콜 허용: {', '.join(ti)}")
+        elif telnet_off and dgs_cli_off:
+            r["N-08"] = (RESULT_GOOD, "Telnet 서버 비활성(no ip telnet server), SSH 서버 설정(ip ssh server) 없음(기본 비활성) - 평문 원격 접속 없음")
         elif telnet_off:
             r["N-08"] = (RESULT_GOOD, "Telnet 서버 비활성(no ip telnet server) - SSH 접속만 사용")
         elif dlink:
@@ -2425,11 +2513,21 @@ def build_net_kisa_checks(lines, text):
                 line_noauth.append(h)
     elif not (dgs3630 and pw_users):   # DGS-3630: 인증 방식 미지정 라인은 로컬 계정 DB 로 인증
         line_noauth = [h for h, _ in _cfg_blocks(lines, r"^line\s+\S+") if not users]
+    # 'password <타입 0|7|15> <값>' — 타입 뒤 값이 없으면 빈 비밀번호 또는 config 제출 시 값 마스킹
+    def pw_of(l):
+        m = re.search(r"\bpassword\s+(0|7|15)(?:\s+(\S+))?\s*$", l, re.I)
+        if m:
+            return m.group(1), m.group(2) or ""
+        m = re.search(r"\bpassword\s+(\S+)\s*$", l, re.I)
+        return ("0", m.group(1)) if m else None
+    empty_pw = sorted({uname(l) for l in users if (pw_of(l) or ("", "x"))[1] == ""})
     bad01 = [x for x in ((f"비밀번호 없는 계정: {', '.join(nopw_users)}" if nopw_users else ""),
                          (f"기본값으로 추정되는 비밀번호 사용: {', '.join(plain_def)} (값 비공개)" if plain_def else ""),
                          (f"인증 없는 접속 라인: {', '.join(line_noauth)}" if line_noauth else "")) if x]
     if bad01:
         r["N-01"] = (RESULT_BAD, " / ".join(bad01))
+    elif empty_pw:
+        r["N-01"] = (RESULT_MANUAL, f"{dev}: 비밀번호 값 없음(password 타입 뒤 값 없음): {', '.join(empty_pw)} - config 제출 시 마스킹한 것인지 확인, 실제 빈 비밀번호면 취약")
     elif users or on(r"^\s*enable\s+(secret|password)\b") or aaa_login:
         r["N-01"] = (RESULT_GOOD, f"{dev}: 계정·접속 라인 비밀번호 설정 (제조사 기본값"
                      + (" - 사용자 계정 없음·enable 비밀번호 빈 값 - 에서 변경)" if dgs3630 else " - 비밀번호 없음 - 에서 변경)")
@@ -2443,12 +2541,13 @@ def build_net_kisa_checks(lines, text):
         def _cx(pw):
             n = sum(bool(re.search(p, pw)) for p in (r"[A-Z]", r"[a-z]", r"\d", r"[^A-Za-z0-9]"))
             return (n >= 2 and len(pw) >= 10) or (n >= 3 and len(pw) >= 8)
-        plain = [(uname(l), m.group(1)) for l in users
-                 for m in [re.search(r"\bpassword\s+(?:0\s+)?(?![0-9]+\s)(\S+)\s*$", l, re.I)] if m]
+        plain = [(uname(l), p[1]) for l in users for p in [pw_of(l)] if p and p[0] == "0" and p[1]]
         enc = [uname(l) for l in users if re.search(r"\bpassword\s+(7|15)\s+\S", l, re.I)]
         weak = sorted({u for u, pw in plain if not _cx(pw)})
         if weak:
             r["N-02"] = (RESULT_BAD, f"{dev}: 비밀번호 복잡성 정책 기능 없음({DGS_REF}) - 설정 비밀번호가 복잡도 기준(2종 10자/3종 8자) 미달: {', '.join(weak)} (값 비공개)")
+        elif empty_pw and not plain:
+            r["N-02"] = (RESULT_MANUAL, f"{dev}: 비밀번호 복잡성 정책 기능 없음({DGS_REF}) - 비밀번호 값 없음(마스킹 또는 빈 값): {', '.join(empty_pw)} - 복잡도 기준(2종 10자/3종 8자) 충족 여부 확인")
         elif plain and not enc:
             r["N-02"] = (RESULT_GOOD, f"{dev}: 비밀번호 복잡성 정책 기능 없음({DGS_REF}) - 설정 비밀번호 복잡도 기준(2종 10자/3종 8자) 충족: {', '.join(sorted({u for u, _ in plain}))} (기관 정책 기준이 다르면 재확인)")
 
@@ -2516,6 +2615,8 @@ def build_net_kisa_checks(lines, text):
                      else (RESULT_BAD, "TCP Keepalive 미설정: service tcp-keepalives-" + "/".join(x for x in ("in", "out") if x not in ka)))
     r.update(svc("N-26", "Finger", r"^\s*(service finger|ip finger)\b"))
     http = on(r"^\s*ip http (server|secure-server)\b")
+    if not http and dgs3630 and not on(r"^\s*no\s+ip\s+http\s+server\b"):   # DGS-3630: HTTP 서버 기본 활성
+        http = f"no ip http server 미설정 - HTTP 서버 기본 활성 ({DGS_REF})"
     hacl = on(r"^\s*ip http access-class\b")
     if http and hacl:
         r["N-27"] = (RESULT_GOOD, f"웹 서비스 활성({http}) - 접속 IP 제한 적용: {hacl}")
