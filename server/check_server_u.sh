@@ -83,7 +83,6 @@ fi
 
 echo "# ============================================================"
 echo "# 점검 대상: ${HN}"
-echo "# IP: $( { [ "$(uname -s)" = Linux ] && hostname -I 2>/dev/null | awk '{print $1}'; ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}'; ifconfig -a 2>/dev/null | awk '/inet / {a=$2; sub(/^addr:/, "", a); if (a ~ /^[0-9]/ && a !~ /^127\./) {print a; exit}}'; netstat -in 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+\./ && $4 !~ /^127\./ {print $4; exit}'; } | head -1)"   # 동일 호스트명(localhost 등) 다른 장비 구분용
 echo "# OS: ${OS_FAMILY} / ${OS_DISTRO} ${OS_MAJOR}"
 echo "# OS 상세: $( ( [ -r /etc/os-release ] && . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-$NAME $VERSION_ID}" ) || ( command -v oslevel >/dev/null 2>&1 && echo "AIX $(oslevel -s 2>/dev/null)" ) || ( [ -r /etc/release ] && head -1 /etc/release | sed 's/^ *//' ) || uname -sr 2>/dev/null)"
 echo "# 커널: $(uname -r 2>/dev/null)$( [ "$(uname -s 2>/dev/null)" = SunOS ] && echo " / $(uname -v 2>/dev/null)")"

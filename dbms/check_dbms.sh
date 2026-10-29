@@ -45,15 +45,6 @@
 
 # ── DBMS 자동 탐지 ──────────────────────────────────────────────
 _proc_has() { { ps -e -o comm= 2>/dev/null || cat /proc/[0-9]*/comm 2>/dev/null; } | sed 's#.*/##' | grep -qE "^($1)\$"; }
-_proc_bin() {   # _proc_bin 'DB프로세스명' '클라이언트명...' → 실행 중인 DB 서버 바이너리와 같은 bin 폴더의 클라이언트 (sudo·비표준 설치로 PATH 에 없을 때)
-    local p e c
-    for p in $(ps -e -o pid=,comm= 2>/dev/null | awk -v r="^($1)\$" '{n=$2; sub(/.*\//, "", n)} n ~ r {print $1}'); do
-        e=$(readlink "/proc/$p/exe" 2>/dev/null); e="${e% (deleted)}"
-        [ -n "$e" ] || continue
-        for c in $2; do [ -x "${e%/*}/$c" ] && { echo "${e%/*}/$c"; return 0; }; done
-    done
-    return 1
-}
 detect_dbms() {
     [ -n "$DBMS_TYPE" ] && return
     # 실행 중인 DB 프로세스 우선 (클라이언트만 설치된 서버·환경변수 없는 root/sudo 실행 대응)
@@ -162,7 +153,6 @@ fi
 
 echo "# ================================================================"
 echo "# 점검 대상: ${HN}"
-echo "# IP: $( { [ "$(uname -s)" = Linux ] && hostname -I 2>/dev/null | awk '{print $1}'; ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}'; ifconfig -a 2>/dev/null | awk '/inet / {a=$2; sub(/^addr:/, "", a); if (a ~ /^[0-9]/ && a !~ /^127\./) {print a; exit}}'; netstat -in 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+\./ && $4 !~ /^127\./ {print $4; exit}'; } | head -1)"   # 동일 호스트명(localhost 등) 다른 장비 구분용
 echo "# DBMS 종류: ${DBMS_TYPE}"
 echo "# OS: ${OS_FAMILY}"
 echo "# OS 상세: $( ( [ -r /etc/os-release ] && . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-$NAME $VERSION_ID}" ) || ( command -v oslevel >/dev/null 2>&1 && echo "AIX $(oslevel -s 2>/dev/null)" ) || ( [ -r /etc/release ] && head -1 /etc/release | sed 's/^ *//' ) || uname -sr 2>/dev/null)"
@@ -732,10 +722,6 @@ check_mysql() {
     MYSQL_SOCKET="${MYSQL_SOCKET:-}"
 
     MYSQL_CMD=$(command -v mysql 2>/dev/null || command -v mariadb 2>/dev/null)
-    [ -z "$MYSQL_CMD" ] && MYSQL_CMD=$(_proc_bin 'mysqld|mariadbd' 'mysql mariadb')
-    [ -z "$MYSQL_CMD" ] && for _c in /usr/local/mysql/bin/mysql /usr/local/mariadb/bin/mariadb /usr/local/mariadb/bin/mysql /opt/mysql/bin/mysql /app/mysql/bin/mysql; do
-        [ -x "$_c" ] && MYSQL_CMD="$_c" && break
-    done
     if [ -z "$MYSQL_CMD" ]; then
         printf '[FALLBACK] %s mysql 클라이언트 미탐지 - MySQL 전 항목 수동 확인 처리\n\n' "$(date '+%H:%M:%S')" >> "$_EVD"
         for i in 001 003 004 005 006 007 008 009 011 013 016 017 019 020 022 \
@@ -1077,10 +1063,6 @@ check_pgsql() {
     PGSQL_PORT="${PGSQL_PORT:-5432}"
 
     PSQL=$(command -v psql 2>/dev/null)
-    [ -z "$PSQL" ] && PSQL=$(_proc_bin 'postgres|postmaster' psql)   # PGDG /usr/pgsql-NN·EDB /opt/PostgreSQL·소스 /usr/local/pgsql
-    [ -z "$PSQL" ] && for _c in /usr/pgsql-*/bin/psql /usr/lib/postgresql/*/bin/psql /usr/local/pgsql/bin/psql /opt/PostgreSQL/*/bin/psql; do
-        [ -x "$_c" ] && PSQL="$_c" && break
-    done
     if [ -z "$PSQL" ]; then
         printf '[FALLBACK] %s psql 미탐지 - PostgreSQL 전 항목 수동 확인 처리\n\n' "$(date '+%H:%M:%S')" >> "$_EVD"
         for i in 001 003 004 005 006 007 008 009 011 013 016 017 019 020 022 \
