@@ -25,6 +25,13 @@ function Find-Python {
     }
     return $null
 }
+function Get-Sha256([string]$path) {
+    # Get-FileHash 는 PowerShell 4.0+ 전용 - 없으면 .NET 으로 계산 (대문자 16진 문자열 반환)
+    if (Get-Command Get-FileHash -EA SilentlyContinue) { return (Get-FileHash $path -Algorithm SHA256).Hash.ToUpper() }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $fs = [System.IO.File]::OpenRead($path)
+    try { return ([BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-','').ToUpper() } finally { $fs.Close(); $sha.Dispose() }
+}
 function Py([string[]]$more) {
     $ErrorActionPreference = 'Continue'   # PS 5.1: Stop 이면 python 의 stderr 출력(모듈 없음 등)이 예외로 바뀜 → 종료코드로 판단
     $all = @($script:py.Args) + $more; & $script:py.Cmd @all
@@ -45,13 +52,29 @@ if ($script:py) {
         $exe = Join-Path $env:TEMP 'python-3.12.10-amd64.exe'
         Write-Host "python.org 에서 설치 파일 다운로드 중..."
         Invoke-WebRequest -Uri $PyUrl -OutFile $exe -UseBasicParsing
-        if ((Get-FileHash $exe -Algorithm SHA256).Hash -ne $PySha) { throw "설치 파일 SHA256 불일치 - 손상/변조 가능: $exe" }
+        $got = Get-Sha256 $exe
+        if ($got -ne $PySha) {
+            Remove-Item $exe -Force -ErrorAction SilentlyContinue   # 검증 실패 파일은 실행하지 않고 삭제
+            throw ("Python 설치 파일의 SHA256 이 기대값과 다릅니다 - 설치를 중단했습니다 (받은 파일은 삭제함).`n" +
+                   "  기대값: $PySha`n  실제값: $got`n" +
+                   "  원인: 다운로드가 중간에 끊겼거나, 프록시/보안장비가 파일을 바꿨거나, 변조되었을 수 있습니다.`n" +
+                   "  조치: 네트워크 상태를 확인한 뒤 다시 실행하거나, python.org 에서 3.12.10 설치 파일을 직접 받아 설치하십시오.")
+        }
         $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
         $all = if ($admin) { 1 } else { 0 }   # 관리자면 전체 사용자, 아니면 현재 사용자
         $p = Start-Process -FilePath $exe -ArgumentList "/quiet InstallAllUsers=$all PrependPath=1 Include_launcher=1 Include_test=0" -Wait -PassThru
         if ($p.ExitCode -ne 0) { throw "Python 설치 실패 (exit $($p.ExitCode))" }
     }
-    $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+    # 설치 프로그램이 갱신한 시스템·사용자 PATH 의 새 항목만 현재 프로세스 PATH 뒤에 추가 (기존 프로세스 PATH 는 덮어쓰지 않음)
+    $have = @($env:Path -split ';' | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\').ToLower() })
+    foreach ($scope in 'Machine','User') {
+        foreach ($d in ([Environment]::GetEnvironmentVariable('Path',$scope) -split ';')) {
+            if ($d -and ($have -notcontains $d.TrimEnd('\').ToLower())) {
+                $env:Path = $env:Path.TrimEnd(';') + ';' + $d
+                $have += $d.TrimEnd('\').ToLower()
+            }
+        }
+    }
     $script:py = Find-Python
     if (-not $script:py) { throw "Python 설치 후에도 찾지 못함 - 새 PowerShell 창에서 다시 실행하세요" }
     Write-Host "Python $($script:py.Ver) 설치 완료" -ForegroundColor Green
