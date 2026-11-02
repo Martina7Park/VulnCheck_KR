@@ -15,6 +15,9 @@ bash check_security.sh fw01_config.txt fortigate FW > security_fw01.txt
 - 결과 맨 앞 `# IP` 는 config 에 적힌 장비 관리 IP 입니다.
 - **증적 파일은 결과 파일과 같은 폴더에 `<결과파일명>_iss_evidence.txt` 로 저장**됩니다 (`> security_fw01.txt` 이면 `security_fw01_iss_evidence.txt`). 컨버터가 이 이름으로 자동 병합합니다. 결과를 파일로 리다이렉트하지 않으면 `/tmp/<config명>_iss.txt` 와 `/tmp/<config명>_iss_evidence.txt` 가 만들어지며, 4번째 인자로 결과 파일 경로를 줄 수도 있습니다.
 - config 에 해당 섹션이 없어(부분 config) 판단할 수 없는 항목은 `점검불가` 로 출력됩니다. 전체 설정(`show full-configuration` 등)으로 다시 추출하세요.
-- 증적의 비밀번호 해시는 알고리즘 접두만, SNMP community 는 앞 2자+`***` 로 마스킹됩니다.
+- 증적의 비밀번호 해시는 알고리즘 접두만, SNMP community 는 앞 2자+`***` 로 마스킹됩니다 (IPsec PSK·RADIUS/TACACS 키·SNMPv3 인증키·private-key 본문 포함).
+- FortiGate 방화벽 정책은 `config firewall policy` 뿐 아니라 `policy6`(IPv6)·`policy46/64`·`security-policy`·`proxy-policy` 도 판정하고, 서비스 그룹(`config firewall service group`) 안의 ALL·출발지 포트 서비스까지 전개해 봅니다. 정책 섹션이 없거나 해석하지 못하면 양호가 아니라 `점검불가` 입니다.
+- Palo Alto 는 규칙이 참조한 서비스 객체의 정의가 config 에 없으면(부분 config) 출발지 포트 항목(ISS-035)을 `점검불가` 로 냅니다. syslog 서버 프로파일이 정의만 되고 로그 설정에서 참조(`send-syslog`)되지 않으면 ISS-002 는 `수동확인` 입니다.
+- config 가 UTF-16(Windows 리다이렉트)이거나 EUC-KR/CP949 한글 배너가 들어 있어도 읽습니다 (스크립트는 `LC_ALL=C` 로 바이트 단위 처리).
 
 결과와 증적 파일을 `converter/security/output/` 에 함께 넣습니다.

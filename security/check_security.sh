@@ -25,6 +25,8 @@
 # ================================================================
 
 umask 077
+# 로케일 고정: UTF-8 로케일에서 EUC-KR(CP949) 한글 주석·배너가 든 config 를 grep 하면 'binary file matches' 로 줄이 사라지므로 바이트 단위로 처리
+export LC_ALL=C
 
 if [ $# -lt 1 ]; then
     echo "사용법: bash check_security.sh <config_file.txt> [fortigate|paloalto|generic] [FW|VPN|IDS|IPS|DDoS|WAF] [result_file]"
@@ -38,18 +40,18 @@ RESULT_ARG="$4"
 [ -z "$3" ] && echo "[경고] 장비유형 인자 미지정 → FW 로 점검합니다. IDS/IPS/DDoS/WAF/VPN 장비는 3번째 인자로 지정하세요 (평가대상 N-A 판정이 달라짐)" >&2
 
 if [ ! -f "$CONFIG" ]; then
-    echo "[ERROR] 파일 없음: $CONFIG"
+    echo "[ERROR] 파일 없음: $CONFIG" >&2
     exit 1
 fi
 if [ ! -s "$CONFIG" ]; then
-    echo "[ERROR] 빈 파일: $CONFIG"
+    echo "[ERROR] 빈 파일: $CONFIG" >&2
     exit 1
 fi
 
 DEV_TYPE=$(echo "$DEV_TYPE" | tr '[:lower:]' '[:upper:]')
 case "$DEV_TYPE" in
     FW|VPN|IDS|IPS|DDOS|WAF) ;;
-    *) echo "[ERROR] 지원하지 않는 장비 유형: $DEV_TYPE (FW|VPN|IDS|IPS|DDoS|WAF)"; exit 1 ;;
+    *) echo "[ERROR] 지원하지 않는 장비 유형: $DEV_TYPE (FW|VPN|IDS|IPS|DDoS|WAF)" >&2; exit 1 ;;
 esac
 case "$VENDOR" in
     auto|"") VENDOR=auto ;;
@@ -59,8 +61,13 @@ case "$VENDOR" in
     *) echo "[경고] 알 수 없는 벤더 '$2' → generic 으로 점검합니다 (fortigate|paloalto|generic)" >&2; VENDOR=generic ;;
 esac
 
-# config 본문: CR 제거 + UTF-8 BOM 제거
-TEXT=$(tr -d '\r' < "$CONFIG" | LC_ALL=C sed $'1s/^\xef\xbb\xbf//')
+# config 본문: UTF-16(Windows 리다이렉트 등)이면 UTF-8 로 변환, CR 제거 + BOM 제거
+_bom=$(head -c 2 "$CONFIG" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+if [ "$_bom" = "fffe" ] || [ "$_bom" = "feff" ]; then
+    TEXT=$( { iconv -f UTF-16 -t UTF-8 "$CONFIG" 2>/dev/null || tr -d '\000' < "$CONFIG"; } | tr -d '\r' | sed $'1s/^\xef\xbb\xbf//;1s/^\xff\xfe//;1s/^\xfe\xff//')
+else
+    TEXT=$(tr -d '\r' < "$CONFIG" | sed $'1s/^\xef\xbb\xbf//')
+fi
 CFG_FILE=$(basename "$CONFIG")
 CFG_BASE=$(basename "$CONFIG" .txt)
 
@@ -100,11 +107,13 @@ mask_text() {
     BEGIN { KEYS = "^(password|passwd|phash|psksecret|secret|auth-pwd|priv-pwd|auth-password|priv-password|pre-shared-key|passphrase|bind-password|md5-key|sha-key|private-key|api-key|apikey|token|auth-key|enc-key|key)$" }
     {
         line = $0
+        # FortiGate private-key 처럼 따옴표 값이 여러 줄에 걸친 경우: 본문 줄을 통째로 가림
+        if (inkey) { if (index(line, "\"") > 0) inkey = 0; print "***"; next }
         # FortiGate / Palo Alto set 형식:  [set ]<key> [ENC] <value>
         if (match(line, /^[ \t]*(set[ \t]+)?[A-Za-z0-9-]+[ \t]+/)) {
             lead = substr(line, 1, RLENGTH); rest = substr(line, RLENGTH + 1)
             k = lead; sub(/^[ \t]*(set[ \t]+)?/, "", k); sub(/[ \t]+$/, "", k)
-            if (k ~ KEYS) { n = split(rest, a, /[ \t]+/); if (a[1] == "ENC") print lead "ENC ***"; else print lead mv(a[1]); next }
+            if (k ~ KEYS) { if (rest ~ /^"/ && gsub(/"/, "&", rest) == 1) inkey = 1; n = split(rest, a, /[ \t]+/); if (a[1] == "ENC") print lead "ENC ***"; else print lead mv(a[1]); next }
             if (k == "snmp-community-string") { n = split(rest, a, /[ \t]+/); print lead mc(a[1]); next }
             if (k == "name" && incomm) { v = rest; gsub(/"/, "", v); print lead "\"" mc(v) "\""; next }
         }
@@ -116,6 +125,29 @@ mask_text() {
             seg = substr(line, RSTART, RLENGTH); n = split(seg, a, /[ \t]+/); pre = substr(line, 1, RSTART - 1); post = substr(line, RSTART + RLENGTH)
             sub(/[ \t]+[^ \t]+$/, "", seg); line = pre seg " " mc(a[n]) post
         }
+        # Cisco 류: snmp-server host <주소> [traps|informs] [version 1|2c] <community> ... (version 3 은 community 가 아니라 사용자)
+        if (match(line, /snmp-server host[ \t]+[^ \t]/)) {
+            pre = substr(line, 1, RSTART + 15) " "; rest = substr(line, RSTART + 16); sub(/^[ \t]+/, "", rest); n = split(rest, a, /[ \t]+/)
+            k = 2; if (a[k] == "traps" || a[k] == "informs") k++
+            if (a[k] == "version") { ver = a[k + 1]; k += 2 } else ver = ""
+            if (ver != "3" && a[k] != "" && a[k] !~ /^(udp-port|port)$/) { cm = a[k]; out = pre; for (q = 1; q < k; q++) out = out a[q] " "; for (q = k + 1; q <= n; q++) tail = tail " " a[q]; line = out mc(cm) tail; tail = "" }
+        }
+        # Cisco 류: snmp-server user ... auth <알고리즘> <키> priv <알고리즘> [비트] <키>
+        out = ""; rest = line
+        while (match(rest, /[ \t](auth|priv)[ \t]+(md5|sha|sha256|sha384|sha512|aes|des|3des)([ \t]+(128|192|256))?[ \t]+[^ \t]+/)) {
+            seg = substr(rest, RSTART, RLENGTH); n = split(seg, a, /[ \t]+/)
+            sub(/[ \t]+[^ \t]+$/, "", seg); out = out substr(rest, 1, RSTART - 1) seg " ***"
+            rest = substr(rest, RSTART + RLENGTH)
+        }
+        line = out rest
+        # Cisco 류: tacacs-server / radius-server / crypto isakmp ... key [유형 숫자] <키>
+        if (line ~ /^[ \t]*(tacacs-server|radius-server|crypto isakmp|tacacs|radius)([ \t].*)?[ \t]key[ \t]/) {
+            if (match(line, /[ \t]key[ \t]+([0-9][ \t]+)?[^ \t]+/)) {
+                seg = substr(line, RSTART, RLENGTH); n = split(seg, a, /[ \t]+/)
+                pre = substr(line, 1, RSTART - 1); post = substr(line, RSTART + RLENGTH)
+                line = pre " key " ((n >= 4) ? a[3] " " : "") "***" post
+            }
+        }
         # Cisco 류: password|secret|passwd <유형 숫자> <값> → 유형은 남기고 값만 가림
         out = ""; rest = line
         while (match(rest, /(password|secret|passwd)[ \t]+[0-9][ \t]+[^ \t]+/)) {
@@ -126,7 +158,7 @@ mask_text() {
         line = out rest
         # Palo Alto set 형식: ... phash <값> / snmp-community-string <값> 등 줄 중간의 키-값
         out = ""; rest = line
-        while (match(rest, /[ \t](phash|password|authpwd|privpwd|auth-password|priv-password|secret|pre-shared-key|passphrase|bind-password|private-key|snmp-community-string|community-string)[ \t]+[^ \t]+/)) {
+        while (match(rest, /[ \t](phash|password|authpwd|privpwd|auth-password|priv-password|secret|pre-shared-key|passphrase|bind-password|private-key|snmp-community-string|community-string|community)[ \t]+[^ \t]+/)) {
             seg = substr(rest, RSTART, RLENGTH); n = split(seg, a, /[ \t]+/); k = a[2]; v = a[3]
             if (v ~ /^[0-9]$/ || v == "***") out = out substr(rest, 1, RSTART + RLENGTH - 1)   # Cisco 암호 유형 숫자·이미 가린 값은 그대로
             else out = out substr(rest, 1, RSTART) k " " ((k ~ /community/) ? mc(v) : mv(v))
@@ -136,7 +168,7 @@ mask_text() {
         if (line ~ /^[ \t]*(enable )?(password|secret)[ \t]+/) { sub(/(password|secret)[ \t]+.*/, "&", line); n = split(line, a, /[ \t]+/); line = substr(line, 1, index(line, a[n]) - 1) "***" }
         # XML 요소: <phash>..</phash> 등
         out = ""; rest = line
-        while (match(rest, /<(phash|password|auth-password|priv-password|secret|pre-shared-key|passphrase|bind-password|private-key|key|snmp-community-string|community-string)>[^<]+</)) {
+        while (match(rest, /<(phash|password|authpwd|privpwd|auth-password|priv-password|secret|pre-shared-key|passphrase|bind-password|private-key|key|snmp-community-string|community-string|community)>[^<]+</)) {
             seg = substr(rest, RSTART, RLENGTH); t = seg; sub(/^</, "", t); tag = t; sub(/>.*/, "", tag); val = t; sub(/^[^>]*>/, "", val); sub(/<\/?$/, "", val)
             newv = (tag ~ /community/) ? mc(val) : mv(val)
             out = out substr(rest, 1, RSTART - 1) "<" tag ">" newv "</"
@@ -404,18 +436,28 @@ check_applicable() {
 }
 
 # ── FortiGate 설정 파서 (정책·서비스 객체 단위 판정용) ─────────
-# fg_policies: config firewall policy 의 edit 단위 → "id<TAB>action<TAB>status<TAB>srcaddr<TAB>dstaddr<TAB>service<TAB>srcintf<TAB>dstintf"
-#   (FortiOS 기본값: action=deny, status=enable — show 백업에는 기본값 줄이 생략됨)
+# fg_policies: config firewall policy / policy6 / policy46·64 / security-policy / proxy-policy 의 edit 단위 → "id<TAB>action<TAB>status<TAB>srcaddr<TAB>dstaddr<TAB>service<TAB>srcintf<TAB>dstintf<TAB>service(서비스 그룹 전개)"
+#   (FortiOS 기본값: action=deny, status=enable — show 백업에는 기본값 줄이 생략됨. IPv6 정책 id 는 v6/<번호>, 그 밖은 v46/ v64/ sec/ proxy/ 접두)
 fg_policies() {
-    echo "$TEXT" | tr -d '\r' | awk '
-        function flush() { if (id != "") printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", id, act, st, src, dst, svc, si, di; id="" }
+    { fg_svcgroups | awk '{ print "@@GRP@@\t" $0 }'; printf '%s\n' "$TEXT" | tr -d '\r'; } | awk '
+        function flush(   i, e, k, x, xn, q) {
+            if (id == "") return
+            e = svc
+            # 서비스 그룹 멤버를 최대 4단계까지 펼침
+            for (k = 0; k < 4; k++) { q = ""; xn = split(e, x, " "); for (i = 1; i <= xn; i++) if (x[i] in grp) q = q " " grp[x[i]]; if (q == "") break; e = e q }
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", id, act, st, src, dst, svc, si, di, e; id=""
+        }
         function val(l) { sub(/^[ \t]*set [^ ]+[ \t]*/, "", l); gsub(/"/, "", l); return l }
-        /^[ \t]*config firewall policy[ \t]*$/ { inp=1; nest=0; next }
+        /^@@GRP@@\t/ { split($0, gf, "\t"); grp[gf[2]] = gf[3]; next }
+        /^[ \t]*config firewall (policy|policy6|policy46|policy64|security-policy|proxy-policy)[ \t]*$/ {
+            inp=1; nest=0; pre = ""; t = $3
+            if (t == "policy6") pre = "v6/"; else if (t == "policy46") pre = "v46/"; else if (t == "policy64") pre = "v64/"; else if (t == "security-policy") pre = "sec/"; else if (t == "proxy-policy") pre = "proxy/"
+            next }
         !inp { next }
         /^[ \t]*config / { nest++; next }
         /^[ \t]*end[ \t]*$/ { if (nest > 0) { nest--; next } flush(); inp=0; next }
         nest > 0 { next }
-        /^[ \t]*edit / { flush(); id=$2; gsub(/"/, "", id); act="deny"; st="enable"; src=""; dst=""; svc=""; si=""; di=""; next }
+        /^[ \t]*edit / { flush(); id=$2; gsub(/"/, "", id); id = pre id; act="deny"; st="enable"; src=""; dst=""; svc=""; si=""; di=""; next }
         /^[ \t]*next[ \t]*$/ { flush(); next }
         /^[ \t]*set action / { act=val($0) }
         /^[ \t]*set status / { st=val($0) }
@@ -425,8 +467,17 @@ fg_policies() {
         /^[ \t]*set srcintf / { si=val($0) }
         /^[ \t]*set dstintf / { di=val($0) }'
 }
-# fg_accept: 활성(accept, status enable) 정책만
-fg_accept() { fg_policies | awk -F'\t' '$2=="accept" && $3!="disable"'; }
+# fg_svcgroups: config firewall service group → "그룹명<TAB>멤버들(공백 구분)"
+fg_svcgroups() {
+    printf '%s\n' "$TEXT" | tr -d '\r' | awk '
+        /^[ \t]*config firewall service group[ \t]*$/ { ins=1; next }
+        !ins { next }
+        /^[ \t]*end[ \t]*$/ { if (n != "") print n "\t" m; ins=0; n=""; next }
+        /^[ \t]*edit / { if (n != "") print n "\t" m; n=$0; sub(/^[ \t]*edit[ \t]*/, "", n); gsub(/"/, "", n); m=""; next }
+        /^[ \t]*set member / { l=$0; sub(/^[ \t]*set member[ \t]*/, "", l); gsub(/"/, "", l); m=m " " l }'
+}
+# fg_accept: 활성(accept·ipsec·ssl-vpn, status enable) 정책만
+fg_accept() { fg_policies | awk -F'\t' '($2=="accept" || $2=="ipsec" || $2=="ssl-vpn") && $3!="disable"'; }
 # fg_services: config firewall service custom → "name<TAB>tcp/udp/sctp portrange 값들"
 fg_services() {
     echo "$TEXT" | tr -d '\r' | awk '
@@ -438,7 +489,7 @@ fg_services() {
 }
 # 정책 서비스 목록에 지정 이름(공백 구분 토큰, 대소문자 무시)이 있는 accept 정책 id 목록
 fg_accept_with_svc() {  # $1: 정규식(토큰 전체 일치)
-    fg_accept | awk -F'\t' -v re="^($1)$" '{ n=split($6, a, " "); for (i=1;i<=n;i++) if (toupper(a[i]) ~ toupper(re)) { printf "%s ", $1; break } }'
+    fg_accept | awk -F'\t' -v re="^($1)$" '{ n=split($9, a, " "); for (i=1;i<=n;i++) if (toupper(a[i]) ~ toupper(re)) { printf "%s ", $1; break } }'
 }
 # fg_block <'config ...'>: 섹션 본문(중첩 config 포함) 줄 그대로 출력
 fg_block() {
@@ -499,10 +550,24 @@ fg_blockm() { printf '%s\n' "$TEXT_M" | awk -v hdr="$1" '
         /^[ \t]*config / { nest++ }
         { print }
         /^[ \t]*end[ \t]*$/ { if (nest > 0) nest--; else ins=0 }'; }
-fg_pol_dump() { fg_policies | awk -F'\t' '{print "policy " $1 ": action=" $2 " status=" $3 " srcintf=" $7 " dstintf=" $8 " src=" $4 " dst=" $5 " svc=" $6}'; }
+fg_pol_dump() { fg_policies | awk -F'\t' '{print "policy " $1 ": action=" $2 " status=" $3 " srcintf=" $7 " dstintf=" $8 " src=" $4 " dst=" $5 " svc=" $6 (($9 != $6) ? " (서비스 그룹 전개: " $9 ")" : "")}'; }
 # FG_FULL=1: 장비 전체 config 로 볼 수 있음(config system global 존재) → 기본값 생략·섹션 부재를 '미설정'으로 해석 가능
 FG_FULL=0; has_sec 'config system global' && FG_FULL=1
-FG_NOPOL="config firewall policy 섹션 없음(부분 config) — show full-configuration 으로 전체 설정을 다시 추출해 점검 필요"
+FG_NOPOL=""
+# fg_pol_ok: 정책(config firewall policy / policy6 등)을 읽을 수 있는가. 섹션이 없거나 파싱 결과가 비면 실패(FG_NOPOL 에 사유) → 호출부가 '점검불가' 로 처리
+fg_pol_ok() {
+    local _n _raw
+    if ! printf '%s\n' "$TEXT" | grep -qE '^[[:space:]]*config firewall (policy|policy6|policy46|policy64|security-policy|proxy-policy)[[:space:]]*$'; then
+        FG_NOPOL="config firewall policy 섹션 없음(부분 config) — show full-configuration 으로 전체 설정을 다시 추출해 점검 필요"; return 1
+    fi
+    _n=$(fg_policies | wc -l | tr -d ' ')
+    # 정책 섹션 안의 최상위 edit 개수(원본)와 파싱된 정책 수가 다르면 해석 실패
+    _raw=$(printf '%s\n' "$TEXT" | tr -d '\r' | awk '/^[ \t]*config firewall (policy|policy6|policy46|policy64|security-policy|proxy-policy)[ \t]*$/ { inp=1; nest=0; next } !inp { next } /^[ \t]*config / { nest++; next } /^[ \t]*end[ \t]*$/ { if (nest > 0) { nest--; next } inp=0; next } nest == 0 && /^[ \t]*edit / { c++ } END { print c + 0 }')
+    if [ "${_n:-0}" -ne "${_raw:-0}" ]; then
+        FG_NOPOL="config firewall policy 의 정책(edit) ${_raw}건 중 ${_n}건만 해석됨 — 형식 확인 필요"; return 1
+    fi
+    return 0
+}
 
 check_fortigate() {
 
@@ -515,14 +580,19 @@ check_applicable "ISS-001" "정책 및 로그 백업" && {
 # ISS-002: 원격 로그 서버 사용 여부
 check_applicable "ISS-002" "원격 로그 서버" && {
     kw "ISS-002" 'config log (syslogd|fortianalyzer|forticloud)|set server|set status'
-    LOG_ON=""; LOG_OFF=""
+    LOG_ON=""; LOG_OFF=""; LOG_NOSRV=""
     for _h in syslogd syslogd2 syslogd3 syslogd4 fortianalyzer fortianalyzer2 fortianalyzer3 fortianalyzer-cloud; do
         has_sec "config log $_h setting" || continue
         evd "ISS-002" "fg_blockm 'config log $_h setting'"
-        if fg_block "config log $_h setting" | grep -qiE '^[[:space:]]*set status enable'; then LOG_ON="${LOG_ON}${_h} "; else LOG_OFF="${LOG_OFF}${_h} "; fi
+        if fg_block "config log $_h setting" | grep -qiE '^[[:space:]]*set status enable'; then
+            # 서버 주소(set server)가 있어야 실제 전송 (FortiAnalyzer Cloud/FortiCloud 는 주소 대신 계정 연동)
+            if fg_block "config log $_h setting" | grep -qiE '^[[:space:]]*set server[[:space:]]+[^[:space:]]' || echo "$_h" | grep -qE 'cloud'; then LOG_ON="${LOG_ON}${_h} "; else LOG_NOSRV="${LOG_NOSRV}${_h} "; fi
+        else LOG_OFF="${LOG_OFF}${_h} "; fi
     done
     if [ -n "$LOG_ON" ]; then
         result "ISS-002|양호|원격 로그서버 연동(status enable): ${LOG_ON% }${LOG_OFF:+ / 비활성: ${LOG_OFF% }}"
+    elif [ -n "$LOG_NOSRV" ]; then
+        result "ISS-002|취약|원격 로그 설정이 enable 이나 서버 주소(set server) 미지정: ${LOG_NOSRV% }${LOG_OFF:+ / 비활성: ${LOG_OFF% }}"
     elif [ -n "$LOG_OFF" ]; then
         result "ISS-002|취약|원격 로그서버 설정은 있으나 활성(set status enable) 아님: ${LOG_OFF% } (FortiOS 기본값 disable)"
     elif [ "$FG_FULL" -eq 1 ]; then
@@ -536,7 +606,7 @@ check_applicable "ISS-002" "원격 로그 서버" && {
 check_applicable "ISS-003" "DMZ 구간 설정" && {
     kw "ISS-003" 'dmz|config system zone'
     evd "ISS-003" "fg_pol_dump"
-    if ! has_sec 'config firewall policy'; then
+    if ! fg_pol_ok; then
         result "ISS-003|점검불가|${FG_NOPOL}"
     else
         # 데스크톱 모델 기본 인터페이스 'dmz' 는 미사용이어도 존재 → dmz 인터페이스/존을 쓰는 활성 accept 정책이 있어야 양호 (비활성·deny 정책 제외)
@@ -695,7 +765,9 @@ check_applicable "ISS-016" "보안 접속" && {
     else
         # 인터페이스별 allowaccess 토큰 단위로 http/telnet 판정 (https 와 구분), global 의 admin-telnet 포함
         WEAK_IF=$(fg_block 'config system interface' | awk '
-            /^[ \t]*edit / { nm=$2; gsub(/"/,"",nm) }
+            /^[ \t]*config / { nst++ }
+            /^[ \t]*end[ \t]*$/ { if (nst > 1) nst-- }
+            nst == 1 && /^[ \t]*edit / { nm=$2; gsub(/"/,"",nm) }
             /^[ \t]*set allowaccess / { w=""; for (i=3;i<=NF;i++) { if ($i=="http") w=w " http"; if ($i=="telnet") w=w " telnet" } if (w!="") printf "%s(%s) ", nm, substr(w,2) }')
         GLOB_TEL=$(fg_block 'config system global' | grep -iE '^[[:space:]]*set admin-telnet enable')
         if [ -n "$WEAK_IF" ] || [ -n "$GLOB_TEL" ]; then
@@ -857,16 +929,17 @@ check_applicable "ISS-029" "기술적 검토" && {
 # ISS-030: 모든 목적지 및 서비스로의 허용 정책 금지 여부
 check_applicable "ISS-030" "ANY/ALL 허용 금지" && {
     evd "ISS-030" "fg_pol_dump"
-    if ! has_sec 'config firewall policy'; then
+    if ! fg_pol_ok; then
         result "ISS-030|점검불가|${FG_NOPOL}"
     else
         # 정책 단위: 활성 accept 정책 중 목적지 all + 서비스 ALL (deny 정리 정책·서비스 정의 제외)
-        P_BOTH=$(fg_accept | awk -F'\t' '(" "$5" ") ~ / all / && (" "toupper($6)" ") ~ / ALL / {printf "%s ", $1}')
+        P_BOTH=$(fg_accept | awk -F'\t' '(" "$5" ") ~ / all / && (" "toupper($9)" ") ~ / ALL / {printf "%s ", $1}')
         P_DST=$(fg_accept | awk -F'\t' '(" "$5" ") ~ / all / {printf "%s ", $1}')
-        P_SVC=$(fg_accept | awk -F'\t' '(" "toupper($6)" ") ~ / ALL / {printf "%s ", $1}')
+        P_SVC=$(fg_accept | awk -F'\t' '(" "toupper($9)" ") ~ / ALL / {printf "%s ", $1}')
         if [ -n "$P_BOTH" ]; then
             result "ISS-030|취약|목적지 all + 서비스 ALL 허용 정책: ${P_BOTH% }"
         elif [ -n "$P_DST" ] || [ -n "$P_SVC" ]; then
+            P_DST="${P_DST% }"; P_SVC="${P_SVC% }"
             result "ISS-030|수동확인|목적지 all 허용 정책(${P_DST:-없음}), 서비스 ALL 허용 정책(${P_SVC:-없음}) — 정당성 수동 확인"
         else
             result "ISS-030|양호|모든 목적지/서비스 허용(accept) 정책 없음 ($(fg_accept | wc -l | tr -d ' ')개 활성 허용 정책 검사)"
@@ -885,7 +958,7 @@ check_applicable "ISS-031" "취약 서비스 대역 허용" && {
 check_applicable "ISS-032" "서비스 포트 적정성" && {
     evd "ISS-032" "fg_pol_dump"
     evd "ISS-032" "fg_services"
-    if ! has_sec 'config firewall policy'; then
+    if ! fg_pol_ok; then
         result "ISS-032|점검불가|${FG_NOPOL}"
     else
         # 과도한 서비스: ALL/ALL_TCP/ALL_UDP 또는 포트 범위 1000개 이상 커스텀 서비스(예: 1024-65535)를 쓰는 활성 accept 정책
@@ -916,7 +989,7 @@ check_applicable "ISS-034" "정책 적용 순서" && {
 check_applicable "ISS-035" "출발지 포트 정책 금지" && {
     evd "ISS-035" "fg_services"
     evd "ISS-035" "fg_pol_dump"
-    if ! has_sec 'config firewall policy'; then
+    if ! fg_pol_ok; then
         result "ISS-035|점검불가|${FG_NOPOL}"
     else
         # FortiOS 출발지 포트는 서비스 객체 portrange '<목적지>:<출발지>' 로 지정 → 해당 객체를 쓰는 활성 accept 정책
@@ -935,7 +1008,7 @@ check_applicable "ISS-035" "출발지 포트 정책 금지" && {
 # ISS-036: 취약한 원격 서비스 금지 여부
 check_applicable "ISS-036" "취약 원격 서비스 금지" && {
     evd "ISS-036" "fg_pol_dump"
-    if ! has_sec 'config firewall policy'; then
+    if ! fg_pol_ok; then
         result "ISS-036|점검불가|${FG_NOPOL}"
     else
         # 기본 서비스 객체 정의(TFTP/RLOGIN 등)는 제외 — 활성 accept 정책의 set service 값만 비교
@@ -980,7 +1053,7 @@ check_applicable "ISS-041" "네트워크 대역 설정 금지" && {
     P_ANY=$(fg_accept | awk -F'\t' '(" "$4" "$5" ") ~ / all / {printf "%s ", $1}')
     if [ -n "$P_ANY" ]; then
         result "ISS-041|수동확인|출발지/목적지 all 허용 정책: ${P_ANY% } — 불필요 대역 적용 여부 수동 확인"
-    elif ! has_sec 'config firewall policy'; then
+    elif ! fg_pol_ok; then
         result "ISS-041|점검불가|${FG_NOPOL}"
     else
         result "ISS-041|수동확인|출발지/목적지 all 허용 정책 없음 — 네트워크 대역(서브넷) 주소 객체 사용 정책 적정성 수동 확인"
@@ -1044,8 +1117,11 @@ check_applicable "ISS-002" "원격 로그 서버" && {
     SYSLOG_SRV=$(pa_cnt 'syslog .*server .*server [^ ]+')
     PANORAMA=$(pa_cnt 'panorama-server [^ ]+|log-collector [^ ]+')
     SYSLOG_KW=$(pa_cnt 'syslog')
-    if [ "$SYSLOG_SRV" -gt 0 ] || [ "$PANORAMA" -gt 0 ]; then
-        result "ISS-002|양호|원격 로그서버 지정됨 (syslog 서버 항목 ${SYSLOG_SRV}건, Panorama/Log Collector 지정 ${PANORAMA}건)"
+    SYSLOG_REF=$(pa_cnt 'send-syslog [^ ]+|syslog-profile [^ ]+')   # 로그 설정/log-forwarding 프로파일이 syslog 프로파일을 실제로 참조
+    if [ "$PANORAMA" -gt 0 ] || { [ "$SYSLOG_SRV" -gt 0 ] && [ "$SYSLOG_REF" -gt 0 ]; }; then
+        result "ISS-002|양호|원격 로그서버 지정됨 (syslog 서버 항목 ${SYSLOG_SRV}건·로그 설정 연결 ${SYSLOG_REF}건, Panorama/Log Collector 지정 ${PANORAMA}건)"
+    elif [ "$SYSLOG_SRV" -gt 0 ]; then
+        result "ISS-002|수동확인|syslog 서버 프로파일(${SYSLOG_SRV}건)은 있으나 로그 설정/log-forwarding 프로파일에서 참조(send-syslog)하는 설정 미확인 — 실제 로그 전송 연결 수동 확인"
     elif [ "$SYSLOG_KW" -gt 0 ]; then
         result "ISS-002|수동확인|syslog 관련 설정 ${SYSLOG_KW}건이나 서버 주소 항목 미확인 — 서버 프로파일·log-forwarding 연결 수동 확인"
     elif [ "$PA_SYSN" -gt 0 ]; then
@@ -1176,7 +1252,7 @@ check_applicable "ISS-015" "SNMP 안전 버전" && {
 check_applicable "ISS-016" "보안 접속" && {
     paf "ISS-016" 'disable-http|disable-telnet|disable-ssh|disable-https|management-profile|interface-management-profile|permitted-ip|(^| )(http|telnet|ssh|https) (yes|no)$'
     # 관리 서비스 disable-http/disable-telnet 가 no(=허용), 인터페이스 관리 프로파일에서 http/telnet 이 yes → 평문 관리 접속 허용 (PAN-OS 기본은 비활성)
-    PLAIN=$(printf '%s\n' "$PA_FLAT" | tr '\t' ' ' | grep -iE '(^| )(disable-http|disable-telnet) no$|(^| )(http|telnet) yes$' | sed -E 's/.*(disable-http|disable-telnet|http|telnet) (no|yes)$/\1=\2/' | sort -u | tr '\n' ' ')
+    PLAIN=$(printf '%s\n' "$PA_FLAT" | tr '\t' ' ' | grep -iE '(^| )(disable-http|disable-telnet) no$|(^| )(http|telnet) yes$' | sed -E 's/^(.* )?(disable-http|disable-telnet|http|telnet) (no|yes)$/\2=\3/' | sort -u | tr '\n' ' ')
     if [ -n "$PLAIN" ]; then
         result "ISS-016|취약|평문 관리 프로토콜 허용 설정: ${PLAIN% } — HTTPS/SSH 전용 사용 필요"
     elif [ "$PA_SYSN" -gt 0 ] || [ "$(pa_cnt 'interface-management-profile')" -gt 0 ]; then
@@ -1246,13 +1322,17 @@ check_applicable "ISS-022" "접속 로깅" && {
 # ISS-023: 로그인 실패 제한 (PAN-OS 기본값: failed-attempts 0 = 제한 없음)
 check_applicable "ISS-023" "로그인 실패 제한" && {
     paf "ISS-023" 'lockout|failed-attempts|login-setting'
-    LOCKOUT=$(printf '%s\n' "$PA_FLAT" | awk -F'\t' '{for(i=1;i<NF;i++) if($i=="failed-attempts") print $(i+1)}' | head -1)
+    # 장비(관리자) 잠금: deviceconfig setting management admin-lockout failed-attempts, 인증 프로파일: lockout failed-attempts (관리자에게 지정된 경우에만 적용)
+    LOCKOUT=$(printf '%s\n' "$PA_FLAT" | awk -F'\t' '{for(i=1;i<NF;i++) if($i=="failed-attempts" && $(i-1)=="admin-lockout") print $(i+1)}' | head -1)
+    LOCK_PRF=$(printf '%s\n' "$PA_FLAT" | awk -F'\t' '{for(i=1;i<NF;i++) if($i=="failed-attempts" && $(i-1)!="admin-lockout") printf "%s ", $(i+1)}')
     if [ -n "$LOCKOUT" ] && [ "$LOCKOUT" -ge 1 ] 2>/dev/null && [ "$LOCKOUT" -le 5 ]; then
         result "ISS-023|양호|로그인 실패 잠금 임계값 failed-attempts ${LOCKOUT}회 (5회 이내)"
     elif [ -n "$LOCKOUT" ] && [ "$LOCKOUT" -gt 5 ] 2>/dev/null; then
         result "ISS-023|취약|로그인 실패 잠금 임계값 ${LOCKOUT}회 — 5회 이내 설정 필요"
     elif [ -n "$LOCKOUT" ]; then
         result "ISS-023|취약|로그인 실패 잠금 임계값 ${LOCKOUT} (0=제한 없음) — 5회 이내 설정 필요"
+    elif [ -n "$LOCK_PRF" ]; then
+        result "ISS-023|수동확인|장비 공통 admin-lockout 미설정(기본값 0=잠금 없음), 인증 프로파일 lockout failed-attempts ${LOCK_PRF% }회 — 해당 프로파일이 관리자 계정에 적용되는지 수동 확인"
     elif [ "$PA_SYSN" -gt 0 ]; then
         result "ISS-023|취약|failed-attempts 미설정 — PAN-OS 기본값 0(잠금 없음) 적용, 인증 프로파일별 lockout 은 증적 참조"
     else
@@ -1263,7 +1343,8 @@ check_applicable "ISS-023" "로그인 실패 제한" && {
 # ISS-024: 세션 타임아웃 (PAN-OS 기본값: 관리자 idle-timeout 60분)
 check_applicable "ISS-024" "세션 타임아웃" && {
     paf "ISS-024" 'idle-timeout|timeout|login-setting'
-    TIMEOUT=$(printf '%s\n' "$PA_FLAT" | awk -F'\t' '{for(i=1;i<NF;i++) if($i=="idle-timeout") print $(i+1)}' | head -1)
+    # 관리자 세션: deviceconfig setting management idle-timeout (GlobalProtect 등 다른 idle-timeout 은 제외)
+    TIMEOUT=$(printf '%s\n' "$PA_FLAT" | awk -F'\t' '{for(i=2;i<NF;i++) if($i=="idle-timeout" && $(i-1)=="management") print $(i+1)}' | head -1)
     if [ -n "$TIMEOUT" ] && [ "$TIMEOUT" -ge 1 ] 2>/dev/null && [ "$TIMEOUT" -le 15 ]; then
         result "ISS-024|양호|관리자 idle-timeout ${TIMEOUT}분 설정"
     elif [ -n "$TIMEOUT" ] && [ "$TIMEOUT" -gt 15 ] 2>/dev/null; then
@@ -1349,20 +1430,47 @@ check_applicable "ISS-034" "정책 적용 순서" && {
     evd "ISS-034" "pa_rules_dump"
     result "ISS-034|수동확인|정책 적용 순서 적절성 수동 확인"
 }
-# ISS-035: source-port 가 지정된 서비스 객체를 쓰는 활성 allow 규칙이 있어야 취약 (객체만 정의돼 있으면 양호)
+# ISS-035: source-port 가 지정된 서비스 객체(서비스 그룹 포함)를 쓰는 활성 allow 규칙이 있어야 취약 (객체만 정의돼 있으면 양호)
+#          규칙이 참조한 서비스 객체의 정의가 config 에 없으면(부분 config) 판단할 수 없으므로 점검불가
+pa_svc_scan() {  # 출력: USED:<이름들> / UNDEF:<이름들> / SRC:<이름들>
+    { pa_allow | awk '{ print "@@RULE@@\t" $0 }'; printf '%s\n' "$PA_FLAT"; } | awk -F'\t' '
+    $1 == "@@RULE@@" { rl[++nr] = $0; next }
+    {
+        isrule = 0; for (i = 1; i <= NF; i++) if ($i == "rules") isrule = 1
+        if (isrule) next
+        for (i = 1; i < NF; i++) {
+            if ($i == "service" && $(i+1) != "") { def[$(i+1)] = 1; if ($(i+2) == "protocol") for (j = i + 3; j < NF; j++) if ($j == "source-port") srcp[$(i+1)] = 1 }
+            if ($i == "service-group" && $(i+1) != "") { def[$(i+1)] = 1; if ($(i+2) == "members" && i + 3 <= NF) grp[$(i+1)] = grp[$(i+1)] " " $(i+3) }
+        }
+    }
+    END {
+        for (r = 1; r <= nr; r++) {
+            split(rl[r], f, "\t"); e = f[10]
+            for (k = 0; k < 4; k++) { q = ""; xn = split(e, x, " "); for (i = 1; i <= xn; i++) if (x[i] in grp) q = q " " grp[x[i]]; if (q == "") break; e = e q }
+            xn = split(e, x, " ")
+            for (i = 1; i <= xn; i++) {
+                t = x[i]
+                if (t in srcp) { if (!(t in used)) { used[t] = 1; us = us t " " } }
+                else if (!(t in def) && t !~ /^(any|application-default|service-http|service-https)$/) { if (!(t in undef)) { undef[t] = 1; ud = ud t " " } }
+            }
+        }
+        for (k in srcp) sp = sp k " "
+        print "USED:" us; print "UNDEF:" ud; print "SRC:" sp
+    }'
+}
 check_applicable "ISS-035" "출발지 포트 정책 금지" && {
     paf "ISS-035" 'source-port|src-port'
     evd "ISS-035" "pa_rules_dump"
+    evd "ISS-035" "pa_svc_scan"
     if [ "$PA_RULEN" -eq 0 ]; then
         result "ISS-035|점검불가|${PA_NORULE}"
     else
-        SRC_SVC=$(printf '%s\n' "$PA_FLAT" | awk -F'\t' '{for(i=1;i+1<NF;i++) if($i=="service" && $(i+2)=="protocol") { s=$(i+1); for(j=i+3;j<NF;j++) if($j=="source-port") print s } }' | sort -u | tr '\n' ' ')
-        USED=""
-        for _s in $SRC_SVC; do
-            pa_allow | awk -F'\t' -v s="$_s" '{ n=split($9, a, " "); for (i=1;i<=n;i++) if (a[i]==s) { print $1; exit } }' | grep -q . && USED="${USED}${_s} "
-        done
+        _scan=$(pa_svc_scan)
+        USED=$(printf '%s\n' "$_scan" | sed -n 's/^USED://p'); UNDEF=$(printf '%s\n' "$_scan" | sed -n 's/^UNDEF://p'); SRC_SVC=$(printf '%s\n' "$_scan" | sed -n 's/^SRC://p')
         if [ -n "$USED" ]; then
             result "ISS-035|취약|출발지 포트(source-port) 지정 서비스(${USED% })를 쓰는 활성 allow 규칙 존재"
+        elif [ -n "$UNDEF" ]; then
+            result "ISS-035|점검불가|활성 allow 규칙이 참조한 서비스 객체(${UNDEF% })의 정의가 config 에 없어 source-port 사용 여부를 판단할 수 없음(부분 config) — service 객체를 포함한 전체 config 로 다시 추출"
         elif [ -n "$SRC_SVC" ]; then
             result "ISS-035|양호|source-port 지정 서비스 객체(${SRC_SVC% })는 있으나 사용하는 활성 allow 규칙 없음"
         else

@@ -62,7 +62,8 @@ SECRET = [
     (re.compile(r"(?i)\bcom2sec\s+\S+\s+\S+\s+(?!\S*\*)\S{3,}"), "SNMP community"),
     (re.compile(r"(?i)\bsnmp-server community\s+(?!\S*\*)\S{3,}"), "SNMP community"),
     (re.compile(r"(?i)(?:password|passwd|pwd)\s*[=:]\s*(?![\"']?\*)[\"']?[^\s\"'*]{4,}"), "비밀번호 원문"),
-    (re.compile(r"(?i)\s-p\S{4,}|\s-P\s+(?!\*)\S{4,}"), "명령 인자 비밀번호"),
+    (re.compile(r"\b(?:mysql|mysqldump|mysqladmin|mariadb)\b[^|;]*\s-p(?!\*)\S{4,}"), "명령 인자 비밀번호"),   # mysql -pSECRET (iptables -p tcp 등과 구분)
+    (re.compile(r"\bsqlcmd\b[^|;]*\s-P\s+(?!\*)\S{4,}"), "명령 인자 비밀번호"),
 ]
 
 
