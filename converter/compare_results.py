@@ -68,8 +68,62 @@ def read_text(path):
 # ================================================================
 # 엑셀 파싱: {(hostname, item_code): {"result": str, "reason": str}}
 # ================================================================
+# convert_v4.py 상세보고서의 호스트 외 시트 (호스트 상세 시트 판별용)
+REPORT_SHEETS = {"표지", "개요", "개정이력", "점검대상", "보안수준 통계", "통계_계산", "요약 통계",
+                 "취약점 목록", "취약점_계산", "검토·수정", "보안가이드", "증적"}
+_CODE_RE = re.compile(r"^[A-Z]+-\d+$")
+_REF_RE = re.compile(r"(?:'((?:[^']|'')+)'|([^'!=(),\s]+))!\$?([A-Z]+)\$?(\d+)")
+
+
+def _cell_value(wb_f, wb_v, ws_title, row, col, depth=0):
+    """셀 표시값 — 계산값이 없으면(엑셀에서 저장한 적 없는 생성 직후 보고서) 참조 수식을 따라가 원본 값 사용"""
+    v = wb_v[ws_title].cell(row, col).value
+    if v is not None:
+        return v
+    f = wb_f[ws_title].cell(row, col).value
+    if not (isinstance(f, str) and f.startswith("=")):
+        return f
+    m = _REF_RE.search(f)   # =IF('검토·수정'!G6="","",'검토·수정'!G6) 형식
+    if not m or depth > 3:
+        return None
+    sheet = (m.group(1) or "").replace("''", "'") or m.group(2)
+    if sheet not in wb_f.sheetnames:
+        return None
+    return _cell_value(wb_f, wb_v, sheet, int(m.group(4)),
+                       openpyxl.utils.column_index_from_string(m.group(3)), depth + 1)
+
+
+def _parse_report_hosts(wb_f, wb_v):
+    """상세보고서 호스트 상세 시트: '점검 항목' 머리글 아래 C=항목코드, O=점검결과, P=현황 및 문제점, C6=호스트명"""
+    data = {}
+    for ws in wb_f.worksheets:
+        if ws.title in REPORT_SHEETS or ws.sheet_state != "visible":
+            continue
+        hdr = next((r for r in range(1, min(ws.max_row, 200) + 1)
+                    if ws.cell(r, 3).value == "점검 항목" and "결과" in str(ws.cell(r, 15).value or "")), None)
+        if not hdr:
+            continue
+        host = str(_cell_value(wb_f, wb_v, ws.title, 6, 3) or ws.title).strip()
+        for r in range(hdr + 1, ws.max_row + 1):
+            code = str(ws.cell(r, 3).value or "").strip().upper()
+            if not _CODE_RE.match(code):
+                continue
+            result = _cell_value(wb_f, wb_v, ws.title, r, 15)
+            if result is None:   # 참조를 못 따라간 경우: 생성 시 판정(숨김 S열)
+                result = ws.cell(r, 19).value
+            reason = _cell_value(wb_f, wb_v, ws.title, r, 16)
+            data[(host, code)] = {"result": str(result or "").strip(), "reason": str(reason or "").strip()}
+    return data
+
+
 def parse_result_excel(xlsx_path):
-    wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+    wb_f = openpyxl.load_workbook(xlsx_path)
+    wb_v = openpyxl.load_workbook(xlsx_path, data_only=True)
+    data = _parse_report_hosts(wb_f, wb_v)
+    if data:
+        return data
+    # 구버전·결과 기입용 양식: 첫 시트에서 '항목ID' 머리글 탐색
+    wb = wb_v
     ws = wb.active
 
     header_row = None

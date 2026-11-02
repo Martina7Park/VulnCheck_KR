@@ -33,13 +33,14 @@
 #   SRV-xxx|수동확인|직접 확인 필요
 # ================================================================
 
-import os, re, sys, datetime, json, hashlib
+import os, re, sys, datetime, json, hashlib, unicodedata
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import FormulaRule, CellIsRule
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.chart import RadarChart, BarChart, Reference
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.series import SeriesLabel
@@ -476,24 +477,94 @@ def _fail_condition(std_text):
     return ""
 
 
-def _condense_evidence(evd_text, max_lines=8, width=60):
-    """증적 원문 → 명령/출력 요약 (출력 없는 명령은 '(출력 없음)' 표기)"""
-    out, pending_cmd = [], False
+# 상세 시트 현황 칸(P열 너비 43.5) 표시 기준 — 엑셀 행 높이 상한(409pt) 안에 판정 근거가 보이도록 표시 줄 수로 관리
+CELL_CPL       = 46    # 한 줄 표시 폭 (영문·숫자 1칸, 한글 2칸)
+CELL_MAX_LINES = 30    # 현황 칸 전체 표시 줄 수 상한 (13pt/줄 → 약 400pt)
+EVD_LINE_MAX   = 160   # 증적 요약 한 줄 최대 글자 수 (초과분 '…', 원문은 '증적' 시트)
+_WS_RUN = re.compile(r"[ \t]{3,}")
+
+
+def _disp_width(s):
+    """표시 폭 (한글·전각 2칸)"""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in s)
+
+
+def _vis_lines(text, cpl=CELL_CPL):
+    """셀 줄바꿈(wrap) 적용 시 표시 줄 수 추정"""
+    return sum(max(1, -(-_disp_width(l) // cpl)) for l in str(text or "").split("\n"))
+
+
+def _evd_blocks(evd_text):
+    """증적 원문 → [(머리줄, [출력 줄])] — 머리줄: '$ 명령' / '# 설명·SQL' / '파일: 경로'"""
+    blocks = []
     for ln in evd_text.splitlines():
         if not ln.strip() or ln.startswith("[평가대상 아님]"):
             continue
         if ln.startswith(("$ ", "# ", "파일: ")):
-            if pending_cmd:
-                out.append("  (출력 없음)")
-            out.append(ln[:width])
-            pending_cmd = True
+            blocks.append((ln, []))
+        elif blocks:
+            blocks[-1][1].append(ln)
         else:
-            out.append("  " + ln.strip()[:width])
-            pending_cmd = False
-    if pending_cmd:
-        out.append("  (출력 없음)")
-    if len(out) > max_lines:
-        out = out[:max_lines] + ["  … (이하 생략, 증적 파일 참조)"]
+            blocks.append(("", [ln]))
+    return blocks
+
+
+def _evd_line(s, limit=EVD_LINE_MAX):
+    """증적 한 줄 정리: 표 형식 출력의 열 맞춤 공백 압축 (lastlog·Format-Table·net accounts 의 오른쪽 값 보존)"""
+    s = _WS_RUN.sub("  ", s.strip())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def _condense_evidence(evd_text, budget=24):
+    """증적 원문 → 현황 칸용 요약 (budget: 표시 줄 수 상한)
+    - 명령(머리줄)은 모두 표시하고 출력은 명령별로 고르게 배분 → 앞 명령 출력이 길어 뒤 명령 근거가 빠지지 않도록
+    - 생략분은 명령별 '… 외 N줄' 표기, 원문 전체는 '증적' 시트"""
+    blocks = [(_evd_line(h), [_evd_line(l) for l in ls] or ["(출력 없음)"]) for h, ls in _evd_blocks(evd_text)]
+    if not blocks:
+        return ""
+    budget -= 1   # 끝줄 '※ 생략 없는 원문' 몫
+    n, used = 0, 0
+    for h, _ in blocks:   # 명령이 아주 많으면 앞쪽 명령만 — 명령마다 출력 1줄(또는 '… 외 N줄') 몫 확보
+        cost = (_vis_lines(h) if h else 0) + 1
+        if n and used + cost + 1 > budget:   # +1: '… 외 명령 N건'
+            break
+        n += 1; used += cost
+    blocks, dropped = blocks[:n], len(blocks) - n
+    avail = budget - sum(_vis_lines(h) for h, _ in blocks if h) - (1 if dropped else 0)
+
+    def alloc(cap):
+        shown, left, prog = [0] * len(blocks), cap, True
+        while prog:   # 명령별 한 줄씩 차례로 배정
+            prog = False
+            for i, (_, ls) in enumerate(blocks):
+                if shown[i] < len(ls):
+                    cost = _vis_lines("  " + ls[shown[i]])
+                    if cost <= left:
+                        shown[i] += 1; left -= cost; prog = True
+        return shown
+
+    reserve = 0
+    while True:   # '… 외 N줄' 표기 줄 몫을 남기고 배정
+        shown = alloc(max(0, avail - reserve))
+        cut = sum(1 for i, (_, ls) in enumerate(blocks) if shown[i] < len(ls))
+        if cut <= reserve:
+            break
+        reserve = cut
+    for i, (_, ls) in enumerate(blocks):   # 남은 출력이 한 줄뿐이면 '… 외 1줄' 대신 그 줄 표시
+        if len(ls) - shown[i] == 1 and _vis_lines("  " + ls[-1]) == 1:
+            shown[i] += 1
+    out = []
+    for i, (h, ls) in enumerate(blocks):
+        if h:
+            out.append(h)
+        out += ["  " + l for l in ls[:shown[i]]]
+        if shown[i] < len(ls):
+            out.append(f"  … 외 {len(ls) - shown[i]}줄")
+    if dropped:
+        out.append(f"… 외 명령 {dropped}건")
+    if dropped or any(shown[i] < len(ls) for i, (_, ls) in enumerate(blocks)) or \
+            any(len(_WS_RUN.sub("  ", l.strip())) > EVD_LINE_MAX for l in evd_text.splitlines()):
+        out.append(f"※ 생략 없는 원문: '{EVIDENCE_SHEET}' 시트 (항목코드 클릭)")
     return "\n".join(out)
 
 
@@ -542,8 +613,9 @@ def compose_status(res, evidence, criteria_items, sub_key=None):
                     ml = ml[:6] + ["… (평가기준 판단방법 참조)"]
                 parts.append("[확인방법]\n" + "\n".join(ml))
         evd = evidence.get(code, "")
-        if evd:
-            parts.append("[증적]\n" + _condense_evidence(evd))
+        if evd:   # 현황·문제점·확인방법을 뺀 나머지 줄 수 안에서 증적 요약 (최소 10줄)
+            budget = max(10, CELL_MAX_LINES - _vis_lines("\n".join(parts)) - 1)
+            parts.append("[증적]\n" + _condense_evidence(evd, budget))
         out[code] = (rv, "\n".join(parts) if len(parts) > 1 else (why or ""))
     return out
 
@@ -4184,7 +4256,7 @@ def _kisa_result(res, criteria_items, kisa_items, family):
 def _kisa_groups(category, all_results, hosts_info, criteria_items, evidences=None):
     """
     주요정보(MI) 모드: 판정 결과 → 2026 상세가이드 항목 체계로 변환
-    반환: [(구분 라벨, all_results, hosts_info, criteria_items), ...]  ※ 서버 Unix/Windows 혼재 시 항목군별 분리
+    반환: [(구분 라벨, all_results, hosts_info, criteria_items, 항목별 증적), ...]  ※ 서버 Unix/Windows 혼재 시 항목군별 분리
     """
     fams = {}
     for host, (res, sub) in all_results.items():
@@ -4192,7 +4264,7 @@ def _kisa_groups(category, all_results, hosts_info, criteria_items, evidences=No
     groups = []
     for fam, hosts in fams.items():
         items = _kisa_criteria(fam, criteria_items)
-        g_res = {}
+        g_res, g_evd = {}, {}
         legacy_n = 0
         for h in hosts:
             raw, sub = all_results[h]
@@ -4226,13 +4298,14 @@ def _kisa_groups(category, all_results, hosts_info, criteria_items, evidences=No
             if evidences is not None:   # 현황 및 문제점: 가이드 판단기준으로 구성
                 kev = {k: (ev.get(k) or "\n".join(ev[x] for x in it["sources"] if ev.get(x))) for k, it in items.items()}
                 kres = compose_status(kres, kev, items, "GENERIC")
+                g_evd[h] = kev
             g_res[h] = (kres, sub)
         g_hosts = [hi for hi in hosts_info if hi["hostname"] in g_res]
         print(f"[INFO] 주요정보통신기반시설 상세가이드(2026) 항목으로 변환: {KISA_FAMILY_LABEL[fam]} "
               f"{len(items)}개 항목 / 대상 {len(hosts)}대"
               + (f" / 전자금융 스크립트 증적 → 가이드 기준 재판정 {legacy_n}건" if legacy_n else ""))
         label = KISA_FAMILY_SHORT[fam] if len(fams) > 1 else ""
-        groups.append((label, g_res, g_hosts, items))
+        groups.append((label, g_res, g_hosts, items, g_evd))
     return groups
 
 
@@ -4299,7 +4372,7 @@ class _UEv:
         return any(path in cmd for cmd, _ in self.cmds)
 
     @staticmethod
-    def show(blocks, limit=12):
+    def show(blocks, limit=40):
         out = []
         for cmd, lines in blocks:
             out.append(f"$ {cmd}")
@@ -5027,7 +5100,7 @@ def _qsheet(name):
     return "'" + name.replace("'", "''") + "'"
 
 
-_FIXED_SHEETS = {"표지", "개요", "개정이력", "점검대상", "보안수준 통계", "요약 통계", "취약점 목록", "취약점_계산", "검토·수정", "보안가이드"}
+_FIXED_SHEETS = {"표지", "개요", "개정이력", "점검대상", "보안수준 통계", "통계_계산", "요약 통계", "취약점 목록", "취약점_계산", "검토·수정", "보안가이드", "증적"}
 _SHEET_NAME_MAP = {}
 
 
@@ -6542,10 +6615,10 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
                 ws.cell(data_row, ci).fill = row_fill
 
             _apply_border(ws, data_row, data_row, 1, 17)
-            est = sum(len(l) // 36 + 1 for l in str(reason or "").split("\n"))
+            est = _vis_lines(reason)
             if result_val == RESULT_BAD and fix_text:
-                est = max(est, sum(len(l) // 36 + 1 for l in fix_text.split("\n")))
-            ws.row_dimensions[data_row].height = max(16, min(400, est * 13))
+                est = max(est, _vis_lines(fix_text))
+            ws.row_dimensions[data_row].height = max(16, min(409, est * 13 + 4))
             data_row += 1
 
         # 구분 열 세로 병합 (A:B)
@@ -6840,6 +6913,108 @@ def _create_review_sheet(wb, all_results, criteria_items):
 
 
 # ================================================================
+# 증적 시트 — 항목별 증적 원문 전체 (호스트 상세 시트 현황 칸의 [증적]은 요약)
+# ================================================================
+EVIDENCE_SHEET     = "증적"
+EVD_ITEM_MAX_ROWS  = 500       # 항목당 최대 줄 수 (초과분은 원본 증적 파일 참조)
+EVD_SHEET_MAX_ROWS = 1000000   # 엑셀 시트 행 한도(1,048,576) 이내
+
+
+def _create_evidence_sheet(wb, all_results, criteria_items, evidences):
+    """증적 시트 — 호스트·항목별 실행 명령과 출력 원문을 한 줄씩 생략 없이 수록
+    - 상세 시트 항목코드(C) → 이 시트 항목 머리줄, 이 시트 호스트명 → 상세 시트 해당 행 (상호 하이퍼링크)
+    - 판정 열은 상세 시트 점검결과 참조 수식 → 검토·수정에서 바꾼 판정이 그대로 보임
+    - 모든 줄에 호스트명·항목코드 기입 → 머리글 필터로 호스트·항목별 조회"""
+    evidences = evidences or {}
+    if not any(evidences.get(h) for h in all_results):
+        return
+    ws = wb.create_sheet(EVIDENCE_SHEET)
+    ws.sheet_properties.tabColor = "7F7F7F"
+    ws.sheet_view.showGridLines = False
+    ws.cell(1, 1).value = "▣ 증적 (점검 스크립트 실행 명령 · 출력 원문)"
+    ws.cell(1, 1).font = FONT_SECTION
+    ws.merge_cells("A2:D2")
+    ws.cell(2, 1).value = ("호스트 상세 시트 현황 칸의 [증적]은 요약이며, 이 시트에 증적 파일(*_evidence.txt)의 항목별 명령·출력을 생략 없이 수록합니다. "
+                           "호스트명을 누르면 상세 시트 해당 항목으로, 상세 시트 항목코드를 누르면 이 시트로 이동합니다. 머리글 필터로 호스트·항목을 골라 볼 수 있습니다.")
+    ws.cell(2, 1).font = Font(name=FONT_NAME, size=9, color="555555")
+    ws.cell(2, 1).alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[2].height = 30
+    hdr = 4
+    for ci, (h, w) in enumerate((("호스트명", 18), ("항목코드", 10), ("판정", 9), ("명령 · 출력", 120)), 1):
+        c = ws.cell(hdr, ci)
+        c.value = h
+        c.fill = FILL_SUBHEADER; c.font = FONT_HEADER
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+    area_groups = _group_by_control_area(criteria_items)
+    first = _detail_layout(area_groups)["first_data_row"]
+    order = [code for _, codes in area_groups for code in codes]
+    f_item = Font(name=FONT_NAME, size=10, bold=True, color="1F3864")
+    f_link = Font(name=FONT_NAME, size=9, bold=True, color="0563C1", underline="single")
+    f_code_link = Font(name=FONT_NAME, size=10, bold=True, color="0563C1", underline="single")
+    f_key = Font(name=FONT_NAME, size=8, color="A6A6A6")
+    f_cmd = Font(name="Consolas", size=9, bold=True, color="1F3864")
+    f_out = Font(name="Consolas", size=9, color="262626")
+    fill_item = PatternFill("solid", fgColor="D6E4F0")
+    fill_cmd = PatternFill("solid", fgColor="F2F2F2")
+    ctr = Alignment(horizontal="center", vertical="center")
+    wrap = Alignment(wrap_text=True, vertical="top")   # 긴 줄은 셀 안에서 줄바꿈 (행 높이 자동)
+    EQ = _qsheet(EVIDENCE_SHEET)
+
+    def put(row, col, val, font, fill=None):
+        c = ws.cell(row, col)
+        c.value = val
+        if isinstance(val, str) and val.startswith("=") and col == 4:
+            c.data_type = "s"   # 출력 줄('==> 파일 <==' 등)이 수식으로 저장되지 않도록
+        c.font = font
+        if fill:
+            c.fill = fill
+        return c
+
+    r, skipped = hdr + 1, 0
+    for host, (res, _) in all_results.items():
+        evd = evidences.get(host) or {}
+        hname = _host_sheet_name(host)
+        hq, hws = _qsheet(hname), wb[hname]
+        for idx, code in enumerate(order):
+            lines = [l.rstrip().replace("\t", "    ") for l in (evd.get(code) or "").splitlines()]
+            lines = [l for l in lines if l.strip()]
+            if not lines:
+                continue
+            if r + min(len(lines), EVD_ITEM_MAX_ROWS) + 2 > EVD_SHEET_MAX_ROWS:
+                skipped += 1
+                continue
+            hrow = first + idx
+            item = criteria_items.get(code) or {}
+            put(r, 1, host, f_link, fill_item).hyperlink = Hyperlink(ref=f"A{r}", location=f"{hq}!C{hrow}")
+            put(r, 2, code, f_item, fill_item).alignment = ctr
+            put(r, 3, f'=IF({hq}!O{hrow}="","",{hq}!O{hrow})', f_item, fill_item).alignment = ctr
+            put(r, 4, f"{item.get('name', '')}  ({len(lines)}줄)", f_item, fill_item)
+            hws.cell(hrow, 3).hyperlink = Hyperlink(ref=f"C{hrow}", location=f"{EQ}!A{r}")
+            hws.cell(hrow, 3).font = f_code_link
+            r += 1
+            for ln in lines[:EVD_ITEM_MAX_ROWS]:
+                head = ln.startswith(("$ ", "# ", "파일: "))
+                put(r, 1, host, f_key); put(r, 2, code, f_key).alignment = ctr
+                put(r, 4, ln[:32000], f_cmd if head else f_out, fill_cmd if head else None).alignment = wrap
+                r += 1
+            if len(lines) > EVD_ITEM_MAX_ROWS:
+                put(r, 1, host, f_key); put(r, 2, code, f_key)
+                put(r, 4, f"… 이하 {len(lines) - EVD_ITEM_MAX_ROWS}줄 생략 — 원본 증적 파일 참조", Font(name=FONT_NAME, size=9, color="C0392B"))
+                r += 1
+    if skipped:
+        print(f"[경고] 증적 시트 행 한도 초과 → {skipped}개 항목 증적 미수록 (원본 증적 파일 참조)")
+    ws.freeze_panes = f"A{hdr + 1}"
+    ws.auto_filter.ref = f"A{hdr}:D{max(hdr, r - 1)}"
+    ws.print_title_rows = f"{hdr}:{hdr}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+
+# ================================================================
 # EoS 현황 (서버·웹/WAS·DBMS·네트워크) — 대상별 OS·버전·커널·제품 버전 수집 → EoS 판정 → .txt
 # ================================================================
 _EOS_CATS = {"server": "서버", "webwas": "웹서버/WAS", "dbms": "DBMS", "network": "네트워크 장비"}
@@ -6996,6 +7171,12 @@ def _eos_scan_category(category, base_dir):
         if kern and kern[:1].isdigit() and mod:
             kr, ke, kd = mod.kernel_status(kern, os.environ.get("EOS_OFFLINE") != "1")
             judged.append(("커널(참고)", "linux", kern, "참고", ke, kd + " - 배포판 커널은 배포판 지원 정책을 따르므로 판정에 미반영"))
+        prev = next((x for x in rows if x[0] == host), None)
+        if prev:   # 같은 호스트의 다른 결과 파일(전자금융 + 주요정보 등) → 1대로 병합, 제품 중복 제거
+            seen = {(j[0], j[1], j[2]) for j in prev[3]}
+            prev[3].extend(j for j in judged if (j[0], j[1], j[2]) not in seen)
+            rows[rows.index(prev)] = (host, prev[1] or os_disp, prev[2] or kern, prev[3])
+            continue
         rows.append((host, os_disp, kern, judged))
     return rows, mod
 
@@ -7291,17 +7472,14 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
                     forced += 1
             if forced:
                 print(f"[INFO] {fname} → 평가대상 아닌 항목 {forced}건 N-A 보정")
-        if mode == "MI":   # 가이드 항목 변환 후 현황 구성
-            evidences[hinfo["hostname"]] = evidence
-        else:
+        if mode != "MI":   # 주요정보는 가이드 항목 변환 후 현황 구성
             res = compose_status(res, evidence, criteria_items, detected_sub)
         _h = hinfo["hostname"]
         if _h in all_results:   # 같은 호스트 결과 파일이 여럿(전자금융 + 주요정보 전용 스크립트 등) → 판정·증적 병합, 대상 1대 (파일 순서 무관)
             _old_res, _old_sub = all_results[_h]
             res = {**_old_res, **res}
             detected_sub = detected_sub or _old_sub
-            if _h in evidences:
-                evidences[_h] = {**evidences[_h], **(evidence or {})}
+            evidences[_h] = {**evidences.get(_h, {}), **(evidence or {})}
             for _hi in hosts_info:
                 if _hi.get("hostname") == _h:
                     for _k, _v in hinfo.items():
@@ -7311,6 +7489,7 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
             all_results[_h] = (res, detected_sub)
             continue
         all_results[_h] = (res, detected_sub)
+        evidences[_h] = evidence
         hosts_info.append(hinfo)
 
         total = sum(1 for k in res if k in criteria_items)
@@ -7323,56 +7502,8 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
         return
     # 주요정보(MI): 2026 상세가이드 웹 서비스(WEB-xx) 항목 체계로 변환
     if mode == "MI" and all_results:
-        _, all_results, hosts_info, criteria_items = _kisa_groups("webwas", all_results, hosts_info, criteria_items, evidences)[0]
-
-    wb = openpyxl.Workbook()
-    print(f"[INFO] 보고서 생성 중...")
-
-    _create_cover_sheet(wb, mode, "webwas", hosts_info)
-    _create_overview_sheet(wb, mode, "webwas", hosts_info, criteria_items,
-                           next(iter(all_results), None))
-    _create_revision_sheet(wb)
-    _init_sheet_names(list(all_results.keys()))
-    target_row_map = _create_target_sheet(wb, hosts_info, all_results)
-    _create_security_stats_sheet(wb, all_results, criteria_items, hosts_info, "webwas")
-    _create_summary_stats_sheet(wb, all_results, criteria_items)
-
-    for hostname, (res, detected_sub) in all_results.items():
-        hi = next((h for h in hosts_info if h["hostname"] == hostname), {})
-        _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, hi,
-                             target_row_map.get(hostname))
-        filled = sum(1 for code in criteria_items if code in res)
-        print(f"[INFO] {hostname}: {filled}개 항목 기입 완료")
-
-    _create_vuln_list_sheet(wb, all_results, criteria_items)
-    _create_review_sheet(wb, all_results, criteria_items)
-    _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items)
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    mode_str  = "전자금융" if mode == "EF" else "주요정보"
-    out_path  = os.path.join(cat_dir, f"상세보고서_{mode_str}_웹WAS_{timestamp}.xlsx")
-    wb.save(out_path)
-    total_bad = sum(sum(1 for v in res.values() if v[0] == RESULT_BAD)
-                    for res, _ in all_results.values())
-    print(f"\n[완료] 상세보고서 저장: {out_path}")
-    print(f"  시트 구성: 표지 / 개요 / 개정이력 / 점검대상 / 보안수준 통계 / 요약 통계 / 호스트 상세 {len(all_results)}개")
-    print(f"  총 점검 대상: {len(all_results)}대 / 전체 취약: {total_bad}건")
-
-    audit_targets = []
-    for hostname, (res, detected_sub) in all_results.items():
-        filtered = {code: res.get(code, (RESULT_MANUAL, "")) for code in criteria_items}
-        good = sum(1 for v in filtered.values() if v[0] == RESULT_GOOD)
-        bad  = sum(1 for v in filtered.values() if v[0] == RESULT_BAD)
-        na_c = sum(1 for v in filtered.values() if v[0] == RESULT_NA)
-        mc   = sum(1 for v in filtered.values() if v[0] == RESULT_MANUAL)
-        hi = next((h for h in hosts_info if h["hostname"] == hostname), {})
-        audit_targets.append({
-            "name": hostname, "subtype": detected_sub,
-            "web_info": hi.get("web_info", ""),
-            "good": good, "bad": bad, "na": na_c, "manual": mc,
-            "input_file": f"{hostname}.txt",
-        })
-    write_audit_log(base_dir, mode, "webwas", audit_targets, out_path)
+        _, all_results, hosts_info, criteria_items, evidences = _kisa_groups("webwas", all_results, hosts_info, criteria_items, evidences)[0]
+    _write_report(mode, "webwas", cat_dir, base_dir, all_results, hosts_info, criteria_items, evidences=evidences)
     try:
         write_eos_inventory(base_dir, ["webwas"], cat_dir)
     except Exception as e:
@@ -7588,6 +7719,7 @@ def run_pc_convert(mode, base_dir):
         print(f"[INFO] PC 내장 항목 {len(criteria_items)}개 로드")
 
     all_results = {}
+    evidences   = {}
     hosts_info  = []
 
     for fname in input_files:
@@ -7620,6 +7752,7 @@ def run_pc_convert(mode, base_dir):
 
         res = compose_status(res, evidence, criteria_items, None)
         all_results[hinfo["hostname"]] = (res, "PC")
+        evidences[hinfo["hostname"]] = evidence
         hosts_info.append(hinfo)
 
         bad  = sum(1 for v in res.values() if v[0] == RESULT_BAD)
@@ -7629,50 +7762,7 @@ def run_pc_convert(mode, base_dir):
     if not all_results:
         _no_results_stop(mode, "pc")
         return
-    wb = openpyxl.Workbook()
-    print(f"[INFO] 보고서 생성 중...")
-
-    _create_cover_sheet(wb, mode, "pc", hosts_info)
-    _create_overview_sheet(wb, mode, "pc", hosts_info, criteria_items,
-                           next(iter(all_results), None))
-    _create_revision_sheet(wb)
-    _init_sheet_names(list(all_results.keys()))
-    target_row_map = _create_target_sheet(wb, hosts_info, all_results)
-    _create_security_stats_sheet(wb, all_results, criteria_items, hosts_info, "pc")
-    _create_summary_stats_sheet(wb, all_results, criteria_items)
-
-    for hostname, (res, detected_sub) in all_results.items():
-        hi = next((h for h in hosts_info if h["hostname"] == hostname), {})
-        _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, hi,
-                             target_row_map.get(hostname))
-        print(f"[INFO] {hostname}: {len(criteria_items)}개 항목 기입 완료")
-
-    _create_vuln_list_sheet(wb, all_results, criteria_items)
-    _create_review_sheet(wb, all_results, criteria_items)
-    _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items)
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    mode_str  = "전자금융" if mode == "EF" else "주요정보"
-    out_path  = os.path.join(cat_dir, f"상세보고서_{mode_str}_PC_{timestamp}.xlsx")
-    wb.save(out_path)
-    total_bad = sum(sum(1 for v in res.values() if v[0] == RESULT_BAD)
-                    for res, _ in all_results.values())
-    print(f"\n[완료] 상세보고서 저장: {out_path}")
-    print(f"  시트 구성: 표지 / 개요 / 개정이력 / 점검대상 / 보안수준 통계 / 요약 통계 / 호스트 상세 {len(all_results)}개")
-    print(f"  총 점검 대상: {len(all_results)}대 / 전체 취약: {total_bad}건")
-
-    audit_targets = []
-    for hostname, (res, detected_sub) in all_results.items():
-        filtered = {code: res.get(code, (RESULT_MANUAL, "")) for code in criteria_items}
-        good = sum(1 for v in filtered.values() if v[0] == RESULT_GOOD)
-        bad  = sum(1 for v in filtered.values() if v[0] == RESULT_BAD)
-        na_c = sum(1 for v in filtered.values() if v[0] == RESULT_NA)
-        mc   = sum(1 for v in filtered.values() if v[0] == RESULT_MANUAL)
-        audit_targets.append({
-            "name": hostname, "good": good, "bad": bad, "na": na_c, "manual": mc,
-            "input_file": f"{hostname}.txt",
-        })
-    write_audit_log(base_dir, mode, "pc", audit_targets, out_path)
+    _write_report(mode, "pc", cat_dir, base_dir, all_results, hosts_info, criteria_items, evidences=evidences)
 
 
 def _no_results_stop(mode, category):
@@ -7761,7 +7851,8 @@ def run_convert(mode, category, base_dir, criteria_excel):
         hinfo = _parse_header_info(text)
         evidence = {}
         if not hinfo["hostname"]:
-            hinfo["hostname"] = pure
+            mf = re.search(r"^#\s*파일\s*:\s*(\S+)", text, re.M) if category == "security" else None
+            hinfo["hostname"] = os.path.splitext(os.path.basename(mf.group(1)))[0] if mf else pure
 
         if input_mode == "pipe":
             res = parse_pipe(text)
@@ -7854,17 +7945,14 @@ def run_convert(mode, category, base_dir, criteria_excel):
         res = run_eos_check(category, res, text, base_dir)
 
         detected_sub = sub_key if input_mode == "pipe" else "GENERIC"
-        if kisa_mode:   # 가이드 항목 변환 후 현황 구성
-            evidences[hinfo["hostname"]] = evidence
-        else:
+        if not kisa_mode:   # 주요정보는 가이드 항목 변환 후 현황 구성
             res = compose_status(res, evidence, criteria_items, detected_sub)
         _h = hinfo["hostname"]
         if _h in all_results:   # 같은 호스트 결과 파일이 여럿(전자금융 + 주요정보 전용 스크립트 등) → 판정·증적 병합, 대상 1대 (파일 순서 무관)
             _old_res, _old_sub = all_results[_h]
             res = {**_old_res, **res}
             detected_sub = detected_sub or _old_sub
-            if _h in evidences:
-                evidences[_h] = {**evidences[_h], **(evidence or {})}
+            evidences[_h] = {**evidences.get(_h, {}), **(evidence or {})}
             for _hi in hosts_info:
                 if _hi.get("hostname") == _h:
                     for _k, _v in hinfo.items():
@@ -7874,6 +7962,7 @@ def run_convert(mode, category, base_dir, criteria_excel):
             all_results[_h] = (res, detected_sub)
             continue
         all_results[_h] = (res, detected_sub)
+        evidences[_h] = evidence
         hosts_info.append(hinfo)
         total = sum(1 for k in res if k in criteria_items)
         bad   = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_BAD)
@@ -7887,9 +7976,9 @@ def run_convert(mode, category, base_dir, criteria_excel):
     if mode == "MI" and category in KISA_CATEGORY_FAMILY:
         groups = _kisa_groups(category, all_results, hosts_info, criteria_items, evidences)
     else:
-        groups = [("", all_results, hosts_info, criteria_items)]
-    for label, g_results, g_hosts, g_items in groups:
-        _write_report(mode, category, cat_dir, base_dir, g_results, g_hosts, g_items, label)
+        groups = [("", all_results, hosts_info, criteria_items, evidences)]
+    for label, g_results, g_hosts, g_items, g_evd in groups:
+        _write_report(mode, category, cat_dir, base_dir, g_results, g_hosts, g_items, label, g_evd)
     if category in _EOS_CATS:   # 서버·DBMS·네트워크: 대상별 OS·버전·커널·제품 EoS 현황 .txt
         try:
             write_eos_inventory(base_dir, [category], cat_dir)
@@ -7897,8 +7986,11 @@ def run_convert(mode, category, base_dir, criteria_excel):
             print(f"[경고] EoS 현황 생성 실패: {e}")
 
 
-def _write_report(mode, category, cat_dir, base_dir, all_results, hosts_info, criteria_items, label=""):
-    """상세보고서 워크북 생성·저장 + 감사 로그 (label: 파일명 구분자, 예: Unix/Windows)"""
+_FILE_LABEL = {"webwas": "웹WAS", "pc": "PC"}   # 보고서 파일명 분야 표기 (CAT_LABEL 의 '/'·괄호·공백 제외)
+
+
+def _write_report(mode, category, cat_dir, base_dir, all_results, hosts_info, criteria_items, label="", evidences=None):
+    """상세보고서 워크북 생성·저장 + 감사 로그 (label: 파일명 구분자, 예: Unix/Windows / evidences: {호스트: {항목: 증적 원문}})"""
     # 새 워크북 생성 (템플릿 불필요)
     wb = openpyxl.Workbook()
     print(f"[INFO] 보고서 생성 중...")
@@ -7923,17 +8015,20 @@ def _write_report(mode, category, cat_dir, base_dir, all_results, hosts_info, cr
     _create_vuln_list_sheet(wb, all_results, criteria_items)
     _create_review_sheet(wb, all_results, criteria_items)
     _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items)
+    _create_evidence_sheet(wb, all_results, criteria_items, evidences)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_str  = "전자금융" if mode == "EF" else "주요정보"
-    cat_str   = CAT_LABEL.get(category, category)
+    cat_str   = _FILE_LABEL.get(category) or CAT_LABEL.get(category, category)
     out_name  = f"상세보고서_{mode_str}_{cat_str}{'_' + label if label else ''}_{timestamp}.xlsx"
     out_path  = os.path.join(cat_dir, out_name)
     wb.save(out_path)
-    total_bad = sum(sum(1 for v in res.values() if v[0] == RESULT_BAD)
+    total_bad = sum(sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_BAD)
                     for res, _ in all_results.values())
+    host_sheets = {_host_sheet_name(h) for h in all_results}
+    fixed = [ws.title for ws in wb.worksheets if ws.sheet_state == "visible" and ws.title not in host_sheets]
     print(f"\n[완료] 상세보고서 저장: {out_path}")
-    print(f"  시트 구성: 표지 / 개요 / 개정이력 / 점검대상 / 보안수준 통계 / 요약 통계 / 호스트 상세 {len(all_results)}개")
+    print(f"  시트 구성: {' / '.join(fixed)} / 호스트 상세 {len(all_results)}개")
     print(f"  총 점검 대상: {len(all_results)}대 / 전체 취약: {total_bad}건")
 
     audit_targets = []
@@ -7943,8 +8038,10 @@ def _write_report(mode, category, cat_dir, base_dir, all_results, hosts_info, cr
         bad  = sum(1 for v in filtered.values() if v[0] == RESULT_BAD)
         na_c = sum(1 for v in filtered.values() if v[0] == RESULT_NA)
         mc   = sum(1 for v in filtered.values() if v[0] == RESULT_MANUAL)
+        hi = next((h for h in hosts_info if h["hostname"] == hostname), {})
         audit_targets.append({
             "name": hostname, "subtype": detected_sub,
+            **({"web_info": hi.get("web_info", "")} if category == "webwas" else {}),
             "good": good, "bad": bad, "na": na_c, "manual": mc,
             "input_file": f"{hostname}.txt",
         })
