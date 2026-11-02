@@ -115,6 +115,9 @@ _get_ips() {
     if [ -z "$ips" ]; then   # HP-UX: netstat -in 의 Address 열
         ips=$(netstat -in 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $4}')
     fi
+    if [ -z "$ips" ] && [ -r /proc/net/fib_trie ]; then   # ip·ifconfig·hostname 이 없는 최소 Linux: 커널 라우팅 트리의 로컬 주소
+        ips=$(awk '$1=="|--"{ip=$2} /\/32 host LOCAL/{print ip}' /proc/net/fib_trie 2>/dev/null)
+    fi
     echo "$ips" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -v '^127\.' | awk '!s[$0]++' | tr '\n' ',' | sed 's/,$//; s/,/, /g'
 }
 
@@ -400,6 +403,7 @@ get_perm() {
     *)       out=$(stat -c "%a" "$f" 2>/dev/null)
              [ -z "$out" ] && out=$(ls -lL "$f" 2>/dev/null | _ls_octal) ;;
     esac
+    case "$out" in [0-7]|[0-7][0-7]) out=$(printf '%03d' "$out") ;; esac   # stat 이 앞자리 0 을 생략(예: RHEL 계열 /etc/shadow 000 → "0")
     echo "$out"
 }
 get_owner() {
@@ -454,6 +458,7 @@ is_running() {
     fi
     command -v svcs >/dev/null 2>&1 && svcs -H -o state "$svc" 2>/dev/null | grep -qx online && return 0
     _ps_has "$svc" && return 0
+    [ "$svc" = sendmail ] && { _ps_has sm-mta || _ps_has sendmail-mta; } && return 0   # Debian/Ubuntu sendmail 의 MTA 프로세스 이름
     [ -n "$alt" ] && _ps_has "$alt" && return 0
     return 1
 }
@@ -542,10 +547,12 @@ _local_mounts() {
     [ -z "$m" ] && m="/"
     echo "$m"
 }
-_FIND_TO=0
-_find_scan() {   # _find_scan 출력파일 find표현식... : 로컬 FS 별 실행. 타임아웃(124)이면 _FIND_TO=1
+_FIND_TO=0; _FIND_NA=0
+_FIND_NA_MSG="find 명령이 없어 파일을 검색하지 못함 (findutils 설치 후 재점검)"
+_find_scan() {   # _find_scan 출력파일 find표현식... : 로컬 FS 별 실행. 타임아웃(124)이면 _FIND_TO=1, find 명령이 없으면 _FIND_NA=1
     local out="$1" m rc; shift
-    : > "$out"; _FIND_TO=0
+    : > "$out"; _FIND_TO=0; _FIND_NA=0
+    command -v find >/dev/null 2>&1 || { _FIND_NA=1; return 0; }
     for m in $(_local_mounts); do
         _to 60 find "$m" -xdev "$@" >> "$out" 2>/dev/null; rc=$?
         [ $rc -eq 124 ] && _FIND_TO=1
@@ -912,6 +919,17 @@ check_U12() {
             if [ -n "$line" ]; then v=$(_tmout_val "$(echo "$line" | sed 's/.*TMOUT=//')"); tm="$v"; tsrc="$f"; fi ;;
         esac
     done
+    # 일반 계정 홈 파일에서 TMOUT 을 해제(0)하거나 600초 초과로 재정의한 경우 (전역 설정을 무력화)
+    local uo="" uh uf uv
+    for uh in $(awk -F: '$7!~/(nologin|false|sync|shutdown|halt)$/ && $6!="" && $6!="/" && $6!="/root" {print $6}' /etc/passwd 2>/dev/null | sort -u); do
+        for uf in "$uh/.profile" "$uh/.bash_profile" "$uh/.bashrc" "$uh/.kshrc"; do
+            [ -f "$uf" ] && [ -r "$uf" ] || continue
+            line=$(grep -vE '^[[:space:]]*#' "$uf" 2>/dev/null | grep -E '(^|[[:space:];])TMOUT=' | tail -1)
+            [ -n "$line" ] || continue
+            uv=$(_tmout_val "$(echo "$line" | sed 's/.*TMOUT=//')")
+            if [ "$uv" = "?" ] || [ "$uv" = "0" ] || [ "$uv" -gt 600 ] 2>/dev/null; then uo="${uo} ${uf}(TMOUT=${uv})"; fi
+        done
+    done
     local ci cc sshp=""
     if _sshd_present; then
         ci=$(_sshd_get ClientAliveInterval); cc=$(_sshd_get ClientAliveCountMax)
@@ -934,6 +952,7 @@ check_U12() {
     *) if [ "$ci" -gt 0 ] 2>/dev/null && [ $((ci*cc)) -le 600 ] 2>/dev/null && [ "$cc" -gt 0 ] 2>/dev/null; then ok=1; info="${info}sshd ClientAliveInterval×CountMax=${ci}×${cc}=$((ci*cc))초 "
        else info="${info}sshd ClientAlive ${ci}×${cc} (유휴 종료 없음/600초 초과) "; fi ;;
     esac
+    [ -n "$uo" ] && badmsg="${badmsg:+${badmsg} / }계정 홈 파일에서 TMOUT 해제·600초 초과:${uo}"
     if [ -n "$badmsg" ]; then result "U-12|취약|${badmsg} (600초 이하 필요)"
     elif [ $ok -eq 1 ]; then result "U-12|양호|세션 종료 시간 600초 이하 설정: ${info}"
     elif [ "$tm" = "?" ]; then result "U-12|수동확인|TMOUT 설정이 산술식·변수 등 해석 불가(${tsrc}) - 증적 확인"
@@ -1019,6 +1038,7 @@ check_U15() {
     evd_f "U-15" "find $(_local_mounts) -xdev \\( -nouser -o -nogroup \\) ! -path '/proc/*' ! -path '/sys/*' (마운트별 60초 제한)" "$out"
     local cnt; cnt=$(wc -l < "$out" | tr -d ' ')
     if [ "${cnt:-0}" -gt 0 ] 2>/dev/null; then result "U-15|취약|소유자/그룹 없는 파일 ${cnt}개: $(_join < "$out")$([ $_FIND_TO -eq 1 ] && echo ' (일부 탐색이 시간 초과로 중단됨)')"
+    elif [ $_FIND_NA -eq 1 ]; then result "U-15|점검불가|${_FIND_NA_MSG}"
     elif [ $_FIND_TO -eq 1 ]; then result "U-15|점검불가|find 가 60초 제한으로 중단되어 전체 탐색을 완료하지 못함(발견 0건)"
     else result "U-15|양호|소유자/그룹 없는 파일 없음"; fi
 }
@@ -1026,16 +1046,17 @@ check_U15() {
 check_U16() { _check_file_perm "U-16" "/etc/passwd" 644 "root" "/etc/passwd"; }
 
 check_U17() {
-    local lst="$_TMPD/u17.lst" g f
+    local lst="$_TMPD/u17.lst" g f dng=""
     : > "$lst"
     for g in /etc/rc.d/init.d/* /etc/init.d/* /etc/rc.d/rc*.d/* /etc/rc[0-6S].d/* /etc/rc.local /etc/rc.d/rc.local /sbin/init.d/* /sbin/rc*.d/* /etc/rc.config.d/* /etc/systemd/system/* /etc/systemd/system/*/* /usr/lib/systemd/system/* /lib/systemd/system/*; do
         [ -e "$g" ] || [ -L "$g" ] || continue
         [ -d "$g" ] && [ ! -L "$g" ] && continue
         [ -L "$g" ] && [ "$(readlink -f "$g" 2>/dev/null)" = "/dev/null" ] && continue   # 비활성(mask) 처리된 유닛
+        [ -L "$g" ] && [ ! -e "$g" ] && { dng="${dng} ${g}"; continue; }   # 대상이 없는 깨진 링크는 실행되지 않으므로 소유자·권한 점검 제외(증적에 기록)
         echo "$g" >> "$lst"
     done
     sort -u "$lst" -o "$lst"
-    evd "U-17" "ls -ld /etc/rc.d /etc/init.d /etc/rc.d/init.d /etc/rc.local /sbin/init.d /sbin/rc2.d /etc/rc.config.d /etc/systemd/system /usr/lib/systemd/system 2>&1"
+    evd "U-17" "ls -ld /etc/rc.d /etc/init.d /etc/rc.d/init.d /etc/rc.local /sbin/init.d /sbin/rc2.d /etc/rc.config.d /etc/systemd/system /usr/lib/systemd/system 2>&1; echo '# 대상 없는 깨진 심볼릭 링크(점검 제외):${dng:- 없음}'"
     evd_ls "U-17" "시작 스크립트 경로(/etc/rc*.d, /etc/init.d, /etc/systemd/system 등) 없음" "$lst"
     _fp_reset
     while IFS= read -r f; do
@@ -1093,18 +1114,20 @@ check_U23() {
         case "$_SUID_STD" in *" $b "*) ;; *) nonstd="${nonstd} ${f}" ;; esac
     done < "$out"
     if [ -n "$danger" ]; then result "U-23|취약|위험 바이너리에 SUID/SGID 설정: $(echo $danger | tr ' ' '\n' | _join) (SUID/SGID 파일 전체 ${cnt}개, 증적 참조)"
+    elif [ $_FIND_NA -eq 1 ]; then result "U-23|점검불가|${_FIND_NA_MSG}"
     elif [ $_FIND_TO -eq 1 ] && [ "${cnt:-0}" -eq 0 ]; then result "U-23|점검불가|find 가 60초 제한으로 중단되어 전체 탐색을 완료하지 못함"
     elif [ -n "$nonstd" ]; then result "U-23|수동확인|SUID/SGID 파일 ${cnt}개 중 표준 목록에 없는 파일 $(echo $nonstd | wc -w | tr -d ' ')개: $(echo $nonstd | tr ' ' '\n' | _join) - 불필요 여부 확인$([ $_FIND_TO -eq 1 ] && echo ' (일부 탐색 시간 초과)')"
     else result "U-23|양호|SUID/SGID 파일 ${cnt}개 모두 표준 시스템 바이너리, 위험 바이너리 설정 없음"; fi
 }
 
 check_U24() {
-    local lst="$_TMPD/u24.lst" user home shell f n=0
+    local lst="$_TMPD/u24.lst" user home shell f n=0 unr=""
     : > "$lst"
     while IFS=: read -r user _ _ _ _ home shell; do
         case "$shell" in *nologin|*false) continue ;; esac
         [ -n "$home" ] && [ -d "$home" ] || continue
         n=$((n+1))
+        [ -x "$home" ] || { unr="${unr} ${home}"; continue; }   # 비root: 타 계정 홈 접근 불가 → 점검불가(파일이 없는 것으로 보지 않음)
         for f in .profile .kshrc .cshrc .bashrc .bash_profile .bash_login .login .exrc .netrc; do
             [ -f "$home/$f" ] && [ ! -L "$home/$f" ] && echo "$user $home/$f" >> "$lst"
         done
@@ -1117,6 +1140,8 @@ check_U24() {
         [ -n "$f" ] || continue
         _fp_add "$f" 7775 "root|$user"
     done < "$lst"
+    for f in $unr; do _NCHK=$((_NCHK+1)); _NUK=$((_NUK+1)); _UK="${_UK}${f} 홈 디렉터리 접근 권한 없음(실행 계정: ${_WHOAMI:-?}) - 환경파일 확인 불가 (root 로 재점검)
+"; done
     _fp_verdict "U-24" "홈 디렉터리 환경변수 파일 소유자(root/해당 계정)·other 쓰기 권한 없음"
 }
 
@@ -1128,30 +1153,35 @@ check_U25() {
     local cnt; cnt=$(wc -l < "$out" | tr -d ' ')
     # 가이드: 존재 시 '설정 이유 인지' 여부로 판단 → 스크립트로 판단 불가, 목록 확인
     if [ "${cnt:-0}" -gt 0 ] 2>/dev/null; then result "U-25|수동확인|world writable 파일 ${cnt}개: $(_join < "$out") - 설정 이유 확인, 불필요 시 취약(o-w 제거)$([ $_FIND_TO -eq 1 ] && echo ' (일부 탐색 시간 초과)')"
+    elif [ $_FIND_NA -eq 1 ]; then result "U-25|점검불가|${_FIND_NA_MSG}"
     elif [ $_FIND_TO -eq 1 ]; then result "U-25|점검불가|find 가 60초 제한으로 중단되어 전체 탐색을 완료하지 못함(발견 0건)"
     else result "U-25|양호|world writable 파일 없음"; fi
 }
 
 check_U26() {
     local out="$_TMPD/u26.lst"
-    : > "$out"; _FIND_TO=0
-    _to 60 find /dev -type f ! -path "/dev/shm/*" ! -path "/dev/mqueue/*" ! -path "/dev/pts/*" ! -path "/dev/hugepages/*" ! -path "/dev/.udev/*" ! -path "/dev/.lxd-mounts/*" ! -name MAKEDEV >> "$out" 2>/dev/null
+    : > "$out"; _FIND_TO=0; _FIND_NA=0
+    command -v find >/dev/null 2>&1 || _FIND_NA=1
+    [ $_FIND_NA -eq 1 ] || _to 60 find /dev -type f ! -path "/dev/shm/*" ! -path "/dev/mqueue/*" ! -path "/dev/pts/*" ! -path "/dev/hugepages/*" ! -path "/dev/.udev/*" ! -path "/dev/.lxd-mounts/*" ! -name MAKEDEV >> "$out" 2>/dev/null
     [ $? -eq 124 ] && _FIND_TO=1
     evd "U-26" "ls -ld /dev 2>&1"
     evd_f "U-26" "find /dev -type f (/dev/shm·mqueue·pts·hugepages·.udev 제외, 60초 제한)" "$out"
     local cnt; cnt=$(wc -l < "$out" | tr -d ' ')
     if [ "${cnt:-0}" -gt 0 ] 2>/dev/null; then result "U-26|취약|/dev 에 device 가 아닌 일반 파일 ${cnt}개: $(_join < "$out")"
+    elif [ $_FIND_NA -eq 1 ]; then result "U-26|점검불가|${_FIND_NA_MSG}"
     elif [ $_FIND_TO -eq 1 ]; then result "U-26|점검불가|find 가 60초 제한으로 중단됨"
     else result "U-26|양호|/dev 비정상 파일 없음"; fi
 }
 
 check_U27() {
-    local vuln="" files="" user home f unk=""
+    local vuln="" files="" user home f unk="" unh=""
     [ -f /etc/hosts.equiv ] && files="/etc/hosts.equiv:root"
     while IFS=: read -r user _ _ _ _ home _; do
         [ -n "$home" ] && [ -f "$home/.rhosts" ] && files="${files} ${home}/.rhosts:${user}"
+        [ -n "$home" ] && [ -d "$home" ] && [ ! -x "$home" ] && unh="${unh} ${home}"
     done < /etc/passwd
     evd "U-27" "ls -l /etc/hosts.equiv 2>&1; for h in \$(awk -F: '{print \$6}' /etc/passwd | sort -u); do [ -f \$h/.rhosts ] && ls -l \$h/.rhosts; done; awk -F: 'END{print \"홈 디렉터리 점검 계정 \"NR\"개\"}' /etc/passwd"
+    if [ -z "$files" ] && [ -n "$unh" ]; then result "U-27|점검불가|홈 디렉터리 접근 권한이 없어 .rhosts 존재 여부를 확인하지 못함:${unh} (실행 계정: ${_WHOAMI:-?}, root 로 재점검)"; return; fi
     if [ -z "$files" ]; then result "U-27|양호|/etc/hosts.equiv·\$HOME/.rhosts 파일 없음"; return; fi
     local e
     for e in $files; do
@@ -1165,15 +1195,17 @@ check_U27() {
     done
     if [ -n "$vuln" ]; then result "U-27|취약|${vuln# }"
     elif [ -n "$unk" ]; then result "U-27|점검불가|${unk# }"
+    elif [ -n "$unh" ]; then result "U-27|점검불가|확인된 파일은 기준 충족이나 홈 디렉터리 접근 권한이 없어 .rhosts 존재 여부를 확인하지 못함:${unh} (root 로 재점검)"
     else result "U-27|양호|hosts.equiv/.rhosts 소유자·권한(600 이하) 적절, '+' 설정 없음"; fi
 }
 
 check_U28() {
-    local rules=0 detail="" unk="" n wa wd
+    local rules=0 detail="" unk="" n wa wd twr=0 fwtools=0 c
+    for c in iptables nft firewall-cmd ufw ipfstat lsfilt; do command -v "$c" >/dev/null 2>&1 && fwtools=$((fwtools+1)); done
     evd "U-28" "for c in iptables nft firewall-cmd ufw ipfstat lsfilt; do command -v \$c >/dev/null 2>&1 && echo \"\$c: \$(command -v \$c)\" || echo \"\$c: 없음\"; done; echo \"클라우드: ${CLOUD_LINE}\""
     evd_cfg "U-28" /etc/hosts.allow /etc/hosts.deny
     wa=$(_nc /etc/hosts.allow | wc -l | tr -d ' '); wd=$(_nc /etc/hosts.deny | wc -l | tr -d ' ')
-    if [ "${wa:-0}" -gt 0 ] || [ "${wd:-0}" -gt 0 ]; then rules=$((rules+wa+wd)); detail="${detail} TCP Wrapper(hosts.allow ${wa}줄/hosts.deny ${wd}줄);"; fi
+    if [ "${wa:-0}" -gt 0 ] || [ "${wd:-0}" -gt 0 ]; then twr=$((wa+wd)); rules=$((rules+wa+wd)); detail="${detail} TCP Wrapper(hosts.allow ${wa}줄/hosts.deny ${wd}줄);"; fi
     local denied='ermission denied|must be root|not permitted|are you root|Operation not|Unable to|cannot|can.t'
     if command -v iptables >/dev/null 2>&1; then
         evd "U-28" "iptables -S 2>&1"
@@ -1214,12 +1246,17 @@ check_U28() {
     Azure) cloud="클라우드 Azure NSG: 포털에서 확인" ;;
     GCP) cloud="클라우드 GCP 네트워크 태그: ${CLOUD_SG:-없음}(방화벽 규칙 콘솔 확인)" ;;
     esac
-    if [ "$rules" -gt 0 ]; then
+    if [ "$rules" -gt 0 ] && [ "$rules" -le "$twr" ] && { [ -n "$unk" ] || [ "$fwtools" -eq 0 ]; }; then
+        # TCP Wrapper 규칙만 확인됨: 방화벽 조회가 실패했거나 조회 도구가 없으면 실제 접근통제 여부를 확정할 수 없음 (sshd 등은 libwrap 미지원일 수 있음)
+        result "U-28|수동확인|TCP Wrapper 규칙만 확인됨(hosts.allow ${wa}줄/hosts.deny ${wd}줄) - $([ -n "$unk" ] && echo "방화벽 규칙 조회 실패:${unk}" || echo "방화벽 조회 도구(iptables·nft·firewall-cmd·ufw 등) 없음"), 방화벽 규칙(root 권한) 확인 필요"
+    elif [ "$rules" -gt 0 ]; then
         result "U-28|양호|접속 IP/포트 제한 규칙 설정됨:${detail}${cloud:+ / ${cloud} 병행 확인}"
     elif [ -n "$cloud" ]; then
         result "U-28|수동확인|호스트 방화벽·TCP Wrapper 규칙 없음${unk:+ (${unk})} - ${cloud} 의 인바운드 규칙(허용 IP·포트)을 콘솔에서 확인"
     elif [ -n "$unk" ]; then
         result "U-28|점검불가|방화벽 규칙 조회 실패:${unk} (실행 계정: ${_WHOAMI:-?})"
+    elif [ "$fwtools" -eq 0 ]; then
+        result "U-28|수동확인|방화벽 조회 도구(iptables·nft·firewall-cmd·ufw·ipfstat·lsfilt)가 모두 없어 규칙을 확인하지 못함 - 호스트 방화벽 유무·상위 방화벽 수동 확인"
     else
         case "$CLOUD_LINE" in
         미확인*) result "U-28|수동확인|호스트 방화벽·TCP Wrapper 규칙 없음 - 클라우드 여부 미확인(${CLOUD_LINE}), 클라우드라면 보안그룹 확인" ;;
@@ -1291,6 +1328,7 @@ check_U33() {
     evd "U-33" "df -lP 2>&1"
     evd_f "U-33" "find $(_local_mounts) -xdev \\( -type f -o -type d \\) -name '.*' (/proc·/sys·/dev·/run 제외, 홈 디렉터리 표준 설정 파일 제외, 마운트별 60초 제한)" "$out"
     local cnt; cnt=$(wc -l < "$out" | tr -d ' ')
+    [ $_FIND_NA -eq 1 ] && { result "U-33|점검불가|${_FIND_NA_MSG}"; return; }
     result "U-33|수동확인|숨겨진 파일/디렉토리 ${cnt}개 (증적 목록에서 의심 파일 확인)$([ $_FIND_TO -eq 1 ] && echo ' - 일부 탐색 시간 초과')"
 }
 
@@ -1544,7 +1582,7 @@ _u47_exim() {
     for f in /etc/exim/exim.conf /etc/exim4/exim4.conf /etc/exim4/exim4.conf.template /var/lib/exim4/config.autogenerated /usr/local/etc/exim/configure /etc/exim/exim4.conf /etc/exim.conf /etc/exim4/update-exim4.conf.conf; do [ -f "$f" ] && cf="${cf} $f"; done
     [ -z "$cf" ] && { _K="${_K} exim 설정 파일을 찾지 못함;"; return; }
     li=$(_nc $cf | grep -E '^[[:space:]]*(local_interfaces|dc_local_interfaces)' | tail -1 | sed "s/.*=[[:space:]]*//; s/'//g")
-    rf=$(_nc $cf | grep -E 'relay_from_hosts|dc_relay_nets' | grep -E "(=|[[:space:]])[[:space:]]*'?(\*|0\.0\.0\.0/0)" | head -1)
+    rf=$(_nc $cf | grep -iE 'relay_from_hosts|dc_relay_nets|MAIN_RELAY_NETS' | grep -E "(^|[=[:space:]:'\"])(\*|0\.0\.0\.0/0)([[:space:]:'\";]|$)" | head -1)
     if [ -n "$rf" ]; then _B="${_B} exim 릴레이 허용 호스트에 전체(*) 포함: ${rf};"; return; fi
     if [ -n "$li" ] && ! echo "$li" | tr ';:,' '   ' | tr ' ' '\n' | grep -v '^$' | grep -qvE '^(127\.0\.0\.1|::1)$'; then _G="${_G} exim 루프백 전용(${li});"; return; fi
     if _nc $cf | grep -qi 'relay not permitted'; then _G="${_G} exim ACL 에 relay not permitted 적용;"
@@ -1567,7 +1605,7 @@ check_U47() {
         evd "U-47" "ls -l ${cf:-/etc/mail/sendmail.cf} ${mc} 2>&1; grep -nE 'Relaying|DaemonPortOptions|PrivacyOptions' ${cf:-/etc/mail/sendmail.cf} /dev/null 2>&1; grep -nE 'promiscuous_relay|relay' ${mc:-/dev/null} /dev/null 2>&1; grep -vE '^[[:space:]]*(#|\$)' /etc/mail/access /dev/null 2>&1"
         _u47_sendmail ;; esac
     case " $mta " in *" exim "*)
-        evd "U-47" "grep -nE 'relay_from_hosts|dc_relay_nets|dc_relay_domains|local_interfaces|dc_local_interfaces|relay not permitted' /etc/exim/exim.conf /etc/exim4/exim4.conf /etc/exim4/exim4.conf.template /var/lib/exim4/config.autogenerated /etc/exim4/update-exim4.conf.conf /usr/local/etc/exim/configure /dev/null 2>&1; exim -bP relay_from_hosts local_interfaces 2>&1"
+        evd "U-47" "grep -nE 'relay_from_hosts|dc_relay_nets|MAIN_RELAY_NETS|dc_relay_domains|local_interfaces|dc_local_interfaces|relay not permitted' /etc/exim/exim.conf /etc/exim4/exim4.conf /etc/exim4/exim4.conf.template /var/lib/exim4/config.autogenerated /etc/exim4/update-exim4.conf.conf /usr/local/etc/exim/configure /dev/null 2>&1; exim -bP relay_from_hosts local_interfaces 2>&1"
         _u47_exim ;; esac
     if [ -n "$_B" ]; then result "U-47|취약|스팸 메일 릴레이 제한 미흡:${_B}${_G:+ / 양호: ${_G}}"
     elif [ -n "$_M" ]; then result "U-47|수동확인|릴레이 제한을 자동 판정하지 못함:${_M}${_G:+ / 양호: ${_G}} (원자료는 증적 참조)"
@@ -1820,6 +1858,12 @@ _snmp_confs() { _exist /etc/snmp/snmpd.conf /etc/snmpd.conf /etc/net-snmp/snmp/s
 _snmp_on() { local s o=""; for s in snmpd snmpdm snmpdv3ne snmpdv3; do is_running "$s" && o="${o} ${s}"; done; [ -n "$(_listen 161)" ] && o="${o} 161/udp"; echo "${o# }"; }
 _snmp_ev() { _svc_status 'snmpd|snmpdm|snmpdv3ne|snmpdv3' snmpd snmpdm snmpdv3ne; echo "리슨 161: $(_listen 161)"; }
 
+_snmp_wr() {   # 표준입력 snmpd 설정에서 v1/v2c 로 쓰기(SET)가 가능한 설정 요약 (community 값은 출력하지 않음)
+    awk '{ l=tolower($1) }
+        l ~ /^rwcommunity6?$/ { print $1 }
+        l ~ /^(set-community-name:?|write-community)$/ { print $1 }
+        l=="access" && tolower($4)!="usm" && $8!="" && tolower($8)!="none" { print "access " $2 " (" $4 ", write view=" $8 ")" }' | sort -u | tr '\n' ',' | sed 's/,$//'
+}
 check_U58() {
     evd "U-58" "_snmp_ev"
     local on; on=$(_snmp_on)
@@ -1884,6 +1928,7 @@ check_U61() {
     local lo=0
     grep -vE '^[[:space:]]*#' $cf 2>/dev/null | grep -qiE '^[[:space:]]*agentaddress' && ! grep -vE '^[[:space:]]*#' $cf 2>/dev/null | grep -iE '^[[:space:]]*agentaddress' | grep -qvE '(127\.0\.0\.1|\[?::1\]?|localhost)' && lo=1
     if [ $open -gt 0 ]; then result "U-61|취약|SNMP community 에 허용 네트워크(source) 제한 없음(default/0.0.0.0/0) ${open}개 설정 파일"
+    elif [ $restr -gt 0 ] && [ -n "$(_nc $cf | _snmp_wr)" ]; then result "U-61|수동확인|허용 네트워크는 제한되어 있으나 v1/v2c 쓰기(SET) 권한이 설정됨: $(_nc $cf | _snmp_wr) - 쓰기 필요성 확인, 불필요 시 제거·v3 전환"
     elif [ $restr -gt 0 ]; then result "U-61|양호|SNMP community 접근 허용 네트워크가 제한됨"
     elif [ $lo -eq 1 ]; then result "U-61|양호|agentAddress 가 루프백으로만 바인딩됨"
     elif grep -vE '^[[:space:]]*#' $cf 2>/dev/null | grep -qiE '^[[:space:]]*(rouser|rwuser|createUser|USM_USER)'; then result "U-61|수동확인|v1/v2c community 없음(SNMPv3 사용자만) - v3 접근 제어(view·허용 IP) 수동 확인"
