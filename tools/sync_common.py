@@ -25,6 +25,11 @@ def block(text, name, path):
 
 
 def main():
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__); return
+    unknown = [a for a in sys.argv[1:] if a != "--check"]
+    if unknown:
+        sys.exit(f"[오류] 알 수 없는 인자: {' '.join(unknown)}\n{__doc__}")
     check = "--check" in sys.argv
     stale = []
     for src, dst, names in PAIRS:

@@ -162,15 +162,19 @@ elif command -v wsadmin >/dev/null 2>&1; then _list_add WEB_LIST webtob; DETECT_
 elif printf '%s\n' "$_PSALL" | grep -qE '^([^[:space:]]*/)?(wsm|htl|hth)([[:space:]]|$)'; then _list_add WEB_LIST webtob; DETECT_WT="실행 프로세스(wsm/htl)"; fi
 
 # Tomcat: 실행 중 프로세스의 catalina.base/home → 환경변수 → conf/server.xml 이 있는 디렉터리를 3단계 깊이까지 모두 수집
-_tc_add() {
+_tc_add() {   # _tc_add 디렉터리 [force] : force(실행 중 프로세스의 catalina.base, 비root 의 알려진 패키지 경로)는 conf 를 읽거나 열람할 수 없어도 등록 → 항목에서 '점검불가(권한 없음)' 로 표시
     local d="${1%/}"; [ -n "$d" ] || return 0
-    [ -f "$d/conf/server.xml" ] || return 0
-    grep -q '<Server' "$d/conf/server.xml" 2>/dev/null || return 0
+    if [ -f "$d/conf/server.xml" ]; then
+        if [ -r "$d/conf/server.xml" ]; then grep -q '<Server' "$d/conf/server.xml" 2>/dev/null || return 0; fi
+    elif [ -n "$2" ] && [ -d "$d" ] && { [ -d "$d/conf" ] || [ -L "$d/conf" ] || [ "$2" = proc ]; }; then :
+    else return 0; fi
     _list_add TOMCAT_HOMES "$(_canon_dir "$d")"
 }
-for _d in $(printf '%s\n' "$_PSALL" | grep -oE -- '-Dcatalina\.base=[^[:space:]]+' | cut -d= -f2) $(printf '%s\n' "$_PSALL" | grep -oE -- '-Dcatalina\.home=[^[:space:]]+' | cut -d= -f2) \
+for _d in $(printf '%s\n' "$_PSALL" | grep -oE -- '-Dcatalina\.base=[^[:space:]]+' | cut -d= -f2); do _tc_add "$_d" proc; done
+for _d in $(printf '%s\n' "$_PSALL" | grep -oE -- '-Dcatalina\.home=[^[:space:]]+' | cut -d= -f2) \
           "$CATALINA_BASE" "$CATALINA_HOME" $CATALINA_BASES; do _tc_add "$_d"; done
-for _d in /var/lib/tomcat* /usr/share/tomcat* /opt/tomcat* /opt/apache-tomcat* /usr/local/tomcat* /usr/local/apache-tomcat* /srv/tomcat*; do _tc_add "$_d"; done
+_tcf=""; [ "$(id -u 2>/dev/null)" != "0" ] && _tcf=known
+for _d in /var/lib/tomcat* /usr/share/tomcat* /opt/tomcat* /opt/apache-tomcat* /usr/local/tomcat* /usr/local/apache-tomcat* /srv/tomcat*; do _tc_add "$_d" "$_tcf"; done
 for _r in /opt /usr/local /srv /app /apps /data /sw /engn /was /svc /webapps /home; do
     [ -d "$_r" ] || continue
     for _d in "$_r"/* "$_r"/*/* "$_r"/*/*/*; do [ -f "$_d/conf/server.xml" ] && _tc_add "$_d"; done
@@ -201,6 +205,7 @@ _ip_list() {   # 루프백을 제외한 IPv4 전부 (Linux ip / UNIX ifconfig -a
     [ -z "$l" ] && l=$( { ifconfig -a 2>/dev/null || /usr/sbin/ifconfig -a 2>/dev/null; } | awk '{for(i=1;i<NF;i++) if($i=="inet"){v=$(i+1); sub(/^addr:/,"",v); print v}}')
     [ -z "$l" ] && l=$(netstat -in 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $4}')
     [ -z "$l" ] && l=$(hostname -I 2>/dev/null | tr ' ' '\n')
+    [ -z "$l" ] && [ -r /proc/net/fib_trie ] && l=$(awk '$1=="|--"{ip=$2} /\/32 host LOCAL/{print ip}' /proc/net/fib_trie 2>/dev/null)   # ip·ifconfig·hostname 이 없는 최소 Linux
     l=$(echo "$l" | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $1 !~ /^127\./ && $1 != "0.0.0.0" && !s[$1]++ {printf "%s%s", (n++?", ":""), $1}')
     echo "${l:-미확인}"
 }
@@ -4681,15 +4686,29 @@ _cfg_scope() {   # 증적: 검색에 사용한 설정 파일 목록 (판정 범�
     [ -n "$_APX" ] && { echo "[Apache] 주설정 ${APACHE_CONF} / Include 전개 파일 $(_ap_files | grep -c .)개:"; _ap_files | sed 's/^/  /'; }
     [ -n "$_NGX" ] && { echo "[Nginx] 주설정 ${NGINX_CONF} / include 전개 파일 $(_ng_files | grep -c .)개:"; _ng_files | sed 's/^/  /'; }
     [ -n "$_WT_M" ] && echo "[WebtoB] 설정 ${_WT_M}"
+    [ -n "$_AP_UN" ] && echo "[Apache] 설정을 읽지 못해 점검불가: ${_AP_UN}"
+    [ -n "$_NG_UN" ] && echo "[Nginx] 설정을 읽지 못해 점검불가: ${_NG_UN}"
+    [ -n "$_WT_UN" ] && echo "[WebtoB] 설정을 읽지 못해 점검불가: ${_WT_UN}"
+    [ -n "$_JE_UN" ] && echo "[JEUS] 설정을 읽지 못해 점검불가: ${_JE_UN}"
     return 0
 }
 _wtm() { [ -f "$_WT_M" ] && [ -r "$_WT_M" ] && grep -v '^[[:space:]]*#' "$_WT_M" 2>/dev/null | grep -iE -- "$(_pat "$1")"; }       # WebtoB http.m 활성 줄
 _wtmf() { [ -f "$_WT_M" ] && [ -r "$_WT_M" ] && grep -nv '^[[:space:]]*#' "$_WT_M" 2>/dev/null | grep -iE -- "$(_pat "$1")" | sed "s|^|${_WT_M}:|"; }
 
 # 문서 루트 / CGI 경로 / 버전 / 로그 경로
+_ap_default_root() {   # ServerRoot 지시자가 없을 때 상대 Include 의 기준: 설정 파일이 conf/ 아래면 그 상위, 아니면 컴파일 기본값(HTTPD_ROOT, Debian/Ubuntu 는 /etc/apache2), 그것도 없으면 설정 파일 디렉터리
+    local r b; r=$(dirname "$APACHE_CONF")
+    case "$(basename "$r")" in conf|config) dirname "$r"; return ;; esac
+    for b in "$_AP_BIN" apache2ctl httpd apache2 apachectl; do
+        [ -n "$b" ] && command -v "$b" >/dev/null 2>&1 || continue
+        b=$("$b" -V 2>/dev/null </dev/null | sed -n 's/.*HTTPD_ROOT="\(.*\)".*/\1/p' | sed -n 1p)
+        [ -n "$b" ] && [ -d "$b" ] && { echo "$b"; return; }
+    done
+    echo "$r"
+}
 _apache_root() {
     local r; r=$(printf '%s\n' "$_APX" | awk -F'\t' 'tolower($3) ~ /^serverroot[ \t]/ { print $3; exit }' | awk '{print $2}' | tr -d '"')
-    [ -n "$r" ] && echo "$r" || { [ -n "$APACHE_CONF" ] && dirname "$(dirname "$APACHE_CONF")"; }
+    [ -n "$r" ] && echo "$r" || { [ -n "$APACHE_CONF" ] && _ap_default_root; }
 }
 _web_docroots() {
     {
@@ -4710,8 +4729,11 @@ _apache_ver() {
     { httpd -v 2>/dev/null || apache2 -v 2>/dev/null || apachectl -v 2>/dev/null || "$_AP_BIN" -v 2>/dev/null; } | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sed -n 1p
 }
 _nginx_ver() { { nginx -v 2>&1 || "$_NG_BIN" -v 2>&1; } | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sed -n 1p; }
-_tc_home() {   # catalina.base → catalina.home (프로세스 인자에서, 없으면 base 자체)
+_tc_home() {   # catalina.base → catalina.home (프로세스 인자에서, 없으면 base 자체. 중지된 패키지형 인스턴스(/var/lib/tomcatN)는 /usr/share/tomcatN 를 home 으로)
     local h; h=$(printf '%s\n' "$_PSALL" | grep -F -- "-Dcatalina.base=$1" | grep -oE '\-Dcatalina\.home=[^ ]+' | sed -n 1p | cut -d= -f2)
+    if [ -z "$h" ] && [ ! -e "$1/lib/catalina.jar" ] && [ ! -e "$1/bin/catalina.sh" ]; then
+        case "$(basename "$1")" in tomcat*) [ -e "/usr/share/$(basename "$1")/bin/catalina.sh" ] && h="/usr/share/$(basename "$1")" ;; esac
+    fi
     [ -n "$h" ] && echo "$h" || echo "$1"
 }
 _tomcat_ver() {   # _tomcat_ver [base] : 버전 문자열 (RELEASE-NOTES → ServerInfo.properties → version.sh)
@@ -4735,7 +4757,12 @@ _tc_each() {   # _tc_each 함수 : Tomcat 인스턴스마다 함수 실행(TOMCA
     local fn="$1" h out acc="" many=0 _keep="$TOMCAT_HOME"
     many=1   # 단일 인스턴스도 근거에 대상 경로를 표시
     for h in $TOMCAT_HOMES; do
-        TOMCAT_HOME="$h"; _HP_FILTER="$h"; out=$($fn </dev/null)
+        TOMCAT_HOME="$h"; _HP_FILTER="$h"
+        out=""
+        case "$fn" in _v_webproc_tomcat|_v_eos_tomcat) ;; *)   # conf 디렉터리를 열람할 수 없으면(비root) 설정 파일 유무를 알 수 없으므로 '없음/양호' 가 아니라 점검불가
+            if [ -d "$h/conf" ] && [ ! -x "$h/conf" ]; then out="점검불가|Tomcat conf 디렉터리 접근 권한 없음: $h/conf (실행 계정 $(_me))"; fi ;;
+        esac
+        [ -n "$out" ] || out=$($fn </dev/null)
         [ -n "$out" ] || continue
         [ "$many" = 1 ] && out=$(_worse_lab "$out" "Tomcat $h")
         acc=$(_worse "$acc" "$out")
@@ -4824,7 +4851,7 @@ _setup_conf() {
         elif [ ! -e "$APACHE_CONF" ]; then _AP_UN="Apache 설정 파일 없음: ${APACHE_CONF} - 설정 경로(APACHE_CONF) 확인 필요"
         elif [ ! -r "$APACHE_CONF" ]; then _AP_UN="Apache 설정 파일 읽기 권한 없음: ${APACHE_CONF} (실행 계정 $(_me))"
         else
-            _APX=$(_expand_conf apache "$APACHE_CONF" "$(dirname "$(dirname "$APACHE_CONF")")")
+            _APX=$(_expand_conf apache "$APACHE_CONF" "$(_ap_default_root)")
             [ -n "$_APX" ] || _AP_UN="Apache 설정 파일을 읽지 못함: ${APACHE_CONF}"
             # ServerRoot 지정이 있으면 상대 Include 를 다시 전개
             local sr; sr=$(printf '%s\n' "$_APX" | awk -F'\t' 'tolower($3) ~ /^serverroot[ \t]/ { print $3; exit }' | awk '{print $2}' | tr -d '"')
@@ -5054,7 +5081,8 @@ _combine() {
         apache) [ -n "$_AP_UN" ] && x="점검불가|$_AP_UN" ;;
         nginx)  [ -n "$_NG_UN" ] && x="점검불가|$_NG_UN" ;;
         webtob) [ -n "$_WT_UN" ] && x="점검불가|$_WT_UN" ;;
-        tomcat) x=$(_tc_each "_v_${chk}_tomcat"); r=$(_worse "$r" "$x"); continue ;;
+        tomcat) if [ -z "$TOMCAT_HOMES" ]; then x="점검불가|Tomcat 프로세스는 실행 중이나 인스턴스(catalina.base)의 conf/server.xml 을 찾지 못함 (실행 계정 $(_me))"; r=$(_worse "$r" "$(_worse_lab "$x" Tomcat)")
+                else x=$(_tc_each "_v_${chk}_tomcat"); r=$(_worse "$r" "$x"); fi; continue ;;
         jeus)   if [ -n "$_JE_UN" ]; then x="점검불가|$_JE_UN"; else x=$(_je_each "_v_${chk}_jeus"); r=$(_worse "$r" "$x"); continue; fi ;;
         esac
         [ -n "$x" ] || x=$("_v_${chk}_$p" </dev/null)
@@ -5211,12 +5239,19 @@ _v_unneeded_jeus() {
 }
 _ev_unneeded() {
     local d
-    _hasw apache && _show "Apache: ServerRoot / DocumentRoot" sh -c "echo ServerRoot=$(_apache_root); echo DocumentRoot=$(_web_docroots_of apache | tr '\n' ' ')"
-    _hasw apache && _show "Apache: 매뉴얼 후보 경로 존재 여부" sh -c "for d in $(_apache_root)/manual $(_apache_root)/htdocs/manual /var/www/manual /usr/share/httpd/manual /usr/share/doc/apache2-doc/manual /usr/local/apache2/manual; do if [ -d \"\$d\" ]; then echo \"존재: \$d\"; else echo \"없음: \$d\"; fi; done"
+    if _hasw apache; then
+        if [ -n "$(_apache_root)" ]; then
+            _show "Apache: ServerRoot / DocumentRoot" sh -c "echo ServerRoot=$(_apache_root); echo DocumentRoot=$(_web_docroots_of apache | tr '\n' ' ')"
+            _show "Apache: 매뉴얼 후보 경로 존재 여부" sh -c "for d in $(_apache_root)/manual $(_apache_root)/htdocs/manual /var/www/manual /usr/share/httpd/manual /usr/share/doc/apache2-doc/manual /usr/local/apache2/manual; do if [ -d \"\$d\" ]; then echo \"존재: \$d\"; else echo \"없음: \$d\"; fi; done"
+        else echo "Apache ServerRoot 를 확인하지 못해 매뉴얼 경로를 점검하지 못함 (${_AP_UN:-설정 파일 미발견})"; fi
+    fi
     _hasw nginx && _show "Nginx: 문서 루트의 index.html 기본 문구" sh -c "for d in $(_web_docroots_of nginx | tr '\n' ' ') /usr/share/nginx/html; do if [ -f \"\$d/index.html\" ]; then echo \"== \$d/index.html\"; grep -i 'Welcome to nginx' \"\$d/index.html\"; else echo \"없음: \$d/index.html\"; fi; done"
     _hasw tomcat && _tc_ev 'ls -l "$TOMCAT_HOME/webapps"'
     _hasw jeus && _je_ev 'for d in docs/manuals samples; do if [ -d "$JEUS_HOME/$d" ]; then echo "존재: $JEUS_HOME/$d"; else echo "없음: $JEUS_HOME/$d"; fi; done'
-    _hasw webtob && _show "WebtoB: 매뉴얼·샘플" sh -c "for d in docs/manuals samples; do if [ -d \"$_WT_HOME/\$d\" ]; then echo \"존재: $_WT_HOME/\$d\"; else echo \"없음: $_WT_HOME/\$d\"; fi; done"
+    if _hasw webtob; then
+        if [ -n "$_WT_HOME" ]; then _show "WebtoB: 매뉴얼·샘플" sh -c "for d in docs/manuals samples; do if [ -d \"$_WT_HOME/\$d\" ]; then echo \"존재: $_WT_HOME/\$d\"; else echo \"없음: $_WT_HOME/\$d\"; fi; done"
+        else echo "WebtoB 설치 경로를 확인하지 못해 매뉴얼·샘플 경로를 점검하지 못함 (${_WT_UN:-http.m 미발견})"; fi
+    fi
 }
 
 # ── 파일 업로드·다운로드 용량 제한 (WST-035 / WEB-08) ─────────────
@@ -5326,19 +5361,19 @@ _v_proxy_tomcat() {
     local u; u=$(_tc_need server.xml) || { echo "$u"; return; }
     _tcx server.xml | grep -qE 'proxyName=|proxyPort=' && echo "수동확인|Connector proxyName/proxyPort 설정 - 업무상 필요 여부 확인" || echo "양호|Connector 프록시 설정 없음"
 }
-_v_proxy_jeus() { ls -d "$JEUS_HOME"/*/ReverseProxy "$JEUS_HOME"/ReverseProxy >/dev/null 2>&1 && echo "수동확인|ReverseProxy 애플리케이션 존재 - 필요 여부 확인" || echo "양호|ReverseProxy 없음"; }
+_v_proxy_jeus() { local d f=""; for d in "$JEUS_HOME"/*/ReverseProxy "$JEUS_HOME"/ReverseProxy; do [ -e "$d" ] && f="${f} ${d}"; done; [ -n "$f" ] && echo "수동확인|ReverseProxy 애플리케이션 존재:${f} - 필요 여부 확인" || echo "양호|ReverseProxy 없음"; }
 _ev_proxy() {
     _cfg_scope
     _hasw apache && _show "Apache: 프록시 모듈/지시자" _activef '(LoadModule[[:space:]]+proxy|ProxyRequests|ProxyPass)'
     _hasw nginx && _show "Nginx: proxy_pass" _ngxf '^proxy_pass'
     _hasw webtob && _show "WebtoB: REVERSE_PROXY" _wtmf 'REVERSE_PROXY'
     _hasw tomcat && _tc_ev 'echo "-- proxyName/proxyPort"; _tcx server.xml | grep -noE "proxy(Name|Port)=\"[^\"]*\""; ls -l "$(_tc_f server.xml)"'
-    _hasw jeus && _je_ev 'ls -d "$JEUS_HOME"/*/ReverseProxy "$JEUS_HOME"/ReverseProxy'
+    _hasw jeus && _je_ev 'for d in "$JEUS_HOME"/*/ReverseProxy "$JEUS_HOME"/ReverseProxy; do if [ -e "$d" ]; then echo "존재: $d"; else echo "없음: $d"; fi; done'
 }
 
 # ── 웹 서비스 경로 설정 (WST-037 / WEB-11) ───────────────────────
 _SYSDIRS=''
-_v_docroot_all() {   # 제품 구분 없이 문서 루트 전체를 한 번 판정 (docroot 는 제품이 공유)
+_v_docroot_all_core() {   # 제품 구분 없이 문서 루트 전체를 한 번 판정 (docroot 는 제품이 공유)
     local roots d bad="" def=""
     roots="$( { _web_docroots; for h in $TOMCAT_HOMES; do TOMCAT_HOME=$h _tcx server.xml | grep -oE 'docBase="[^"]*"' | cut -d'"' -f2; done; } | sort -u | tr '\n' ' ')"
     if [ -z "${roots// /}" ]; then echo "점검불가|웹 서비스 경로(DocumentRoot/root/docBase/DOCROOT)를 설정에서 찾지 못함"; return; fi
@@ -5368,7 +5403,7 @@ _findd() {   # _findd 깊이 디렉터리 find식… : -maxdepth 대신 prune �
     find "$d" -path "$pr/*" -prune -o "$@" -print 2>/dev/null
 }
 _v_links_apache() {
-    local ol; ol=$(_active 'Options[[:space:]]')
+    local ol; ol=$(_ap_scoped | awk -F'\t' 'tolower($5) ~ /^options[ \t]/ && $2 !~ /icons|noindex|\/error|manual/ { print $5 }')   # 배포판 기본 아이콘·오류 샘플 디렉터리의 Options 는 제외 (WEB-04 와 동일)
     if [ -z "$ol" ]; then echo "취약|Options 미설정 (2.4 기본값 FollowSymLinks - 링크 허용)"
     elif echo "$ol" | grep -iE '(^|[[:space:]+])FollowSymLinks' | grep -qvi -- '-FollowSymLinks'; then echo "취약|FollowSymLinks 허용: $(echo "$ol" | grep -i FollowSymLinks | grep -vi -- -FollowSymLinks | sed -n 1p | tr -s ' ')"
     elif echo "$ol" | grep -qi 'SymLinksIfOwnerMatch'; then echo "수동확인|SymLinksIfOwnerMatch (소유자 일치 시 링크 허용) - 링크 사용 필요성 확인"
@@ -5387,11 +5422,12 @@ _v_links_jeus() {
     local f hit=""; for f in $(_JX jeus-web-dd.xml 50); do [ -r "$f" ] && _xml_nc < "$f" | grep -q '<aliasing>' && hit="${hit} ${f}"; done
     [ -n "$hit" ] && echo "취약|jeus-web-dd.xml aliasing 설정 존재:${hit}" || echo "양호|aliasing 미사용"
 }
+_wt_alias_ev() { if [ -r "$_WT_M" ]; then grep -nA5 '^\*ALIAS' "$_WT_M"; else echo "WebtoB http.m 을 읽을 수 없음: ${_WT_M:-(미발견)}"; fi; }
 _ev_links() {
     _cfg_scope
     _hasw apache && _show "Apache: Options" _activef 'Options[[:space:]]'
     _hasw nginx && _show "Nginx: disable_symlinks" _ngxf '^disable_symlinks'
-    _hasw webtob && _show "WebtoB: *ALIAS" sh -c "grep -nA5 '^\\*ALIAS' '$_WT_M'"
+    _hasw webtob && _show "WebtoB: *ALIAS" _wt_alias_ev
     _hasw tomcat && _tc_ev 'echo "-- allowLinking"; { _tcx server.xml; _tcx context.xml; } | grep -nE "allowLinking"'
     _hasw jeus && _je_ev 'for f in $(_JX jeus-web-dd.xml 50); do echo "-- $f"; grep -n "aliasing" "$f"; done'
 }
@@ -5414,6 +5450,11 @@ _ev_wst038() {
 }
 
 # ── 웹 서비스 정보 노출 (WST-102 / WEB-16) ───────────────────────
+_hp_err_ver() {   # 포트의 오류 응답(4xx/5xx) 본문에서 제품 버전 표시 부분 (없으면 빈 값)
+    case "$(_hp_status "$1" err)" in 4*|5*) ;; *) return 0 ;; esac
+    [ -s "$_HPD/p$1.err.body" ] || return 0
+    grep -ioE 'Apache Tomcat/[0-9][0-9.]*[^<]*|Apache/[0-9][0-9.]* \([^)]*\)|nginx/[0-9][0-9.]*|Jetty\([0-9][^)]*\)|WebtoB/[0-9][0-9.]*' "$_HPD/p$1.err.body" 2>/dev/null | sed -n 1p
+}
 _hp_server_resp() {   # _hp_server_resp 제품 : 응답의 Server 헤더 판정 "판정|근거" (응답 없으면 빈 값)
     local p v leak="" clean="" any=0 xp trace=""
     _hp_have "$1" || return 0
@@ -5422,24 +5463,47 @@ _hp_server_resp() {   # _hp_server_resp 제품 : 응답의 Server 헤더 판정 
         v=$(_hp_hdr "$p" get Server); xp=$(_hp_hdr "$p" get X-Powered-By)
         if _hp_server_leak "$v"; then leak="${leak} $(_hp_scheme "$p"):${p}[Server: ${v}]"; else clean="${clean} $(_hp_scheme "$p"):${p}[Server: ${v:-없음}]"; fi
         [ -n "$xp" ] && echo "$xp" | grep -qE '/[0-9]' && leak="${leak} $(_hp_scheme "$p"):${p}[X-Powered-By: ${xp}]"
+        v=$(_hp_err_ver "$p"); [ -n "$v" ] && leak="${leak} $(_hp_scheme "$p"):${p}[오류 페이지 본문 버전 표시: ${v}]"   # 헤더가 깨끗해도 오류 페이지 서명에 버전이 보이면 노출 (Tomcat showServerInfo, Apache ServerSignature, nginx server_tokens)
         case "$(_hp_status "$p" trc)" in 200) trace="${trace} :${p}" ;; esac
     done
     [ "$any" = 1 ] || return 0
-    if [ -n "$leak" ]; then echo "취약|실제 응답 헤더에 서버 버전/OS 정보 노출:${leak}${trace:+ (참고: TRACE 허용 응답 200${trace})}"
-    else echo "양호|실제 응답 헤더에 버전 미노출:${clean}${trace:+ (참고: TRACE 허용 응답 200${trace})}"; fi
+    if [ -n "$leak" ]; then echo "취약|실제 응답(헤더·오류 페이지)에 서버 버전/OS 정보 노출:${leak}${trace:+ (참고: TRACE 허용 응답 200${trace})}"
+    else echo "양호|실제 응답(헤더·오류 페이지)에 버전 미노출:${clean}${trace:+ (참고: TRACE 허용 응답 200${trace})}"; fi
+}
+_ap_sigbad() {   # ServerSignature 가 Off 가 아닌 문맥 "문맥=값 ..." (가상호스트가 전역 값을 덮어쓸 수 있으므로 문맥별 마지막 값, 지정이 없으면 전역값 → 기본 Off)
+    _ap_scoped | awk -F'\t' '
+    { if (!($1 in seen)) { seen[$1] = 1; order[++n] = $1 } t = tolower($5)
+      if (t ~ /^serversignature[ \t]/) { split(t, a, /[ \t]+/); v[$1] = a[2] } }
+    END { g = ("global" in v) ? v["global"] : "off"
+          for (i = 1; i <= n; i++) { c = order[i]; e = (c in v) ? v[c] : g; if (e != "off") { printf "%s=%s ", c, e; shown = 1 } }
+          if (!shown && g != "off") printf "global=%s ", g }'
 }
 _v_servinfo_apache() {
-    local tk sg a cfg
-    tk=$(_active 'ServerTokens[[:space:]]' | tail -1 | awk '{print $2}'); sg=$(_active 'ServerSignature[[:space:]]' | tail -1 | awk '{print $2}')
+    local tk sg a cfg sb
+    tk=$(_active 'ServerTokens[[:space:]]' | tail -1 | awk '{print $2}'); sg=$(_active 'ServerSignature[[:space:]]' | tail -1 | awk '{print $2}'); sb=$(_ap_sigbad)
     case "$(echo "$tk" | tr 'A-Z' 'a-z')" in prod|productonly) a=1 ;; *) a=0 ;; esac
-    if [ "$a" = 1 ] && [ "$(echo "${sg:-off}" | tr 'A-Z' 'a-z')" = off ]; then cfg="양호|ServerTokens ${tk}, ServerSignature ${sg:-Off(기본)}"
-    else cfg="취약|헤더 정보 노출 설정 (ServerTokens=${tk:-미설정(Full)}, ServerSignature=${sg:-미설정}) - 가이드: ServerTokens Prod + ServerSignature Off"; fi
-    _resp_adjust "$cfg" "$(_hp_server_resp apache)"
+    if [ "$a" = 1 ] && [ -z "$sb" ]; then cfg="양호|ServerTokens ${tk}, ServerSignature ${sg:-Off(기본)}"
+    else cfg="취약|헤더 정보 노출 설정 (ServerTokens=${tk:-미설정(Full)}, ServerSignature=${sg:-미설정}${sb:+, Off 아닌 가상호스트/문맥: ${sb% }}) - 가이드: ServerTokens Prod + ServerSignature Off"; fi
+    # 가상호스트 단위 설정 결함은 기본 호스트(127.0.0.1) 응답만으로 양호 보정하지 않는다 (이름 기반 가상호스트는 응답 수집이 닿지 않음)
+    if [ "$a" = 1 ] && [ -n "$sb" ]; then _worse "$cfg" "$(_hp_server_resp apache)"; else _resp_adjust "$cfg" "$(_hp_server_resp apache)"; fi
+}
+_ng_tokbad() {   # server_tokens 가 off 가 아닌 server 블록 "server#N(listen)=값 ..." (server 값이 http 값을 덮어씀, 기본 on)
+    _ng_scoped | awk -F'\t' '
+    { c = $1; if (!(c in seen)) { seen[c] = 1; order[++n] = c } t = $5
+      if (t ~ /^listen[ \t]/ && !(c in lis)) { l = t; sub(/^listen[ \t]+/, "", l); lis[c] = l }
+      if (tolower(t) ~ /^server_tokens[ \t]/) { split(tolower(t), a, /[ \t]+/); v[c] = a[2] } }
+    END { g = ("http" in v) ? v["http"] : (("main" in v) ? v["main"] : "on"); ns = 0
+          for (i = 1; i <= n; i++) { c = order[i]; if (c !~ /^server#/) continue; ns++; e = (c in v) ? v[c] : g
+              if (e != "off") printf "%s(%s)=%s ", c, lis[c], e }
+          if (!ns && g != "off") printf "http=%s ", g }'
 }
 _v_servinfo_nginx() {
-    local cfg
-    if _ngx '^server_tokens[[:space:]]+off' | grep -q .; then cfg="양호|server_tokens off"; else cfg="취약|server_tokens off 미설정 (버전 노출)"; fi
-    _resp_adjust "$cfg" "$(_hp_server_resp nginx)"
+    local cfg tb
+    tb=$(_ng_tokbad)
+    if [ -z "$tb" ]; then cfg="양호|server_tokens off (모든 server 블록)"
+    else cfg="취약|server_tokens off 아님 (버전 노출; 미설정 시 기본 on): ${tb% }"; fi
+    # 응답을 받은 포트 수보다 결함 server 블록이 많으면(이름 기반 server 포함) 기본 호스트 응답만으로 양호 보정하지 않는다
+    if [ -n "$tb" ] && [ "$(echo "$tb" | tr ' ' '\n' | grep -c 'server#')" -gt "$(_hp_ports nginx | grep -c .)" ]; then _worse "$cfg" "$(_hp_server_resp nginx)"; else _resp_adjust "$cfg" "$(_hp_server_resp nginx)"; fi
 }
 _v_servinfo_webtob() {
     local tk cfg; tk=$(_wtm 'ServerTokens' | sed -n 1p)
@@ -5465,7 +5529,7 @@ _ev_servinfo() {
     _hasw webtob && _show "WebtoB: ServerTokens" _wtmf 'Server(Tokens|Signature)'
     _hasw tomcat && _tc_ev 'echo "-- Connector server= / showServerInfo"; _tcx server.xml | grep -noE "(server|showServerInfo|showReport)=\"[^\"]*\""'
     _hasw jeus && _je_ev 'for f in $(_JX JEUSMain.xml 5) $(_JX domain.xml 5); do echo "-- $f"; grep -nE "serverInfo|field-name" "$f"; done'
-    _hp_ev "" get trc
+    _hp_ev "" get err trc
 }
 
 # ── 기본 에러 페이지 (WST-123 / WEB-22) ──────────────────────────
@@ -5477,7 +5541,8 @@ _hp_err_resp() {   # 오류 응답 본문이 제품 기본 페이지인지
         [ -s "$_HPD/p$p.err" ] || continue
         case "$(_hp_status "$p" err)" in 4*|5*) ;; *) continue ;; esac   # 오류 응답(4xx/5xx)만 판단 대상
         any=1
-        if _hp_body_has "$p" err 'The requested URL .* was not found on this server|Server at .* Port|<hr><center>nginx|HTTP Status [0-9]+|Apache Tomcat/|<h1>Not Found</h1>'; then o="${o} $(_hp_scheme "$p"):${p}(상태 $(_hp_status "$p" err))"
+        # Tomcat 은 'HTTP Status NNN' 제목만 남는 showReport=false 페이지(Type/Message/Description·버전 없음)는 기본 보고서가 아니므로 제외
+        if _hp_body_has "$p" err 'The requested URL .* was not found on this server|Server at .* Port|<hr><center>nginx|Apache Tomcat/|<h1>Not Found</h1>' || { _hp_body_has "$p" err 'HTTP Status [0-9]+' && _hp_body_has "$p" err '<b>(Type|Message|Description)</b>'; }; then o="${o} $(_hp_scheme "$p"):${p}(상태 $(_hp_status "$p" err))"
         else ok="${ok} $(_hp_scheme "$p"):${p}(상태 $(_hp_status "$p" err))"; fi
     done
     [ "$any" = 1 ] || return 0
@@ -5501,10 +5566,11 @@ _v_errpage_apache() {
     _resp_adjust "$cfg" "$(_hp_err_resp apache)"
 }
 _v_errpage_nginx() {
-    local vh miss glob ep cfg
+    local vh miss glob ep cfg rd
     vh=$(_ng_vh '^error_page[[:space:]]+.*[45][0-9][0-9]')
     glob=$(echo "$vh" | awk -F'\t' '$1 == "http" || $1 == "main" { if ($2 == 1) g = 1 } END { print g + 0 }')
-    miss=$(echo "$vh" | awk -F'\t' -v g="$glob" '$1 ~ /^server#/ && $2 == 0 && g != 1 { print $1 "(" $4 ")" }' | tr '\n' ',' | sed 's/,$//')
+    rd=$(_ng_vh '^return[[:space:]]+30[1278][[:space:]]' | awk -F'\t' '$1 ~ /^server#/ && $2 == 1 { printf "%s ", $1 }')   # return 30x 만 하는 리디렉션 전용 server 는 오류 페이지를 내보내지 않음
+    miss=$(echo "$vh" | awk -F'\t' -v g="$glob" -v rd="$rd" 'BEGIN { n = split(rd, a, " "); for (i = 1; i <= n; i++) r[a[i]] = 1 } $1 ~ /^server#/ && $2 == 0 && g != 1 && !($1 in r) { print $1 "(" $4 ")" }' | tr '\n' ',' | sed 's/,$//')
     ep=$(_ngx '^error_page[[:space:]]' | grep -oE '[45][0-9][0-9]' | sort -u | tr '\n' ' ')
     if [ "$_ERRSTRICT" = 1 ]; then echo " $ep" | grep -q ' 404' || miss="${miss:+$miss, }404 미지정"; echo " $ep" | grep -qE ' 5[0-9][0-9]' || miss="${miss:+$miss, }5xx 미지정"; fi
     [ -z "$(echo "$vh" | grep '^server#')" ] && [ "$glob" != 1 ] && [ -z "$ep" ] && miss="${miss:-error_page 없음}"
@@ -5576,7 +5642,7 @@ _ev_vdir() {
     _cfg_scope
     _hasw apache && _show "Apache: Alias" _activef 'Alias[[:space:]]'
     _hasw nginx && _show "Nginx: alias" _ngxf '^alias[[:space:]]'
-    _hasw webtob && _show "WebtoB: *ALIAS" sh -c "grep -nA5 '^\\*ALIAS' '$_WT_M'"
+    _hasw webtob && _show "WebtoB: *ALIAS" _wt_alias_ev
     _hasw tomcat && _tc_ev 'echo "-- server.xml Context path"; _tcx server.xml | grep -noE "<Context[^>]*path=\"[^\"]*\""; echo "-- conf/Catalina/*/*.xml"; ls -l "$TOMCAT_HOME"/conf/Catalina/*/ 2>&1'
 }
 _v_webdav_apache() { _active 'Dav[[:space:]]+On' | grep -q . && echo "취약|WebDAV 활성 (Dav On)" || echo "양호|Dav On 설정 없음 (WebDAV 비활성)"; }
@@ -5699,7 +5765,7 @@ _upload_dirs() {
     local d
     for d in $(_web_docroots); do [ -d "$d" ] && _findd 4 "$d" -type d \( -iname 'upload*' -o -iname 'attach*' -o -iname 'userfile*' \) ; done | sort -u
 }
-_v_upload_dirs() {
+_v_upload_dirs_core() {
     local ud o="" d p roots; roots=$(_web_docroots | tr '\n' ' ')
     if [ -z "${roots// /}" ]; then echo "점검불가|웹 서비스 경로를 확인하지 못해 업로드 디렉터리를 찾을 수 없음"; return; fi
     ud=$(_upload_dirs | tr '\n' ' ')
@@ -5732,7 +5798,7 @@ _v_admin_jeus() {
     else echo "양호|JEUS 관리자 계정명 기본값(administrator) 아님"; fi
 }
 _ev_admin() {
-    _hasw tomcat && _tc_ev 'f=$(_TCU); if [ -e "$f" ]; then ls -l "$f"; grep -iE "<user |<role " "$f" | _mask_pw; else echo "tomcat-users.xml 없음: $f"; fi'
+    _hasw tomcat && _tc_ev 'f=$(_TCU); if [ -e "$f" ]; then ls -l "$f"; _xml_nc < "$f" | grep -iE "<user |<role " | _mask_pw; else echo "tomcat-users.xml 없음: $f"; fi'
     _hasw jeus && _je_ev 'for f in $(_JX accounts.xml 5); do echo "-- $f"; grep -iE "<name>" "$f"; done; echo "accounts.xml 후보: $(_JX accounts.xml 5 | grep -c .)개"'
 }
 _v_weakpw_tomcat() {   # WEB-02
@@ -5761,7 +5827,7 @@ _v_weakpw_jeus() {
     else echo "양호|JEUS 관리자 비밀번호 SHA-256 이상 암호화"; fi
 }
 _ev_weakpw() {
-    _hasw tomcat && _tc_ev 'f=$(_TCU); if [ -e "$f" ]; then grep -iE "<user " "$f" | _mask_pw; else echo "tomcat-users.xml 없음: $f"; fi; echo "-- CredentialHandler/digest"; _tcx server.xml | grep -nE "CredentialHandler|digest=" | _mask_pw'
+    _hasw tomcat && _tc_ev 'f=$(_TCU); if [ -e "$f" ]; then _xml_nc < "$f" | grep -iE "<user " | _mask_pw; else echo "tomcat-users.xml 없음: $f"; fi; echo "-- CredentialHandler/digest"; _tcx server.xml | grep -nE "CredentialHandler|digest=" | _mask_pw'
     _hasw jeus && _je_ev 'for f in $(_JX accounts.xml 5); do echo "-- $f"; grep -iE "<password>" "$f" | _mask_pw; done'
 }
 _v_pwfile_tomcat() {   # WEB-03
@@ -5777,7 +5843,7 @@ _v_pwfile_jeus() {
 }
 _ev_pwfile() {
     _hasw tomcat && _tc_ev 'f=$(_TCU); if [ -e "$f" ]; then ls -l "$f"; else echo "tomcat-users.xml 없음: $f"; fi'
-    _hasw jeus && _je_ev 'ls -l $(_JX accounts.xml 5) $(_JX policies.xml 5)'
+    _hasw jeus && _je_ev 'for f in $(_JX accounts.xml 5) $(_JX policies.xml 5); do ls -l "$f"; done; echo "비밀번호 파일 후보: $(_JX accounts.xml 5 | grep -c .)개(accounts.xml) $(_JX policies.xml 5 | grep -c .)개(policies.xml)"'
 }
 _v_wst044_tomcat() {
     local f users def; f=$(_TCU)
@@ -5845,16 +5911,37 @@ _v_dbconf_jeus() {
     for f in $hits; do p=$(get_perm "$f"); [ -n "$p" ] && _perm_over "$p" 600 && o="${o} ${f}(${p})"; done
     [ -n "$o" ] && echo "취약|DB 연결 정보 포함 설정 파일 권한 600 초과:${o}" || echo "양호|DB 연결 설정 파일 권한 600 이하:${hits}"
 }
-_v_dbconf_spring() {   # Spring Boot 독립 실행 앱 (제품 탐지와 무관)
-    local hits f p o="" l=""
-    hits=$(_spring_cfgs | _dbcfg_hits)
-    [ -n "$hits" ] || return 0
-    for f in $hits; do p=$(get_perm "$f"); l="${l} ${f}(${p})"; [ -n "$p" ] && _perm_over "$p" 600 && o="${o} ${f}(${p})"; done
-    [ -n "$o" ] && echo "취약|[Spring Boot] DB 연결 정보 포함 설정 파일 권한 600 초과:${o}" || echo "양호|[Spring Boot] DB 연결 설정 파일 권한 600 이하:${l}"
+_spring_procs() {   # 스프링 부트로 보이는 실행 중 프로세스의 jar (인자에 org.springframework.boot / --spring. / -Dspring. 가 있거나, -jar 대상 jar 안에 BOOT-INF 가 있는 것)
+    local l j
+    printf '%s\n' "$_PSALL" | grep -E '(^|[[:space:]/])java[[:space:]].*(-jar |org\.springframework\.boot)' | while read -r l; do
+        j=$(printf '%s\n' "$l" | grep -oE -- '-jar[[:space:]]+[^[:space:]]+' | awk '{print $2}' | sed -n 1p)
+        if printf '%s\n' "$l" | grep -qE 'org\.springframework\.boot|(^|[[:space:]])(--|-D)spring\.'; then echo "${j:-spring-boot}"; continue; fi
+        [ -n "$j" ] && [ -r "$j" ] && grep -qa 'BOOT-INF/' "$j" 2>/dev/null && echo "$j"
+    done | sort -u
+}
+_v_dbconf_spring() {   # Spring Boot 독립 실행 앱 (제품 탐지와 무관). 스프링 프로세스·설정 파일이 모두 없으면 출력 없음(대상 아님)
+    local hits cfgs procs f p j d o="" l="" n miss="" r=""
+    cfgs=$(_spring_cfgs); procs=$(_spring_procs)
+    for j in $procs; do   # 실행 중인 앱 중 jar 위치에서 외부 설정 파일을 찾지 못한 것
+        case "$j" in /*) d=$(dirname "$j"); printf '%s\n' "$cfgs" | awk -v d="$d/" 'index($0, d) == 1 { f = 1 } END { exit !f }' || miss="${miss} ${j}" ;; *) [ -n "$cfgs" ] || miss="${miss} ${j}" ;; esac
+    done
+    [ -n "$miss" ] && r="점검불가|[Spring Boot] 실행 중인 앱(${miss# })은 탐지됐으나 외부 설정 파일(application*.properties/yml)을 찾지 못함 - jar 내부(BOOT-INF/classes) 설정이거나 설정 경로 확인 필요"
+    if [ -n "$cfgs" ]; then
+        hits=$(printf '%s\n' "$cfgs" | _dbcfg_hits)
+        n=$(printf '%s\n' "$cfgs" | grep -c .)
+        if [ -z "$hits" ]; then r=$(_worse "$r" "양호|[Spring Boot] 설정 파일 ${n}개에 DB 연결 정보 없음: $(_brief "$cfgs" 3)")
+        else
+            for f in $hits; do p=$(get_perm "$f"); l="${l} ${f}(${p})"; [ -n "$p" ] && _perm_over "$p" 600 && o="${o} ${f}(${p})"; done
+            if [ -n "$o" ]; then r=$(_worse "$r" "취약|[Spring Boot] DB 연결 정보 포함 설정 파일 권한 600 초과:${o}"); else r=$(_worse "$r" "양호|[Spring Boot] DB 연결 설정 파일 권한 600 이하:${l}"); fi
+        fi
+    fi
+    [ -n "$r" ] && echo "$r"
+    return 0
 }
 _ev_dbconf() {
     _hasw tomcat && _tc_ev '_tc_appcfgs | sort -u | _dbcfg_hits | while read -r f; do echo "== $f ($(get_perm "$f"))"; ls -l "$f"; case "$f" in *.xml) _xml_nc < "$f" ;; *) grep -v "^[[:space:]]*[#!;]" "$f" ;; esac | grep -iE "jdbc:|DataSource|spring\.datasource|username|url" | _mask_pw; done; echo "후보 파일 수: $(_tc_appcfgs | sort -u | grep -c .)"'
     _hasw jeus && _je_ev 'for f in $(_JX domain.xml 5) $(_JX jeus-web-dd.xml 50) $(_JX JEUSMain.xml 5); do echo "== $f ($(get_perm "$f"))"; ls -l "$f"; _xml_nc < "$f" | grep -iE "jdbc:|data-?source|user" | _mask_pw; done'
+    echo "-- Spring Boot 실행 프로세스 jar: $(_spring_procs | tr '\n' ' ')"
     echo "-- Spring Boot 설정 파일 (실행 중 java -jar / cwd / spring.config.location), 후보 $(_spring_cfgs | grep -c .)개"
     _spring_cfgs | _dbcfg_hits | while read -r f; do echo "== $f ($(get_perm "$f"))"; ls -l "$f"; grep -v '^[[:space:]]*[#!;]' "$f" | grep -iE 'jdbc:|spring\.datasource|username|url' | _mask_pw; done
 }
@@ -5868,7 +5955,7 @@ _conf_files_all() {
     for h in $JEUS_HOMES; do JEUS_HOME=$h _JX accounts.xml 5; JEUS_HOME=$h _JX domain.xml 5; done
     [ -n "$_WT_M" ] && echo "$_WT_M"
 }
-_v_confperm_all() {
+_v_confperm_all_core() {
     local cf f p o="" n=0 l=""
     cf=$(_conf_files_all | sort -u)
     [ -n "$cf" ] || { echo "점검불가|주요 설정 파일을 확인하지 못함"; return; }
@@ -5920,7 +6007,7 @@ _v_eos_jeus() { local jv; jv=$( { jeusadmin -version 2>/dev/null || "$JEUS_HOME/
 _ev_eos() {
     _hasw apache && _show "Apache 버전" sh -c 'httpd -v 2>&1 || apache2 -v 2>&1 || apachectl -v 2>&1'
     _hasw nginx && _show "Nginx 버전" sh -c 'nginx -v 2>&1'
-    _hasw webtob && _show "WebtoB 버전" sh -c "wscfl -version 2>&1 || '$_WT_HOME/bin/wscfl' -version 2>&1"
+    _hasw webtob && _show "WebtoB 버전" sh -c "wscfl -version 2>&1 || { [ -n '$_WT_HOME' ] && '$_WT_HOME/bin/wscfl' -version 2>&1; } || echo 'wscfl 실행 불가 (WebtoB 설치 경로 ${_WT_HOME:-미확인})'"
     _hasw tomcat && _tc_ev 'echo "버전: $(_tomcat_ver "$TOMCAT_HOME")"; h=$(_tc_home "$TOMCAT_HOME"); grep -h "Apache Tomcat Version" "$h/RELEASE-NOTES" "$TOMCAT_HOME/RELEASE-NOTES" 2>&1'
     _hasw jeus && _je_ev 'jeusadmin -version 2>&1 || "$JEUS_HOME/bin/jeusadmin" -version 2>&1'
 }
@@ -5942,7 +6029,7 @@ _log_dirs() {
     [ -n "$_WT_HOME" ] && echo "$_WT_HOME/log"
 }
 _log_dirs_real() { _log_dirs | while read -r d; do [ -d "$d" ] && _realdir "$d"; done | sort -u; }
-_v_logperm_all() {
+_v_logperm_all_core() {
     local ld d p f o="" un="" n=0
     ld=$(_log_dirs_real | tr '\n' ' ')
     if [ -z "${ld// /}" ]; then echo "점검불가|로그 디렉터리를 확인하지 못함"; return; fi
@@ -5956,6 +6043,21 @@ _v_logperm_all() {
     elif [ -n "$un" ]; then echo "점검불가|일부 로그 디렉터리 접근 권한 없음:${un} (확인한 ${n}개는 other 권한 없음)"
     else echo "양호|로그 디렉터리·파일에 일반 사용자 권한 없음: ${ld}"; fi
 }
+# 제품 구분 없이 경로·파일을 합산하는 판정은 설정을 읽지 못한 제품(Apache/Nginx/WebtoB/JEUS)을 조용히 빼지 않고 '점검불가' 사유를 함께 낸다
+_un_all() {
+    local o=""
+    _hasw apache && [ -n "$_AP_UN" ] && o="${o:+$o / }[Apache] $_AP_UN"
+    _hasw nginx && [ -n "$_NG_UN" ] && o="${o:+$o / }[Nginx] $_NG_UN"
+    _hasw webtob && [ -n "$_WT_UN" ] && o="${o:+$o / }[WebtoB] $_WT_UN"
+    _hasw jeus && [ -n "$_JE_UN" ] && o="${o:+$o / }[JEUS] $_JE_UN"
+    [ -n "$o" ] && echo "점검불가|$o"
+    return 0
+}
+_v_docroot_all() { _worse "$(_v_docroot_all_core)" "$(_un_all)"; }
+_v_confperm_all() { _worse "$(_v_confperm_all_core)" "$(_un_all)"; }
+_v_upload_dirs() { _worse "$(_v_upload_dirs_core)" "$(_un_all)"; }
+_v_wst034() { _worse "$(_v_wst034_core)" "$(_un_all)"; }
+_v_logperm_all() { _worse "$(_v_logperm_all_core)" "$(_un_all)"; }
 _ev_logperm() {
     local d; for d in $(_log_dirs_real); do echo "== $d"; ls -ld "$d"; ls -l "$d" 2>&1; done
     echo "대상 로그 디렉터리 수: $(_log_dirs_real | grep -c .)"
@@ -5985,7 +6087,7 @@ _ev_dirtrav() {
     _hasw nginx && _show "Nginx 버전" sh -c 'nginx -v 2>&1'
     _hasw tomcat && _tc_ev 'echo "Tomcat 버전: $(_tomcat_ver "$TOMCAT_HOME")"'
 }
-_v_wst034() {
+_v_wst034_core() {
     local r="" f d b cg="" tmp="" x ex
     for d in $(_cgi_dirs); do [ -d "$d" ] && ls "$d" 2>/dev/null | grep -qE '^(printenv|test-cgi)' && cg="${cg} 디폴트cgi:${d}"; done
     for d in $(_web_docroots); do
@@ -6079,9 +6181,14 @@ done
 
 # WST-080: 주기적인 보안패치 (OS 판정 + 웹서버/WAS 버전 확인 병합)
 evd "WST-080" "_ev_eos"
-_wver="Apache $(_hasw apache && _apache_ver) / Nginx $(_hasw nginx && _nginx_ver)"
-for _h in $TOMCAT_HOMES; do _wver="${_wver} / Tomcat[${_h}] $(_tomcat_ver "$_h")"; done
-_merge_hold "WST-080" "수동확인" "웹 제품 보안패치 확인 필요 (${_wver}) - 벤더 보안 공지 대조"
+_wver=""
+_hasw apache && _wver="Apache $(_apache_ver)"
+_hasw nginx && _wver="${_wver:+$_wver / }Nginx $(_nginx_ver)"
+_hasw webtob && _wver="${_wver:+$_wver / }WebtoB"
+for _h in $TOMCAT_HOMES; do _wver="${_wver:+$_wver / }Tomcat[${_h}] $(_tomcat_ver "$_h")"; done
+_hasw jeus && _wver="${_wver:+$_wver / }JEUS"
+if [ -n "$_wver" ]; then _merge_hold "WST-080" "수동확인" "웹 제품 보안패치 확인 필요 (${_wver}) - 벤더 보안 공지 대조"   # 웹/WAS 미탐지 호스트는 OS 판정만
+else _merge_hold "WST-080" "" ""; fi
 
 # WST-126: EoS (OS 판정 + 웹서버/WAS 제품 EoS 병합)
 evd "WST-126" "_ev_eos"
@@ -6126,7 +6233,7 @@ _web  WEB-12 "$_ALLT IIS" links _ev_links
 # WEB-13: Tomcat·JEUS 설정 + Spring Boot 독립 실행 앱(application.properties/yml)
 _sp=$(_v_dbconf_spring </dev/null)
 if [ -z "$(_kt "Tomcat JEUS")" ] && [ -z "$_sp" ]; then
-    evd "WEB-13" "_ev_dbconf"; result "WEB-13|N-A|가이드 점검 대상(Tomcat, JEUS) 제품 및 Spring Boot 설정 파일 미탐지 (탐지:${_KP:- 없음})"
+    evd "WEB-13" "_ev_dbconf"; result "WEB-13|N-A|가이드 점검 대상(Tomcat, JEUS) 제품 및 Spring Boot 앱 미탐지 (탐지:${_KP:- 없음})"
 else
     evd "WEB-13" "_ev_dbconf"
     _r13=$(_combine dbconf "Tomcat JEUS"); [ -n "$_sp" ] && _r13=$(_worse "$_r13" "$_sp")
