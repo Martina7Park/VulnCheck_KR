@@ -647,18 +647,68 @@ def fline(lines, pattern):
         if re.search(pattern, l, re.I): return l.strip()
     return None
 
+def _net_secret_sub(m, keep=0):
+    s = m.group("v")
+    quoted = len(s) >= 2 and s[0] == '"' and s[-1] == '"'
+    inner = s[1:-1] if quoted else s
+    masked = (inner[:keep] + "***") if keep and len(inner) > keep else "***"
+    return m.group("p") + ('"' + masked + '"' if quoted else masked) + m.group("q")
+
+
+_NV = r'(?P<v>(?!"?\*\*\*)"[^"]*"|(?!"?\*\*\*)[\x21-\x7e]+?)'
+# 설정 줄이 결과 문구(현황·근거)에 인용될 때 community·비밀번호·해시·키 원문을 가린다 (community 는 앞 2자 + ***)
+_NET_MASK_RULES = [
+    # SNMP community — IOS/Dell/NX-OS/ASA/D-Link/A10/Juniper/Alteon
+    (re.compile(r'(?P<p>\bsnmp-server\s+community\s+(?:\d\s+)?)' + _NV + r'(?P<q>(?=\s|$))', re.I), 2),
+    (re.compile(r'(?P<p>\b(?:create|config|delete)\s+snmp\s+community\s+)' + _NV + r'(?P<q>(?=\s|$))', re.I), 2),
+    (re.compile(r'(?P<p>\bset\s+snmp\s+community\s+)' + _NV + r'(?P<q>(?=\s|$))', re.I), 2),
+    (re.compile(r'(?P<p>\bsnmp-server\s+host\s+.*?\bcommunity\s+)' + _NV + r'(?P<q>(?=\s|$))', re.I), 2),
+    (re.compile(r'(?P<p>\bsnmp-server\s+host\s+.*?\bversion\s+(?:1|2c)\s+)' + _NV + r'(?P<q>(?=\s|$))', re.I), 2),
+    (re.compile(r'(?P<p>\bcreate\s+snmp\s+host\s+\S+\s+v(?:1|2c)\s+)' + _NV + r'(?P<q>(?=\s|$))', re.I), 2),
+    (re.compile(r'(?P<p>\bcommunity\s+(?:read-write|read-only|read_write|read_only|read)\s+)' + _NV + r'(?P<q>(?=\s|$))', re.I), 2),
+    (re.compile(r'(?P<p>\b(?:rcomm|wcomm)\s+)' + _NV + r'(?P<q>(?=\s|$))', re.I), 2),
+    # 비밀번호·키 (ASCII 값만 — 한글 설명 문장은 건드리지 않는다)
+    (re.compile(r'(?P<p>\b(?:encrypted-password|authentication-password|privacy-password|plain-text-password-value|authentication-key|ascii-text|hexadecimal)\s+)' + _NV + r'(?P<q>(?=[;\s]|$))', re.I), 0),
+    (re.compile(r'(?P<p>\bsecret\s+)(?P<v>"[^"]*")(?P<q>)', re.I), 0),
+    (re.compile(r'(?P<p>\b(?:usrpw|admpw|pswd|authpw|privpw|passwd|passphrase)\s+)' + _NV + r'(?P<q>(?=\s|$))', re.I), 0),
+    (re.compile(r'(?P<p>\benable\s+(?:algorithm-type\s+\S+\s+)?(?:secret|password|sha256-password|sha512-password)\s+(?:\d\s+)?)(?P<v>(?!"?\*\*\*|encryption\b)[\x21-\x7e]+)(?P<q>)', re.I), 0),
+    (re.compile(r'(?P<p>\b(?:sha[0-9]*-password|password|secret|passwd)\s+(?:(?:encrypted|\d)\s+)?)(?P<v>(?!"?\*\*\*|encryption\b|encrypt\b|policy\b|strength\b|min\w*\b|max\w*\b|complex\w*\b|expir\w*\b|history\b|aging\b|recovery\b)[\x21-\x7e]{2,})(?P<q>(?=\s|$))', re.I), 0),
+    (re.compile(r'(?P<p>\bkey\s+(?:\d\s+)?)(?P<v>(?!"?\*\*\*|chain\b|config\b|pair\b|generate\b|zeroize\b|string\b)"[^"]*"|(?!"?\*\*\*|chain\b|config\b|pair\b|generate\b|zeroize\b|string\b)[\x21-\x7e]{3,})(?P<q>(?=\s|$))', re.I), 0),
+    (re.compile(r'(?P<p>\bencrypt\s+(?:sha_1|md5|sha1)\s+)(?P<v>(?!"?\*\*\*)[\x21-\x7e]+)(?P<q>)', re.I), 0),
+    (re.compile(r'(?P<p>\bauth(?:entication)?\s+(?:md5|sha\d*|sha_1)\s+)(?P<v>(?!"?\*\*\*)[\x21-\x7e]+)(?P<q>)', re.I), 0),
+    (re.compile(r'(?P<p>\bpriv(?:acy)?\s+(?:aes[\w-]*|des[\w-]*|3des)\s+(?:(?:128|192|256)\s+)?)(?P<v>(?!"?\*\*\*)[\x21-\x7e]+)(?P<q>)', re.I), 0),
+]
+_NET_HASH_RE = re.compile(r'\$(?:[0-9]{1,2}|sha[0-9]+|pbkdf2)\$[^\s"\';,]+')
+_NET_HEX_RE = re.compile(r'(?<![0-9A-Za-z])(?:0x)?[0-9A-Fa-f]{32,}(?![0-9A-Za-z])')
+
+
+def mask_net_secrets(s):
+    """결과 문구 속 community(앞 2자 + ***)·비밀번호·해시·키 원문 마스킹"""
+    if not s or not isinstance(s, str):
+        return s
+    for rx, keep in _NET_MASK_RULES:
+        s = rx.sub(lambda m, k=keep: _net_secret_sub(m, k), s)
+    s = _NET_HASH_RE.sub(lambda m: re.match(r'\$[^$]+\$', m.group(0)).group(0) + "***", s)
+    s = _NET_HEX_RE.sub("***", s)
+    return s
+
+
 def detect_net_vendor(text):
     # 자유 문구 줄(description·hostname·banner 등)의 단어로 오판하지 않도록 제외
     t = "\n".join(l for l in text.lower().splitlines()
                   if not re.match(r'\s*(description|hostname|sysname|banner|alias|name\s|set system host-name|snmp-server (location|contact))', l))
-    if re.search(r'alteon|radware|^/c/sys|^/cfg/sys', t, re.M): return "ALTEON"
-    if re.search(r'a10networks|vthunder|\bacos\b|^!version \S+.*build|^slb |^interface management\s*$', t, re.M): return "A10"
-    if re.search(r'\bftos\b|dell networking|force10', t):     return "DELL"
+    if re.search(r'alteon|radware|^/c/sys|^/cfg/sys|^script start "alteon|^/c/slb\b', t, re.M): return "ALTEON"
+    if re.search(r'a10networks|vthunder|\bacos\b|^!version \S+.*build|^slb |^interface management\s*$|^enable-management\s+service\b|^snmp-server snmpv1-v2c\b', t, re.M): return "A10"
+    if re.search(r'\bftos\b|dell networking|force10|dell emc|^boot system stack-unit|^! version \d+\.\d+\(\d+\.\d+\)|^protocol lldp\s*$|^interface managementethernet\b|^interface (?:ten|forty|hundred|twentyfive|fortygig)\w*gigabitethernet \d', t, re.M): return "DELL"
+    if re.search(r'^asa version\b|^:\s*hardware:\s+asa', t, re.M) or \
+            (re.search(r'^\s*nameif\s+\S+', t, re.M) and re.search(r'^\s*security-level\s+\d+', t, re.M)): return "ASA"
     dl = sum(bool(re.search(p, t, re.M)) for p in (
         r'^\s*#.*\b(dgs|des|dxs|dws)-\d', r'^config (ports|terminal_line|safeguard_engine|traffic_control|snmp community)\b',
-        r'^create account\b', r'^enable password encryption\b', r'^create vlan\b', r'^config ipif\b'))
+        r'^create account\b', r'^(enable|disable) password[_ ]encryption\b', r'^create vlan\b', r'^config ipif\b',
+        r'^create (snmp community|trusted_host|syslog host|access_profile)\b', r'^config (serial_port|ssh|sntp|port_security|stp)\b',
+        r'^(enable|disable) (telnet|web|ssh|clipaging|syslog|sntp|snmp)\b'))
     if dl >= 2: return "DLINK"
-    if re.search(r'\bjunos\b|^set system |^set interfaces |^system \{|^interfaces \{|^version \S+;\s*$', t, re.M): return "JUNIPER"
+    if re.search(r'\bjunos\b|^set system |^set interfaces |^system \{|^interfaces \{|^version \S+;\s*$|^## last commit:', t, re.M): return "JUNIPER"
     if re.search(r'^\s*sysname |^\s*snmp-agent |^\s*undo |^interface vlanif|^\s*local-user |\bvrp\b|\bcomware\b', t, re.M): return "HUAWEI"  # 가이드 벤더 그룹 미분류
     if re.search(r'^ltm |^sys global-settings|\bbig-?ip\b', t, re.M): return "BIGIP"
     if re.search(r'^add ns |^set ns |\bnetscaler\b', t, re.M): return "CITRIX"
@@ -667,6 +717,20 @@ def detect_net_vendor(text):
     if re.search(r'^version \d|^line (vty|con)|^interface (gigabit|fastethernet|tengig|ethernet|port-channel|vlan|loopback)|^ip (route|access-list|http)|^snmp-server |^feature |\bios\b|nx-os|^asa version', t, re.M):
         return "CISCO"
     return "UNKNOWN"
+
+
+def _net_os(text):
+    """Cisco 계열 세부 OS: NXOS / ASA / IOSXE / IOS (그 외 벤더는 detect_net_vendor 값)"""
+    v = detect_net_vendor(text)
+    if v == "ASA": return "ASA"
+    if v != "CISCO": return v
+    t = text.lower()
+    if re.search(r'^\s*feature\s+\S+|^vdc\s+\S+\s+id\s+\d|^version \S+\s+bios:|^vrf context\b|^interface mgmt0\b|^!command: show running-config|nx-os', t, re.M):
+        return "NXOS"
+    m = re.search(r'^version\s+(\d+)\.', t, re.M)
+    if "ios-xe" in t or "ios xe" in t or (m and int(m.group(1)) >= 16):
+        return "IOSXE"
+    return "IOS"
 
 def _l3_capable(lines):
     """라우팅 기능 사용 여부: ip routing / 라우팅 프로토콜 / 물리(비 SVI·관리) 인터페이스에 IP 주소 /
@@ -734,326 +798,1272 @@ def get_vty_blocks(lines):
 
 def build_dlink_checks(lines, text):
     """
-    D-Link 관리형 스위치 (DGS/DES/DXS 시리즈) 점검
+    D-Link 관리형 스위치 (DGS/DES/DXS 시리즈, 고유 CLI) 점검
     NET-001~NET-059 → {code: (결과, 현황문자열)}
+    고유 CLI 문법: create snmp community <문자열> view <view> read_only|read_write / create trusted_host / create syslog host ... /
+                  enable|disable password encryption / enable|disable telnet·web·ssh / config serial_port ... auto_logout / config sntp ...
     """
-    def any_m(pat, flags=re.I):
-        return any(re.search(pat, l, flags) for l in lines)
-    def find_lines(pat, flags=re.I):
-        return [l.strip() for l in lines if re.search(pat, l, flags)]
-    def fline(pat, flags=re.I):
-        for l in lines:
-            if re.search(pat, l, flags): return l.strip()
-        return None
-    def ok(s):  return (RESULT_GOOD,   s)
-    def ng(s):  return (RESULT_BAD,    s)
-    def na(s):  return (RESULT_NA,     s)
-    def mc(s):  return (RESULT_MANUAL, s)
-    def fmt(actual, criteria, judge):
-        return f"[실제값] {actual} [기준] {criteria} [판단] {judge}"
+    L = [l.strip() for l in lines if l.strip() and not l.lstrip().startswith("#")]
+    R = _NR()
 
-    results = {}
+    def find(pat):
+        return [s for s in L if re.match(pat, s, re.I)]
+    def first(pat):
+        r = find(pat)
+        return r[0] if r else None
+    def state(en_pat, dis_pat):
+        """마지막으로 적용된 enable/disable 명령 → True/False/None(설정 없음)"""
+        st = None
+        for s in L:
+            if re.match(en_pat, s, re.I): st = True
+            elif re.match(dis_pat, s, re.I): st = False
+        return st
 
-    # NET-001: 백업/복구
-    results['NET-001'] = mc(fmt("D-Link config 백업", "설정 백업 절차 수립", "인터뷰 확인"))
-
-    # NET-003: SNMP 버전
-    snmp_enabled = any_m(r'enable\s+snmp')
-    snmp_disabled = any_m(r'disable\s+snmp')
-    snmp_comm = find_lines(r'config\s+snmp\s+community')
-    snmp_v3 = any_m(r'config\s+snmp\s+engineID|snmpv3|config\s+snmpv3')
-
-    if snmp_disabled and not snmp_enabled:
-        results['NET-003'] = ok(fmt("SNMP 비활성화(disable snmp)", "SNMP 미사용 또는 v3 사용", "SNMP 비활성"))
-        results['NET-004'] = na(fmt("SNMP 비활성", "해당 없음", "SNMP 미사용"))
-        results['NET-005'] = na(fmt("SNMP 비활성", "해당 없음", "SNMP 미사용"))
-        results['NET-006'] = na(fmt("SNMP 비활성", "해당 없음", "SNMP 미사용"))
-    elif snmp_v3 and not snmp_comm:
-        results['NET-003'] = ok(fmt("SNMPv3 사용", "SNMP v3 인증+암호화", "v3 적용"))
-        results['NET-004'] = ok(fmt("SNMPv3 (community 없음)", "RW community 미사용", "양호"))
-        results['NET-005'] = ok(fmt("SNMPv3", "v3 접근통제", "양호"))
-        results['NET-006'] = mc(fmt("SNMPv3 접근 제한", "관리망 한정 SNMP", "수동 확인"))
-    elif snmp_comm:
-        pub_priv = [l for l in snmp_comm if re.search(r'"public"|"private"', l, re.I)]
-        rw_comm = [l for l in snmp_comm if re.search(r'read_write', l, re.I)]
-        if pub_priv:
-            results['NET-003'] = ng(fmt(f"기본 community: {pub_priv[0][:80]}", "public/private 미사용", "기본 community 사용"))
+    _net_common_manual(R, "D-Link")
+    # ── SNMP ──
+    snmp_st = state(r'enable\s+snmp\b', r'disable\s+snmp\b')
+    deleted = {m.group(1).lower() for s in find(r'delete\s+snmp\s+community\s+\S+') for m in [re.match(r'delete\s+snmp\s+community\s+(\S+)', s, re.I)]}
+    comms = []
+    for s in find(r'(create|config)\s+snmp\s+community\s+\S+'):
+        m = re.match(r'(?:create|config)\s+snmp\s+community\s+("?[^"\s]+"?)(.*)$', s, re.I)
+        name, rest = m.group(1).strip('"'), m.group(2)
+        if re.search(r'\bread_write\b|\brw\b', rest, re.I) or re.search(r'\bread_write\b', s, re.I):
+            rw = True
         else:
-            # 평가기준 복잡도: 2종 10자 이상 / 3종 8자 이상 (보고서 표기는 마스킹)
-            weak_c = []
-            for l in snmp_comm:
-                m = re.search(r'community\s+"?([^"\s]+)"?', l, re.I)
-                if not m: continue
-                cs = m.group(1); cls = sum(bool(re.search(p, cs)) for p in (r'[A-Za-z]', r'\d', r'[^A-Za-z0-9]'))
-                if not ((cls >= 2 and len(cs) >= 10) or (cls >= 3 and len(cs) >= 8)):
-                    weak_c.append(f"{cs[:2]}{'*' * max(0, len(cs) - 2)}({len(cs)}자)")
-            results['NET-003'] = ng(fmt(f"복잡도 미달 community: {', '.join(weak_c[:3])}", "2종 10자 / 3종 8자 이상", "community 복잡도 미달")) if weak_c else \
-                mc(fmt(f"SNMPv1/v2c community {len(snmp_comm)}개 (복잡도 충족)", "SNMP v3 사용 가능한 환경에서 v2 이용 시 취약", "v3 사용 가능 환경인지 확인"))
-        results['NET-004'] = ng(fmt(f"RW community: {rw_comm[0][:80]}", "RW 미사용", "RW 제거 필요")) if rw_comm else ok(fmt("RO community만 사용", "RW 미사용", "양호"))
-        results['NET-005'] = mc(fmt("D-Link SNMP ACL", "접근 IP 제한", "trusted-host 설정 수동 확인"))
-        results['NET-006'] = mc(fmt("SNMP 활성", "외부 인터페이스 차단", "수동 확인"))
+            rw = False
+        ex = next((c for c in comms if c["name"] == name), None)
+        if ex: ex["rw"] = ex["rw"] or rw
+        else: comms.append({"name": name, "rw": rw, "restricted": None})
+    comms = [c for c in comms if c["name"].lower() not in deleted]
+    tr_hosts = find(r'create\s+trusted_host\s+\S+')
+    for c in comms:
+        c["restricted"] = True if tr_hosts else False
+    # v3: create snmp group <g> v3 [noauth_nopriv|auth_nopriv|auth_priv] ... write_view
+    v3_weak, extra_rw = [], []
+    for s in find(r'create\s+snmp\s+group\s+\S+\s+v3\b'):
+        if not re.search(r'\bauth_priv\b', s, re.I):
+            v3_weak.append(s)
+        if re.search(r'\bwrite_view\s+\S+', s, re.I):
+            extra_rw.append("v3 group 쓰기 view: " + re.sub(r'^create\s+snmp\s+group\s+', '', s, flags=re.I)[:50])
+    has_v3 = bool(find(r'create\s+snmp\s+(user|group)\b'))
+    if snmp_st is False:
+        R.g('NET-003', "SNMP 비활성화(disable snmp)", "SNMP 미사용 또는 v3 사용", "SNMP 비활성")
+        for c in ('NET-004', 'NET-005', 'NET-006'):
+            R.n(c, "SNMP 비활성", "해당 없음", "SNMP 미사용")
     else:
-        results['NET-003'] = ok(fmt("SNMP community 미설정", "SNMP 미사용 시 양호", "SNMP 미사용"))
-        results['NET-004'] = na(fmt("SNMP 미사용", "해당 없음", "N-A"))
-        results['NET-005'] = na(fmt("SNMP 미사용", "해당 없음", "N-A"))
-        results['NET-006'] = na(fmt("SNMP 미사용", "해당 없음", "N-A"))
+        _net_snmp_eval(R, comms, v3_weak, has_v3, extra_rw)
+        if comms and tr_hosts:
+            R.m('NET-005', f"trusted_host {len(tr_hosts)}건 설정 (SNMP 포함 여부는 적용 서비스 확인)", "SNMP 접근을 단일 IP 로 제한", "trusted_host 적용 서비스·대역 수동 확인")
+        sh = find(r'create\s+snmp\s+host\s+\S+')
+        R.m('NET-006', f"SNMP 호스트: {sh[0]}" if sh else "SNMP 호스트(create snmp host) 미설정", "외부 인터페이스 SNMP 차단 / 관리망 한정", "수동 확인")
 
-    # NET-007: 로컬 계정
-    accounts = find_lines(r'create\s+account\s+\S+\s+\S+')
+    # ── 계정·인증 ──
+    accounts = find(r'create\s+account\s+(admin|operator|user|power_user)\s+\S+')
+    names = [re.match(r'create\s+account\s+\S+\s+(\S+)', a, re.I).group(1) for a in accounts]
     if accounts:
-        names = [re.search(r'create\s+account\s+\S+\s+(\S+)', a, re.I).group(1) for a in accounts if re.search(r'create\s+account\s+\S+\s+(\S+)', a, re.I)]
-        results['NET-007'] = mc(fmt(f"로컬 계정 {len(names)}개: {', '.join(names[:5])}", "운영자 1인 1계정, 계정별 권한 적정", "1인 1계정·권한(admin) 적정성 인터뷰 확인"))
+        R.m('NET-007', f"로컬 계정 {len(names)}개: {', '.join(names[:5])}", "운영자 1인 1계정, 계정별 권한 적정", "1인 1계정·권한(admin) 적정성 인터뷰 확인")
     else:
-        results['NET-007'] = ng(fmt("create account 미발견", "Local 사용자 설정", "Local 사용자 미설정"))
-
-    # NET-008: AAA
-    radius = find_lines(r'config\s+radius|config\s+authentication')
-    tacacs = find_lines(r'config\s+tacacs')
-    if radius or tacacs:
-        results['NET-008'] = ok(fmt(f"인증서버: {(radius+tacacs)[0][:60]}", "외부 인증(RADIUS/TACACS)", "인증서버 연동됨"))
+        R.b('NET-007', "create account 미발견", "Local 사용자 설정", "Local 사용자 미설정")
+    auth = find(r'config\s+(radius\s+add|tacacs\s+add|tacacs\+\s+add)') + find(r'create\s+(authen\s+server_host|authen_login)\b')
+    meth = first(r'config\s+authen_login\s+default\s+method\s+.*(radius|tacacs|tacacs\+|xtacacs|server_group)')
+    if auth and meth:
+        R.g('NET-008', f"외부 인증서버 연동: {meth}", "외부 인증(RADIUS/TACACS+)", "인증서버 연동됨")
+    elif auth or meth:
+        R.m('NET-008', f"인증서버 일부 설정: {(auth or [meth])[0]}", "외부 인증(RADIUS/TACACS+)", "인증 방식 목록(config authen_login) 수동 확인")
     else:
-        results['NET-008'] = mc(fmt("RADIUS/TACACS 설정 없음", "외부 인증서버 연동", "로컬 인증 사용 - 수동 확인"))
-
-    # NET-009: 비밀번호 미설정
-    pw_enc = any_m(r'enable\s+password[_\s]+encryption')
-    results['NET-009'] = mc(fmt(f"password encryption={'활성' if pw_enc else '미설정'}", "모든 계정 비밀번호 설정", "수동 확인"))
-
-    # NET-010: enable secret (D-Link는 admin 권한 체계 사용)
-    results['NET-010'] = mc(fmt("D-Link admin/operator/user 권한 체계", "관리자 비밀번호 암호화", f"password encryption={'활성' if pw_enc else '미설정'}"))
-
-    # NET-011: SSH v2
-    # 평가기준: 사용자·관리자 비밀번호 암호화 여부 및 알고리즘 강도 (SSH 는 NET-015)
-    ssh_enabled = any_m(r'enable\s+ssh')
-    if pw_enc:
-        results['NET-011'] = mc(fmt("enable password encryption 설정", "비밀번호 암호화 + 안전한 알고리즘", "암호화 적용 - 저장 알고리즘(펌웨어별) 보안강도 확인"))
+        R.m('NET-008', "RADIUS/TACACS 설정 없음", "외부 인증서버 연동", "로컬 인증 사용 - 수동 확인")
+    pw_st = state(r'enable\s+password[_\s]+encryption\b', r'disable\s+password[_\s]+encryption\b')
+    plain_acc = [a for a in accounts if not re.search(r'\bencrypt\s+(sha_1|md5|sha1)\b', a, re.I)]
+    R.m('NET-009', f"계정 {len(names)}개, password encryption={'활성' if pw_st else ('비활성' if pw_st is False else '설정 없음(기본 비활성)')}",
+        "모든 계정 비밀번호 설정", "계정별 비밀번호 설정 여부 수동 확인")
+    R.m('NET-010', "D-Link admin/operator/user 권한 체계 (enable 비밀번호 개념 없음)", "관리자 비밀번호 암호화", f"password encryption={'활성' if pw_st else '미설정'} - 수동 확인")
+    if pw_st:
+        R.m('NET-011', "enable password encryption 설정", "비밀번호 암호화 + 안전한 알고리즘", "암호화 적용 - 저장 알고리즘(펌웨어별) 보안강도 확인")
     else:
-        results['NET-011'] = ng(fmt("enable password encryption 미설정", "비밀번호 암호화 설정", "비밀번호 평문 저장"))
+        R.b('NET-011', "password encryption " + ("비활성(disable password encryption)" if pw_st is False else "미설정(기본 비활성)"), "비밀번호 암호화 설정", "비밀번호 평문 저장")
+    R.m('NET-012', "D-Link 자체 비밀번호 복잡도 정책 없음", "비밀번호 영문+숫자+특수 8자 이상", "운영 정책 수동 확인")
+    # 접근 제한
+    acp = find(r'(create|config)\s+access_profile')
+    wide_t = [t for t in tr_hosts if re.search(r'/(\d+)$', t) and int(re.search(r'/(\d+)$', t).group(1)) < 32 or re.search(r'\b0\.0\.0\.0\b', t)]
+    if tr_hosts and not wide_t:
+        R.g('NET-013', f"trusted_host {len(tr_hosts)}건: {'; '.join(tr_hosts[:3])}", "관리 접근 IP 제한", "접근 IP 제한 설정됨")
+    elif tr_hosts:
+        R.m('NET-013', f"trusted_host 대역 허용: {wide_t[0]}", "관리 접근 IP 단일 제한", "허용 대역 적정성 수동 확인")
+    elif acp:
+        R.m('NET-013', f"access_profile {len(acp)}건", "관리 접근 IP 제한", "관리용 ACL 여부 수동 확인")
+    else:
+        R.b('NET-013', "create trusted_host / access_profile 설정 없음", "trusted_host 로 관리 접근 IP 제한", "비인가 IP 접근 가능")
+    al = first(r'config\s+serial_port\b.*\bauto_logout\s+\S+') or first(r'config\s+terminal_line\s+\S+\s+auto_logout\s+\S+')
+    if al:
+        m = re.search(r'auto_logout\s+(never|(\d+)(?:_minutes?)?)', al, re.I)
+        mins = 0 if (m and m.group(1).lower() == "never") else int(m.group(2)) if m and m.group(2) else 0
+        if mins == 0: R.b('NET-014', "auto_logout never (무제한)", "15분 이하 타임아웃", "타임아웃 미설정")
+        elif mins <= 15: R.g('NET-014', f"auto_logout {mins}분", "15분 이하 타임아웃", f"{mins}분 설정")
+        else: R.b('NET-014', f"auto_logout {mins}분", "15분 이하", f"{mins}분 - 기준 초과")
+    else:
+        R.m('NET-014', "auto_logout 설정 미발견", "세션 타임아웃 설정", "수동 확인")
+    tn = state(r'enable\s+telnet\b', r'disable\s+telnet\b')
+    ssh = state(r'enable\s+ssh\b', r'disable\s+ssh\b')
+    if tn:
+        tn_line = first(r'enable\s+telnet') or "enable telnet"
+        R.b('NET-015', f"Telnet 활성: {tn_line}", "Telnet 차단(disable telnet), SSH 전용", "평문 접속 허용")
+    elif tn is False:
+        R.g('NET-015', "Telnet 비활성(disable telnet)" + (", SSH 활성" if ssh else ""), "Telnet 차단, SSH 전용", "Telnet 차단됨")
+    else:
+        R.m('NET-015', "Telnet 상태 설정 없음 (장비 기본값 확인 필요)", "SSH 전용 사용", "수동 확인")
+    R.n('NET-016', "D-Link 스위치 AUX 포트 없음", "AUX 포트 비활성화", "해당 없음")
+    svc = []
+    if tn: svc.append("Telnet")
+    web = state(r'enable\s+web\b', r'disable\s+web\b')
+    if web: svc.append("Web관리(HTTP)")
+    if comms: svc.append("SNMP(v1/v2c community)")
+    if find(r'enable\s+dhcp_relay'): svc.append("DHCP_Relay")
+    if svc: R.b('NET-030', f"활성 불필요 서비스 {len(svc)}개 - {', '.join(svc)}", "Telnet/Web/SNMP v1v2c 등 불필요 서비스 비활성화", f"비활성화 필요: {', '.join(svc)}")
+    else: R.g('NET-030', "불필요 서비스 미발견 (Telnet·Web 비활성, SNMP community 없음)", "주요 서비스 비활성화", "기준 명시 서비스 비활성화 확인됨")
+    sn = first(r'config\s+sntp\s+primary\s+\S+') or first(r'config\s+ntp\b.*')
+    sn_on = state(r'enable\s+sntp\b', r'disable\s+sntp\b')
+    if sn and sn_on is not False and (sn_on or sn_on is None):
+        if sn_on: R.g('NET-031', f"SNTP: {sn}", "시간 동기화 설정", "SNTP 설정·활성화됨")
+        else: R.m('NET-031', f"SNTP 서버 지정됨({sn}), enable sntp 명령 없음", "시간 동기화 설정", "SNTP 활성화 여부 수동 확인")
+    elif sn:
+        R.b('NET-031', f"SNTP 서버 지정되었으나 비활성(disable sntp): {sn}", "시간 동기화 설정", "시간 동기화 비활성")
+    else:
+        R.b('NET-031', "SNTP 미설정", "config sntp primary 설정 및 enable sntp", "시간 동기화 없음")
+    sl_st = state(r'enable\s+syslog\b', r'disable\s+syslog\b')
+    sl_hosts = [s for s in find(r'(create|config)\s+syslog\s+host\s+\d+') if not re.search(r'\bstate\s+disable\b', s, re.I)]
+    if sl_st or sl_hosts:
+        R.g('NET-033', f"syslog {'활성' if sl_st else ''} {sl_hosts[0] if sl_hosts else ''}".replace("  ", " ").strip(), "로깅 활성화", "로깅 설정됨")
+    else:
+        R.b('NET-033', "enable syslog / syslog host 미설정", "로깅 활성화", "로깅 미설정")
+    R.m('NET-034', "D-Link syslog 타임스탬프", "로그 시간 기록", "SNTP 설정 시 자동 포함 - 수동 확인")
+    R.m('NET-035', "D-Link 내장 로그 버퍼", "로그 버퍼 크기", "수동 확인")
+    if sl_hosts: R.g('NET-036', f"원격 syslog 서버 {len(sl_hosts)}개: {sl_hosts[0]}", "원격 로그서버 설정", "외부 전송 설정됨")
+    else: R.b('NET-036', "원격 syslog 서버(create syslog host) 미설정", "원격 syslog 서버 설정", "로그 외부 전송 없음")
+    R.m('NET-037', "D-Link 콘솔 로그", "콘솔 로그 레벨", "수동 확인")
+    R.m('NET-050', "D-Link 로그인 배너(login_banner)" if first(r'(config|enable)\s+(greeting_message|login_banner)') else "D-Link 로그인 배너 설정 미발견", "무단 접근 경고 배너", "수동 확인")
+    R.n('NET-051', "D-Link 스위치 TCP keepalive 해당 없음", "TCP keepalive", "L2/L3 스위치 N-A")
+    dp = [p for p in find(r'config\s+ports?\s+[\d,:\-/]+\b.*state\s+disable')]
+    n_ports = len(find(r'config\s+ports?'))
+    R.m('NET-052', f"비활성(state disable) 포트 설정 {len(dp)}건" if dp else f"config ports 설정 {n_ports}건", "미사용 포트 비활성화", "전체 포트 상태 수동 확인")
+    ps = find(r'config\s+port_security\b.*admin_state\s+enable')
+    found, miss = [], []
+    (found if ps else miss).append("port_security")
+    (found if find(r'config\s+traffic_control\b|config\s+storm_control\b') else miss).append("traffic_control")
+    (found if find(r'config\s+loopdetect\b.*state\s+enable|enable\s+loopdetect\b') else miss).append("loopdetect")
+    if find(r'config\s+filter\s+dhcp_server|(enable|config)\s+dhcp_snooping|enable\s+address_binding'): found.append("dhcp_snooping/filter")
+    if find(r'config\s+safeguard_engine\b.*state\s+enable'): found.append("safeguard_engine")
+    summ = f"설정: {', '.join(found) if found else '없음'} | 미설정: {', '.join(miss) if miss else '없음'}"
+    if ps: R.g('NET-054', summ, "스위치 포트 보안 설정", "포트 보안 설정됨")
+    else: R.b('NET-054', summ, "스위치 포트 보안 설정", "포트 보안(port_security) 미설정")
+    w57 = []
+    if state(r'enable\s+lldp\b', r'disable\s+lldp\b'): w57.append("LLDP")
+    if find(r'enable\s+(tftp|finger)\b'): w57.append("TFTP/Finger")
+    if w57: R.b('NET-057', f"활성 취약 서비스: {', '.join(w57)}", "LLDP/TFTP/Finger 등 취약 서비스 비활성화", f"{len(w57)}개 비활성화 필요")
+    else: R.g('NET-057', "LLDP 등 기준 취약 서비스 미사용", "LLDP/TFTP/Finger 등 취약 서비스 비활성화", "양호")
+    la = first(r'config\s+(admin\s+.*login_attempt|account_lockout|max_login_attempt)') or first(r'config\s+authentication.*attempt')
+    if la: R.g('NET-058', la, "로그인 실패 차단", "설정됨")
+    else: R.m('NET-058', "로그인 실패 차단 설정 미발견", "로그인 실패 횟수 제한", "수동 확인")
+    # 접근 제어·ACL
+    acl_rule = find(r'config\s+access_profile\b|config\s+access_rule\b')
+    if acp or acl_rule:
+        n = len(acp) + len(acl_rule)
+        R.m('NET-038', f"access_profile/rule {n}건", "표준 ACL 적용", "ACL 규칙 적정성 수동 확인")
+        R.m('NET-039', f"access_profile/rule {n}건", "확장 ACL 적용", "ACL 규칙 적정성 수동 확인")
+        R.m('NET-040', f"access_profile/rule {n}건", "관리 접근용 ACL 적용", "관리 접근용 ACL 수동 확인")
+    else:
+        R.b('NET-038', "ACL(access_profile) 미설정", "표준 ACL 적용", "ACL 미설정")
+        R.b('NET-039', "ACL(access_profile) 미설정", "확장 ACL 적용", "ACL 미설정")
+        R.m('NET-040', "ACL 미설정 (trusted_host 대체 가능)", "관리 접근 제한", "수동 확인")
+    R.g('NET-041', "IGMP snooping 설정됨", "멀티캐스트 제어", "IGMP snooping 적용") if find(r'(config|enable)\s+igmp_snooping') else \
+        R.m('NET-041', "IGMP snooping 미설정", "멀티캐스트 제어", "수동 확인")
+    for c, nm in (('NET-022', "IP source routing"), ('NET-026', "Proxy ARP"), ('NET-027', "Directed Broadcast"), ('NET-042', "ICMP 차단"),
+                  ('NET-043', "ICMP redirect"), ('NET-044', "ICMP unreachable"), ('NET-045', "ICMP mask-reply"), ('NET-046', "ICMP Timestamp/Information")):
+        R.n(c, f"D-Link L2/L3 스위치 {nm} 항목 해당 없음", nm + " 차단", "해당 없음")
+    dos = find(r'enable\s+dos_prevention\b') + find(r'config\s+dos_prevention\b.*state\s+enable')
+    sg = find(r'config\s+safeguard_engine\b.*state\s+enable') or find(r'enable\s+safeguard_engine\b')
+    if dos or sg:
+        R.g('NET-047', "DDoS 방어: " + ", ".join(x for x, f_ in (("dos_prevention", dos), ("safeguard_engine", sg)) if f_), "DDoS 방어 설정", "설정됨")
+    else:
+        R.b('NET-047', "dos_prevention / safeguard_engine 미설정(또는 state disable)", "DoS 방어(dos_prevention·safeguard_engine) 활성화", "DDoS 방어 미설정")
+    adm = [a for a in accounts if re.match(r'create\s+account\s+admin\b', a, re.I)]
+    opr = [a for a in accounts if re.match(r'create\s+account\s+(operator|user|power_user)\b', a, re.I)]
+    if adm and opr: R.g('NET-049', f"권한 분리: admin={len(adm)}, operator/user={len(opr)}", "명령어 권한 수준 분리", "역할별 계정 설정됨")
+    else: R.m('NET-049', f"계정: admin={len(adm)}, operator/user={len(opr)}", "명령어 권한 수준 분리", "권한 분리 수동 확인")
+    R.m('NET-048', "D-Link 펌웨어 버전", "벤더 최신 펌웨어", "펌웨어 버전 확인 후 벤더 공지 대조 (수동)")
+    return R.r
 
-    # NET-014: 세션 타임아웃
-    auto_logout = fline(r'config\s+terminal_line\s+\S+\s+auto_logout\s+\d+')
-    if auto_logout:
-        m = re.search(r'auto_logout\s+(\d+)', auto_logout, re.I)
-        mins = int(m.group(1)) if m else 0
-        if 0 < mins <= 15:
-            results['NET-014'] = ok(fmt(f"auto_logout {mins}분", "15분 이하 타임아웃", f"{mins}분 설정"))
-        elif mins == 0:
-            results['NET-014'] = ng(fmt("auto_logout 0(무제한)", "15분 이하 설정", "타임아웃 미설정"))
+
+def _nf(actual, criteria, judge):
+    return f"[실제값] {actual} [기준] {criteria} [판단] {judge}"
+
+
+class _NR:
+    """벤더별 판정 수집기 — g/b/n/m = 양호/취약/N-A/수동확인, 문구는 [실제값][기준][판단] 형식"""
+    def __init__(self):
+        self.r = {}
+    def g(self, code, a, c, j): self.r[code] = (RESULT_GOOD, _nf(a, c, j))
+    def b(self, code, a, c, j): self.r[code] = (RESULT_BAD, _nf(a, c, j))
+    def n(self, code, a, c, j): self.r[code] = (RESULT_NA, _nf(a, c, j))
+    def m(self, code, a, c, j): self.r[code] = (RESULT_MANUAL, _nf(a, c, j))
+
+
+def _net_uname(u):
+    m = re.match(r'\s*username\s+(\S+)', u, re.I)
+    return m.group(1) if m else u.split()[0]
+
+
+def _comm_mask(cs):
+    cs = (cs or "").strip('"')
+    return cs[:2] + "***" if len(cs) > 2 else "***"
+
+
+def _comm_weak(cs):
+    """평가기준 복잡도: 영문+숫자 10자 이상 또는 영문+숫자+특수문자 8자 이상"""
+    cs = (cs or "").strip('"')
+    a, d, s = bool(re.search(r'[A-Za-z]', cs)), bool(re.search(r'\d', cs)), bool(re.search(r'[^A-Za-z0-9]', cs))
+    return not (a and d and (len(cs) >= 10 or (s and len(cs) >= 8)))
+
+
+def _net_common_manual(R, vendor_label):
+    """모든 벤더 공통 인터뷰·수동 항목 (벤더 명령 없이 중립 문구)"""
+    R.m('NET-001', "설정 백업 이력 및 NMS 구성", "장비 설정 정기 백업 절차 수립", "인터뷰 및 실사를 통해 백업 주기·보관 현황 확인 필요")
+    R.m('NET-048', f"{vendor_label} 장비 운영 OS/펌웨어 버전", "벤더 보안 권고 버전 사용", "현재 버전 확인 후 벤더 EoL/패치 공지 대조")
+    R.m('NET-056', "비밀번호 변경 이력", "정기적 비밀번호 변경 수행", "변경 주기 및 최근 변경일 인터뷰 확인")
+    R.m('NET-059', f"장비 벤더: {vendor_label}", "벤더 EoL/EoS 기준 지원 종료 이전 장비 사용", "벤더 EoL 페이지 대조 수동 확인 필요")
+
+
+def _net_snmp_eval(R, comms, v3_weak, has_v3, extra_rw=None, acl_items=None):
+    """SNMP NET-003/004/005 공통 판정.
+    comms: [{'name','rw','restricted'(True/False/None),'line'}] / v3_weak: v3 보안레벨 AuthPriv 미적용 설명 목록 / has_v3: v3 사용 여부"""
+    names = [c["name"] for c in comms]
+    rw = [c for c in comms if c.get("rw") and not c.get("trap")] + [{"name": "v3", "label": x} for x in (extra_rw or [])]
+    if v3_weak:
+        R.b('NET-003', f"SNMPv3 보안레벨 AuthPriv 미적용: {v3_weak[0]}", "SNMP v3 사용 시 보안레벨 AuthPriv(priv)", "SNMPv3 noauth/auth 수준 존재 - AuthPriv 적용 필요")
+    elif not comms:
+        if has_v3:
+            R.g('NET-003', "SNMP v3 전용 사용 (community 없음)", "SNMP v3 사용 시 보안레벨 AuthPriv", "SNMP v3 priv 적용됨")
         else:
-            results['NET-014'] = ng(fmt(f"auto_logout {mins}분", "15분 이하", f"{mins}분 - 기준 초과"))
+            R.g('NET-003', "SNMP 미사용 (community 설정 없음)", "SNMP 미사용 시 양호", "SNMP 미사용 확인됨")
     else:
-        results['NET-014'] = mc(fmt("auto_logout 설정 미발견", "세션 타임아웃 설정", "수동 확인"))
-
-    # NET-015: Telnet 차단
-    telnet_disabled = any_m(r'disable\s+telnet')
-    telnet_enabled = any_m(r'enable\s+telnet')
-    if telnet_disabled and not telnet_enabled:
-        results['NET-015'] = ok(fmt("Telnet 비활성(disable telnet)", "Telnet 차단, SSH 전용", "Telnet 차단됨"))
-    elif ssh_enabled and not telnet_enabled:
-        results['NET-015'] = ok(fmt("SSH 활성, Telnet 미활성화", "SSH 전용", "Telnet 미사용"))
-    elif telnet_enabled:
-        results['NET-015'] = ng(fmt("Telnet 활성", "disable telnet + enable ssh", "평문 접속 허용"))
+        known = [c["name"] for c in comms if not c.get("enc")]
+        encs = [c["name"] for c in comms if c.get("enc")]
+        dflt = [n for n in known if n.strip('"').lower() in ("public", "private")]
+        weak = [n for n in known if _comm_weak(n)]
+        if dflt:
+            R.b('NET-003', f"기본 community 사용: {', '.join(_comm_mask(n) for n in dflt[:3])}", "public/private community 미사용", "기본 community 사용 - 즉시 변경 필요")
+        elif weak:
+            R.b('NET-003', f"복잡도 미달 community: {', '.join(_comm_mask(n) + '(' + str(len(n.strip(chr(34)))) + '자)' for n in weak[:3])}",
+                "영문+숫자 10자 이상 또는 영문+숫자+특수 8자 이상 (v3 권고)", "community 복잡도 미달")
+        elif encs:
+            R.m('NET-003', f"암호화 저장된 community {len(encs)}개 (복잡도 판정 불가): {', '.join(_comm_mask(n) for n in encs[:3])}", "community 복잡도", "수동 확인")
+        else:
+            R.m('NET-003', f"v2c community 복잡도 충족: {', '.join(_comm_mask(n) for n in known[:3])}", "SNMP v3 사용 가능한 환경에서 v2 이용 시 취약",
+                "복잡도 충족 - SNMPv3 사용 가능 환경인지 확인 (가능하면 취약)")
+    if rw:
+        R.b('NET-004', f"RW(쓰기) 권한: {', '.join(c.get('label') or _comm_mask(c['name']) for c in rw[:4])}", "SNMP RW(쓰기) 권한 미사용", f"쓰기 권한 {len(rw)}건 - 제거 필요")
+    elif [c for c in comms if not c.get("trap")]:
+        R.g('NET-004', f"읽기 전용(RO) community만 사용 ({len([c for c in comms if not c.get('trap')])}개)", "RW(쓰기) 권한 미사용", "RO 권한만 설정됨")
+    elif has_v3:
+        R.g('NET-004', "SNMP v3 사용 (community 없음, 쓰기 view 없음)", "RW(쓰기) 권한 미사용", "RW 권한 없음")
     else:
-        results['NET-015'] = mc(fmt("Telnet 상태 확인 불가", "SSH 전용 사용", "수동 확인"))
-
-    # NET-016: AUX (D-Link 스위치는 AUX 포트 없음)
-    results['NET-016'] = na(fmt("D-Link 스위치 AUX 포트 없음", "AUX 비활성화", "해당 없음"))
-
-    # NET-030: 불필요 서비스
-    svc_en = []
-    if any_m(r'enable\s+telnet'):   svc_en.append("Telnet")
-    if any_m(r'enable\s+dhcp_relay|config\s+dhcp_relay'): svc_en.append("DHCP_Relay")
-    if any_m(r'config\s+snmp\s+community.*public|config\s+snmp\s+community.*private'):
-        svc_en.append("SNMP(기본community)")
-    if any_m(r'enable\s+web\b|config\s+web\b'):  svc_en.append("Web관리")
-
-    if svc_en:
-        results['NET-030'] = ng(fmt(f"활성 불필요 서비스: {', '.join(svc_en)}", "불필요 서비스 비활성화", f"{len(svc_en)}개 비활성화 필요"))
+        R.n('NET-004', "SNMP 미사용", "해당 없음", "SNMP 미사용")
+    acl_items = [c for c in comms if not c.get("trap")] + list(acl_items or [])
+    lab = lambda c: c.get("label") or _comm_mask(c["name"])
+    if acl_items:
+        unr = [c for c in acl_items if c.get("restricted") is False]
+        unk = [c for c in acl_items if c.get("restricted") is None]
+        if unr:
+            R.b('NET-005', f"접근 IP 제한 없음 또는 대역 허용: {', '.join(lab(c) for c in unr[:3])}", "SNMP 접근을 단일 IP 단위로 제한", f"접근 제한 없는 SNMP 설정 {len(unr)}건")
+        elif unk:
+            R.m('NET-005', f"접근 제한 설정 확인 불가: {', '.join(lab(c) for c in unk[:3])}", "SNMP 접근 단일 IP", "접근 제한 대상·허용 IP 수동 확인")
+        else:
+            R.g('NET-005', f"단일 IP 로 접근 제한된 SNMP 설정 {len(acl_items)}개", "SNMP 접근 단일 IP", "SNMP 접근 IP 단일 호스트로 제한됨 (불필요 IP 여부 확인)")
+    elif has_v3:
+        R.m('NET-005', "SNMPv3 사용 (community 없음)", "SNMP 접근 단일 IP", "v3 사용자의 접근 제한 수동 확인")
     else:
-        results['NET-030'] = ok(fmt("불필요 서비스 미발견", "주요 서비스 비활성화", "양호"))
+        R.n('NET-005', "SNMP 미사용", "해당 없음", "SNMP 미사용")
 
-    # NET-031: NTP/SNTP
-    sntp = find_lines(r'config\s+sntp\s+primary|config\s+sntp\s+secondary|config\s+ntp')
-    if sntp:
-        results['NET-031'] = ok(fmt(f"SNTP: {sntp[0][:60]}", "시간 동기화 설정", "SNTP 설정됨"))
+
+def _net_banner_eval(R, content, label="로그인 배너"):
+    """NET-050 공통: content = 배너 본문 문자열 목록"""
+    content = [c for c in content if c and c.strip()]
+    if not content:
+        R.b('NET-050', f"{label} 미설정", "무단 접근 경고 배너 설정", "배너 미설정 - 불법 접근 시 법적 효력 없음")
+        return
+    bc = content[0]
+    exposed = re.search(r'\b(IOS|NX-OS|JunOS|Junos|ACOS|Version)\b|\d+\.\d+\(\d+\)', " ".join(content))
+    if exposed:
+        R.b('NET-050', f"배너 내용: \"{bc[:80]}\"", "경고 배너, 서비스명·버전 정보 미노출", f"배너에 버전 정보 노출 ({exposed.group(0)})")
+    elif re.search(r'authorized|unauthorized|warning|법적|불법|경고|허가', bc, re.I):
+        R.g('NET-050', f"배너 내용: \"{bc[:80]}\"", "무단 접근 경고 문구 포함 배너", "경고 배너 설정됨 - 법적 보호 근거 확보")
     else:
-        results['NET-031'] = ng(fmt("SNTP 미설정", "config sntp primary [IP]", "시간 동기화 없음"))
+        R.m('NET-050', f"배너 존재하나 경고 문구 미포함: \"{bc[:60]}\"", "무단 접근 경고 문구 필요", "배너 있으나 경고 문구 없음 - 내용 보완 필요")
 
-    # NET-033: 로깅
-    syslog_enabled = any_m(r'enable\s+syslog')
-    syslog_host = find_lines(r'config\s+syslog\s+host\s+\d+\s+ipaddress')
-    if syslog_enabled or syslog_host:
-        results['NET-033'] = ok(fmt(f"syslog {'활성' if syslog_enabled else ''} {syslog_host[0][:60] if syslog_host else ''}", "로깅 활성화", "로깅 설정됨"))
+
+def _acl_src_wide(rest):
+    """ACL 항목 본문에서 출발지가 단일 IP(host·/32·와일드카드 0.0.0.0)가 아닌지 → True 면 any·대역"""
+    toks = rest.split()
+    if toks and toks[0].lower() in ("ip", "ipv4", "tcp", "udp", "icmp", "eigrp", "ospf", "gre", "esp", "ahp", "pim", "igmp"):
+        toks = toks[1:]
+    if not toks:
+        return True
+    t0 = toks[0].lower()
+    if t0.startswith("any"):
+        return True
+    if t0 == "host":
+        return False
+    m = re.match(r'(\d+\.\d+\.\d+\.\d+)/(\d+)$', toks[0])
+    if m:
+        return int(m.group(2)) < 32
+    if re.match(r'\d+\.\d+\.\d+\.\d+$', toks[0]):
+        if len(toks) > 1 and re.match(r'\d+\.\d+\.\d+\.\d+$', toks[1]):
+            return toks[1] != "0.0.0.0"
+        return False
+    return False
+
+
+def _acl_host_only_entries(entries):
+    """[(action, text)] 중 permit 이 모두 단일 IP 출발지인지 → (bool, 넓은 항목 목록)"""
+    wide = [rest for act, rest in entries if act == "permit" and _acl_src_wide(rest)]
+    return (not wide), wide
+
+
+def _junos_to_set(lines):
+    """JunOS 계층형(show configuration) → set 형식 줄 목록 (set 형식이면 그대로)"""
+    if any(re.match(r'\s*set\s+', l) for l in lines):
+        return [l.strip() for l in lines if re.match(r'\s*set\s+', l)]
+    out, stack = [], []
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith(("#", "/*", "*/", "*")):
+            continue
+        s = re.sub(r'\s+##.*$', '', s).strip()
+        if s.startswith(("inactive:", "protect:")):
+            s = s.split(":", 1)[1].strip() if s.startswith("protect:") else ""
+            if not s:
+                continue
+        if s.endswith("{"):
+            stack.append(s[:-1].strip()); continue
+        if s == "}":
+            if stack: stack.pop()
+            continue
+        if s.endswith(";"):
+            s = s[:-1].strip()
+        m = re.match(r'^(.*?)\s*\[\s*(.*?)\s*\]$', s)
+        if m:
+            for it in m.group(2).split():
+                out.append("set " + " ".join(stack + [m.group(1), it]).strip())
+        else:
+            out.append("set " + " ".join(stack + [s]))
+    return out
+
+
+def _net_asa_checks(lines, text):
+    """Cisco ASA — 설정 문법(snmp-server host/ssh·telnet·http <IP> <마스크> <if>/sysopt/aaa authentication ... console 등) 전용 판정"""
+    L = [l.rstrip() for l in lines if l.strip() and not l.lstrip().startswith(("!", ":"))]
+    S = [l.strip() for l in L]
+    R = _NR()
+
+    def find(pat):
+        return [s for s in S if re.match(pat, s, re.I)]
+    def first(pat):
+        r = find(pat)
+        return r[0] if r else None
+
+    _net_common_manual(R, "Cisco ASA")
+    # 인터페이스: nameif / security-level / ip
+    ifs, cur = [], None
+    for l in L:
+        m = re.match(r'interface\s+(\S+)', l, re.I)
+        if m:
+            cur = {"hw": m.group(1), "nameif": None, "level": None, "ip": False, "shut": False}; ifs.append(cur); continue
+        if cur is not None and re.match(r'^\s', l):
+            s = l.strip()
+            mm = re.match(r'nameif\s+(\S+)', s, re.I)
+            if mm: cur["nameif"] = mm.group(1)
+            mm = re.match(r'security-level\s+(\d+)', s, re.I)
+            if mm: cur["level"] = int(mm.group(1))
+            if re.match(r'ip address\s+\d', s, re.I): cur["ip"] = True
+            if re.match(r'shutdown\b', s, re.I): cur["shut"] = True
+        elif cur is not None:
+            cur = None
+    named = [i for i in ifs if i["nameif"]]
+    ext = [i["nameif"] for i in named if i["level"] == 0 or re.match(r'(outside|untrust|internet|wan|ext)', i["nameif"], re.I)]
+
+    # ── SNMP ──
+    comms, v3_weak, hosts = [], [], []
+    host_lines = find(r'snmp-server\s+host\s+')
+    for s in host_lines:
+        m = re.match(r'snmp-server\s+host\s+(\S+)\s+(\S+)(.*)$', s, re.I)
+        if m:
+            hosts.append((m.group(1), m.group(2), m.group(3)))
+    single_hosts = [h for h in hosts if not re.match(r'0\.0\.0\.0$', h[1])]
+    for s in find(r'snmp-server\s+community\s+'):
+        m = re.match(r'snmp-server\s+community\s+(?:\d\s+)?(\S+)', s, re.I)
+        if m:
+            comms.append({"name": m.group(1), "rw": False, "restricted": (True if single_hosts else None)})
+    for h in hosts:
+        mc_ = re.search(r'\bcommunity\s+(\S+)', h[2], re.I)
+        if mc_ and mc_.group(1) not in [c["name"] for c in comms]:
+            comms.append({"name": mc_.group(1), "rw": False, "restricted": True})
+    for s in find(r'snmp-server\s+group\s+\S+\s+v3'):
+        if not re.search(r'\bv3\s+priv\b', s, re.I):
+            v3_weak.append(s)
+    has_v3 = bool(find(r'snmp-server\s+(group|user)\s+') or any(re.search(r'version\s+3', h[2], re.I) for h in hosts))
+    _net_snmp_eval(R, comms, v3_weak, has_v3)
+    # ASA SNMP 는 읽기 전용 — 쓰기 권한 설정이 불가함을 근거에 명시
+    if R.r['NET-004'][0] == RESULT_GOOD and comms:
+        R.g('NET-004', f"ASA SNMP v1/v2c 는 읽기 전용(쓰기 불가), community {len(comms)}개", "RW(쓰기) 권한 미사용", "RO 권한만 동작")
+    if not comms and not has_v3:
+        pass
+    elif hosts:
+        outside_h = [h for h in hosts if h[0].lower() in [e.lower() for e in ext]]
+        if outside_h:
+            R.b('NET-006', f"외부 인터페이스({outside_h[0][0]})로 SNMP 호스트 허용: snmp-server host {outside_h[0][0]} {outside_h[0][1]}", "외부 인터페이스 SNMP 차단", "외부 구간 SNMP 노출 - 내부 인터페이스로 제한 필요")
+        else:
+            R.g('NET-006', f"SNMP 호스트 {len(hosts)}건 모두 내부 인터페이스: {', '.join(h[0] for h in hosts[:3])}", "외부 인터페이스 SNMP 차단", "외부 SNMP 접근 없음")
     else:
-        results['NET-033'] = ng(fmt("syslog 미설정", "enable syslog + config syslog host", "로깅 미설정"))
+        R.m('NET-006', "snmp-server host 미설정", "외부 인터페이스 SNMP 차단", "수동 확인")
 
-    # NET-034: 타임스탬프
-    results['NET-034'] = mc(fmt("D-Link syslog 타임스탬프", "로그 시간 기록", "SNTP 설정 시 자동 포함 - 수동 확인"))
-
-    # NET-035: 로그 버퍼
-    results['NET-035'] = mc(fmt("D-Link 내장 로그 버퍼", "로그 버퍼 크기", "수동 확인"))
-
-    # NET-036: 원격 로그서버
-    if syslog_host:
-        results['NET-036'] = ok(fmt(f"원격 syslog: {syslog_host[0][:60]}", "원격 로그서버 설정", "외부 전송 설정됨"))
+    # ── 계정·인증 ──
+    users = find(r'username\s+\S+')
+    if users:
+        R.m('NET-007', f"로컬 계정 {len(users)}개: {', '.join(_net_uname(u) for u in users[:5])}",
+            "운영자 1인 1계정, 계정별 권한 적정", "1인 1계정·권한(privilege 15) 적정성 인터뷰 확인")
     else:
-        results['NET-036'] = ng(fmt("syslog host 미설정", "원격 syslog 서버 설정", "로그 외부 전송 없음"))
-
-    # NET-037: 콘솔 로깅
-    results['NET-037'] = mc(fmt("D-Link 콘솔 로그", "콘솔 로그 레벨", "수동 확인"))
-
-    # NET-048: 보안패치
-    results['NET-048'] = mc(fmt("D-Link 펌웨어 버전", "벤더 최신 펌웨어", "show switch 또는 show firmware 수동 확인"))
-
-    # NET-050: 배너
-    results['NET-050'] = mc(fmt("D-Link 로그인 배너", "무단 접근 경고 배너", "수동 확인"))
-
-    # NET-051: TCP keepalive (D-Link N-A)
-    results['NET-051'] = na(fmt("D-Link 스위치 TCP keepalive 해당 없음", "TCP keepalive", "L2/L3 스위치 N-A"))
-
-    # NET-052: 미사용 인터페이스
-    disabled_ports = find_lines(r'config\s+ports?\s+[\d,-]+\s+.*state\s+disable')
-    all_ports = find_lines(r'config\s+ports?\s+[\d,-]+')
-    if disabled_ports:
-        results['NET-052'] = mc(fmt(f"비활성 포트 설정 {len(disabled_ports)}건 발견", "미사용 인터페이스 shutdown", "포트 상태 수동 확인"))
+        R.b('NET-007', "로컬 계정(username) 미발견", "Local 사용자 설정", "Local 사용자 미설정")
+    aaa_c = find(r'aaa\s+authentication\s+(ssh|telnet|http|serial|enable)\s+console\s+\S+')
+    aaa_srv = find(r'aaa-server\s+\S+\s+protocol\s+(tacacs\+|radius|ldap|kerberos)')
+    if aaa_c and (aaa_srv or any(not re.search(r'\bLOCAL\b', a, re.I) for a in aaa_c)):
+        R.g('NET-008', f"{aaa_c[0]}" + (f" / {aaa_srv[0]}" if aaa_srv else ""), "AAA + 외부 인증서버(TACACS/RADIUS)", "중앙 집중 인증 적용됨")
+    elif aaa_c:
+        R.g('NET-008', f"{aaa_c[0]} (로컬 DB 인증, 외부 인증서버 없음)", "AAA 인증 설정 또는 별도 인증서버", "AAA 인증 설정됨 (로컬 DB 인증)")
     else:
-        results['NET-052'] = mc(fmt(f"config ports 설정 {len(all_ports)}건", "미사용 포트 비활성화", "전체 포트 상태 수동 확인"))
-
-    # NET-054: 스위치 보안
-    missing_54 = []; found_54 = []
-    if any_m(r'config\s+port_security'):
-        found_54.append("port_security")
+        R.b('NET-008', "aaa authentication ... console 미설정", "AAA 인증 체계 적용", "관리 접속 AAA 미적용 - 중앙 인증 미적용")
+    nopw = find(r'username\s+\S+\s+nopassword')
+    if nopw:
+        R.b('NET-009', f"비밀번호 없는 계정: {', '.join(_net_uname(u) for u in nopw)}", "계정별 비밀번호 설정", f"비밀번호 미설정 {len(nopw)}건")
     else:
-        missing_54.append("port_security")
-    if any_m(r'config\s+traffic_control|config\s+storm_control'):
-        found_54.append("traffic_control/storm_control")
+        R.m('NET-009', f"계정 {len(users)}개 모두 비밀번호 설정", "계정·모드별 비밀번호 설정 및 중복 사용 금지", "미설정 없음 - 사용자·관리자 비밀번호 중복 인터뷰 확인")
+    en = first(r'enable\s+password\s+\S+')
+    if en:
+        R.g('NET-010', "enable password 설정 (ASA 는 해시로 저장)", "enable 비밀번호 설정", "enable 비밀번호 설정됨")
     else:
-        missing_54.append("traffic_control")
-    if any_m(r'config\s+loopback_detection'):
-        found_54.append("loopback_detection")
-    else:
-        missing_54.append("loopback_detection")
-    if any_m(r'config\s+filter\s+dhcp_server|config\s+dhcp_snooping'):
-        found_54.append("dhcp_snooping/filter")
-    if any_m(r'config\s+safeguard_engine'):
-        found_54.append("safeguard_engine")
-    if any_m(r'config\s+stp\s+.*fbpdu\s+enable|bpdu'):
-        found_54.append("bpdu_protection")
-
-    summary = f"설정: {', '.join(found_54) if found_54 else '없음'} | 미설정: {', '.join(missing_54) if missing_54 else '없음'}"
-    # 평가기준: 포트 보안 미설정 시 취약 (traffic_control·loopback_detection 등은 참고)
-    if "port_security" in found_54:
-        results['NET-054'] = ok(fmt(summary, "스위치 포트 보안 설정", "포트 보안 설정됨"))
-    else:
-        results['NET-054'] = ng(fmt(summary, "스위치 포트 보안 설정", "포트 보안(port_security) 미설정"))
-
-    # NET-056: 비밀번호 변경 주기
-    results['NET-056'] = mc(fmt("비밀번호 변경 이력", "정기적 변경", "인터뷰 확인"))
-
-    # NET-057: 취약 서비스
-    # 평가기준 목록: CDP, LLDP, TFTP, Finger, identd, Smart Install (Telnet/HTTP 는 NET-015/030)
-    weak = []
-    if any_m(r'^\s*enable\s+lldp\b'): weak.append("LLDP")
+        R.b('NET-010', "enable password 미설정 (ASA 기본 빈 값)", "enable 비밀번호 설정 필수", "enable 접근 무인증 - 즉시 설정 필요")
+    weak, strong = [], []
+    for s in users + ([en] if en else []):
+        if re.match(r'username\s+\S+\s+nopassword', s, re.I):
+            continue
+        who = re.match(r'(username\s+\S+|enable)', s, re.I).group(1)
+        if re.search(r'\bpbkdf2\b|\$sha512\$', s, re.I):
+            strong.append(f"{who}: pbkdf2")
+        elif re.search(r'\bnt-encrypted\b', s, re.I):
+            weak.append(f"{who}: nt-encrypted(MD4)")
+        elif re.search(r'\bencrypted\b', s, re.I):
+            weak.append(f"{who}: MD5 해시(encrypted)")
+        else:
+            weak.append(f"{who}: 평문")
     if weak:
-        results['NET-057'] = ng(fmt(f"활성 취약 서비스: {', '.join(weak)}", "CDP/LLDP/TFTP/Finger/identd/Smart Install 비활성화", f"{len(weak)}개 비활성화 필요"))
+        R.b('NET-011', "; ".join(weak[:5]), "비밀번호 안전한 알고리즘(pbkdf2) 암호화", f"평문 또는 보안강도 낮은 알고리즘 {len(weak)}건")
+    elif strong:
+        R.g('NET-011', "; ".join(strong[:5]), "비밀번호 안전한 알고리즘(pbkdf2) 암호화", "모든 비밀번호 pbkdf2 적용")
     else:
-        results['NET-057'] = ok(fmt("LLDP 등 기준 취약 서비스 미사용", "CDP/LLDP/TFTP/Finger/identd/Smart Install 비활성화", "양호"))
-
-    # NET-058: 계정 잠금
-    login_attempt = fline(r'config\s+admin\s+.*login_attempt|config\s+authentication.*attempt')
-    if login_attempt:
-        results['NET-058'] = ok(fmt(f"{login_attempt[:60]}", "로그인 실패 차단", "설정됨"))
+        R.m('NET-011', "ASA 비밀번호 저장 방식", "안전한 암호 알고리즘", "비밀번호 해시 알고리즘 수동 확인")
+    pl = first(r'password-policy\s+minimum-length\s+\d+')
+    if pl:
+        nv = int(re.search(r'(\d+)\s*$', pl).group(1))
+        (R.m if nv >= 8 else R.b)('NET-012', pl, "영문·숫자·특수문자 혼합 8자 이상", f"최소 {nv}자 정책 - 실제 비밀번호 복잡성(크랙) 확인 필요" if nv >= 8 else f"최소 {nv}자 - 8자 이상 설정 필요")
     else:
-        results['NET-058'] = mc(fmt("로그인 실패 차단 설정 미발견", "로그인 실패 횟수 제한", "수동 확인"))
+        R.m('NET-012', "password-policy minimum-length 미설정", "비밀번호 복잡도 정책 적용", "복잡도 설정 수동 확인 (AAA 서버 정책 포함)")
 
-    # NET-012: 비밀번호 복잡도 (D-Link는 자체 복잡도 정책 미지원)
-    results['NET-012'] = mc(fmt("D-Link 자체 비밀번호 복잡도 정책 없음", "비밀번호 영문+숫자+특수 8자 이상", "운영 정책 수동 확인"))
-
-    # NET-013: 접근 IP 제한 (D-Link trusted host / access_profile)
-    trusted_host = find_lines(r'config\s+admin\s+.*trusted_host|config\s+trusted_host')
-    access_prof = find_lines(r'config\s+access_profile')
-    if trusted_host:
-        results['NET-013'] = ok(fmt(f"trusted_host: {trusted_host[0][:60]}", "관리 접근 IP 제한", "접근 IP 제한 설정됨"))
-    elif access_prof:
-        results['NET-013'] = mc(fmt(f"access_profile {len(access_prof)}건", "관리 접근 IP 제한", "관리용 ACL 여부 수동 확인"))
+    # ── 원격 관리 접속 (ssh/telnet/http <IP> <mask> <if>) ──
+    acc = []
+    for s in S:
+        m = re.match(r'(ssh|telnet|http)\s+(\d+\.\d+\.\d+\.\d+|\S+:\S*)\s+(\d+\.\d+\.\d+\.\d+|\d+)\s+(\S+)\s*$', s, re.I)
+        if m and not re.match(r'(version|timeout|key-exchange|cipher|scopy|stricthostkeycheck|server)', m.group(2), re.I):
+            acc.append((m.group(1).lower(), m.group(2), m.group(3), m.group(4)))
+    http_on = bool(first(r'http\s+server\s+enable'))
+    acc = [a for a in acc if a[0] != "http" or http_on]
+    wide = [a for a in acc if a[2] in ("0.0.0.0", "0") or a[1] in ("0.0.0.0", "::")]
+    band = [a for a in acc if a not in wide and a[2] not in ("255.255.255.255", "128")]
+    if wide:
+        R.b('NET-013', f"관리 접속 전체 허용: {'; '.join(f'{a[0]} {a[1]} {a[2]} {a[3]}' for a in wide[:3])}", "관리 접속(ssh/telnet/http)을 지정된 최소 IP 로 제한", "모든 IP 에서 원격 관리 접속 가능")
+    elif band:
+        R.m('NET-013', f"대역 허용: {'; '.join(f'{a[0]} {a[1]} {a[2]} {a[3]}' for a in band[:3])}", "관리 접속 단일 IP 제한", "허용 대역 적정성 수동 확인")
+    elif acc:
+        R.g('NET-013', f"관리 접속 허용 IP {len(acc)}건 모두 단일 호스트: {'; '.join(f'{a[0]} {a[1]} {a[3]}' for a in acc[:4])}", "관리 접속을 지정된 최소 IP 로 제한", "단일 IP 로 제한됨")
     else:
-        results['NET-013'] = ng(fmt("접근 IP 제한 설정 없음", "trusted_host 설정", "비인가 IP 접근 가능"))
-
-    # NET-022: IP Source Routing (L2 스위치 해당 없음)
-    if any_m(r'config\s+route\s+.*source|ip\s+source.?route'):
-        results['NET-022'] = ng(fmt("source routing 관련 설정 발견", "IP source routing 차단", "source routing 비활성화 필요"))
+        R.g('NET-013', "ssh/telnet/http 관리 접속 허용 설정 없음 (ASA 기본 차단)", "관리 접속 IP 제한", "원격 관리 접속 불가 - 양호")
+    # 세션 타임아웃 (분): console 기본 0(무제한), ssh/telnet 기본 5
+    def tmo(kind, default):
+        r = first(kind + r'\s+timeout\s+\d+')
+        return (int(re.search(r'(\d+)\s*$', r).group(1)), True) if r else (default, False)
+    bad_t, ok_t = [], []
+    for kind, dflt, active in (("console", 0, True), ("ssh", 5, any(a[0] == "ssh" for a in acc)), ("telnet", 5, any(a[0] == "telnet" for a in acc))):
+        if not active:
+            continue
+        v, explicit = tmo(kind, dflt)
+        tag = f"{kind} timeout {v}분" + ("" if explicit else "(기본값)")
+        (bad_t if (v == 0 or v > 15) else ok_t).append(tag + (" 무제한" if v == 0 else ""))
+    if bad_t:
+        R.b('NET-014', f"타임아웃 미흡: {'; '.join(bad_t)}", "세션 타임아웃 15분 이하", "타임아웃 초과/무제한 접속 방식 존재")
     else:
-        results['NET-022'] = na(fmt("D-Link L2/L3 스위치 source routing 해당 없음", "IP source routing 차단", "해당 없음"))
-
-    # NET-026: Proxy ARP
-    if any_m(r'proxy.?arp|ip\s+proxy'):
-        results['NET-026'] = ng(fmt("Proxy ARP 관련 설정 발견", "Proxy ARP 비활성화", "비활성화 필요"))
+        R.g('NET-014', '; '.join(ok_t), "세션 타임아웃 15분 이하", "모든 관리 접속 타임아웃 기준 충족")
+    tn = [a for a in acc if a[0] == "telnet"]
+    ssh1 = first(r'ssh\s+version\s+1\s*$')
+    if tn or ssh1:
+        R.b('NET-015', "; ".join(([f"Telnet 접속 허용: telnet {tn[0][1]} {tn[0][2]} {tn[0][3]}"] if tn else []) + ([f"SSH v1 허용: {ssh1}"] if ssh1 else [])),
+            "SSH(v2) 전용 접속", "평문 접속 또는 취약 SSH 버전 허용")
     else:
-        results['NET-026'] = na(fmt("D-Link 스위치 Proxy ARP 해당 없음", "Proxy ARP 비활성화", "해당 없음"))
-
-    # NET-027: Directed Broadcast
-    if any_m(r'directed.?broadcast'):
-        results['NET-027'] = ng(fmt("directed broadcast 관련 설정 발견", "Directed Broadcast 차단", "비활성화 필요"))
+        R.g('NET-015', "Telnet 접속 허용 설정 없음, SSH v1 미사용" + (" (ssh version 2)" if first(r'ssh\s+version\s+2') else ""), "SSH(v2) 전용 접속", "SSH 전용")
+    R.n('NET-016', "ASA 는 AUX 포트가 없음", "AUX 포트 비활성화", "해당 없음")
+    R.n('NET-022', "ASA 는 IP 소스라우팅 패킷을 처리하지 않음", "IP source routing 차단", "해당 없음")
+    R.n('NET-027', "ASA 는 directed-broadcast 전달 기능이 없음", "Directed Broadcast 차단", "해당 없음")
+    R.n('NET-043', "ASA ICMP redirect 송신 설정 해당 없음", "ICMP Redirect 차단", "해당 없음")
+    R.n('NET-045', "ASA ICMP mask-reply 설정 해당 없음", "ICMP Mask Reply 차단", "해당 없음")
+    R.n('NET-051', "ASA TCP keepalive 설정 해당 없음", "TCP keepalive 설정", "해당 없음")
+    R.n('NET-054', "ASA 는 스위치 포트 보안 대상 아님", "스위치 포트 보안 설정", "해당 없음")
+    # Proxy ARP (sysopt noproxyarp <if>)
+    nopa = {m.group(1).lower() for s in S for m in [re.match(r'sysopt\s+noproxyarp\s+(\S+)', s, re.I)] if m}
+    need = [i["nameif"] for i in named if i["ip"] and not i["shut"]]
+    miss = [n for n in need if n.lower() not in nopa]
+    if not need:
+        R.n('NET-026', "IP 가 설정된 nameif 인터페이스 없음", "Proxy ARP 비활성화", "해당 없음")
+    elif miss:
+        R.b('NET-026', f"sysopt noproxyarp 미설정(기본 Proxy ARP 허용): {', '.join(miss)}", "모든 인터페이스 sysopt noproxyarp", f"{len(miss)}개 인터페이스 Proxy ARP 허용")
     else:
-        results['NET-027'] = na(fmt("D-Link 스위치 Directed Broadcast 해당 없음", "Directed Broadcast 차단", "해당 없음"))
+        R.g('NET-026', f"sysopt noproxyarp: {', '.join(need)}", "모든 인터페이스 sysopt noproxyarp", "Proxy ARP 전체 차단됨")
 
-    # NET-038~040: ACL 필터링
-    acl_profile = find_lines(r'create\s+access_profile|config\s+access_profile')
-    acl_rule = find_lines(r'config\s+access_rule')
-    if acl_profile or acl_rule:
-        acl_count = len(acl_profile) + len(acl_rule)
-        results['NET-038'] = mc(fmt(f"access_profile/rule {acl_count}건", "표준 ACL 적용", "ACL 규칙 적정성 수동 확인"))
-        results['NET-039'] = mc(fmt(f"access_profile/rule {acl_count}건", "확장 ACL 적용", "ACL 규칙 적정성 수동 확인"))
-        results['NET-040'] = mc(fmt(f"access_profile/rule {acl_count}건", "VTY ACL 적용", "관리 접근용 ACL 수동 확인"))
+    # ── 불필요 서비스 ──
+    svc = []
+    if http_on: svc.append("HTTP(ASDM) 서버")
+    if tn: svc.append("Telnet")
+    dh = first(r'dhcpd\s+enable\s+\S+')
+    if dh: svc.append(f"DHCP 서버({dh})")
+    if comms: svc.append("SNMP(v1/v2c)")
+    if svc:
+        R.b('NET-030', f"활성 불필요 서비스 {len(svc)}개 - {'; '.join(svc)}", "SNMP-v1v2/HTTP(ASDM)/Telnet/DHCP 등 불필요 서비스 비활성화", f"비활성화 필요: {', '.join(svc)}")
     else:
-        results['NET-038'] = ng(fmt("ACL(access_profile) 미설정", "표준 ACL 적용", "ACL 미설정"))
-        results['NET-039'] = ng(fmt("ACL(access_profile) 미설정", "확장 ACL 적용", "ACL 미설정"))
-        results['NET-040'] = mc(fmt("ACL 미설정 (trusted_host 대체 가능)", "VTY 접근제한", "수동 확인"))
+        R.g('NET-030', "불필요 서비스 미발견 (HTTP·Telnet·DHCP 서버·SNMP v1/v2c 비활성)", "주요 불필요 서비스 전체 비활성화", "기준 명시 서비스 비활성화 확인됨")
+    ntp = find(r'ntp\s+server\s+\S+')
+    if ntp: R.g('NET-031', f"NTP 서버: {ntp[0]}", "NTP 서버 동기화 설정", f"NTP {len(ntp)}개 서버 설정됨")
+    else: R.b('NET-031', "NTP 서버 미설정", "ntp server 설정", "시간 동기화 미설정 - 로그 시간 신뢰도 저하")
 
-    # NET-041: Multicast (IGMP snooping)
-    igmp = any_m(r'config\s+igmp_snooping|enable\s+igmp_snooping')
-    if igmp:
-        results['NET-041'] = ok(fmt("IGMP snooping 설정됨", "멀티캐스트 제어", "IGMP snooping 적용"))
+    # ── 로깅 ──
+    if first(r'logging\s+enable\b'):
+        trap_l = first(r'logging\s+trap\s+\S+') or "trap 레벨 미지정"
+        R.g('NET-033', f"logging enable ({trap_l})", "로깅 활성화", "ASA 로깅 활성화됨")
     else:
-        results['NET-041'] = mc(fmt("IGMP snooping 미설정", "멀티캐스트 제어", "수동 확인"))
-
-    # NET-042~046: ICMP 관련 (L2 스위치 해당 없음)
-    results['NET-042'] = na(fmt("D-Link L2 스위치 ICMP 차단 해당 없음", "ICMP 차단", "해당 없음"))
-    results['NET-043'] = na(fmt("D-Link L2 스위치 ICMP redirect 해당 없음", "ICMP Redirect 차단", "해당 없음"))
-    results['NET-044'] = na(fmt("D-Link L2 스위치 ICMP unreachable 해당 없음", "ICMP Unreachable 차단", "해당 없음"))
-    results['NET-045'] = na(fmt("D-Link L2 스위치 ICMP mask-reply 해당 없음", "ICMP Mask Reply 차단", "해당 없음"))
-    results['NET-046'] = na(fmt("D-Link L2 스위치 ICMP Timestamp/Information 해당 없음", "ICMP Timestamp 차단", "해당 없음"))
-
-    # NET-047: DDoS 방어 (safeguard_engine / dos_prevention)
-    dos_prevention = any_m(r'config\s+dos_prevention|enable\s+dos_prevention')
-    safeguard = any_m(r'config\s+safeguard_engine|enable\s+safeguard_engine')
-    if dos_prevention or safeguard:
-        found_dos = []
-        if dos_prevention: found_dos.append("dos_prevention")
-        if safeguard: found_dos.append("safeguard_engine")
-        results['NET-047'] = ok(fmt(f"DDoS 방어: {', '.join(found_dos)}", "DDoS 방어 설정", "설정됨"))
+        R.b('NET-033', "logging enable 미설정" + (" (no logging enable)" if first(r'no\s+logging\s+enable') else ""), "로깅 활성화", "ASA 로깅 비활성화됨")
+    ts = first(r'logging\s+timestamp\b')
+    if ts: R.g('NET-034', ts, "로그 타임스탬프 설정", "ASA 로그 시간 포함됨")
+    else: R.b('NET-034', "logging timestamp 미설정", "로그 타임스탬프 설정", "ASA 로그 시간 미포함")
+    bs = first(r'logging\s+buffer-size\s+\d+') or first(r'logging\s+buffered\b')
+    if bs: R.g('NET-035', bs, "로깅 버퍼 설정", f"로깅 버퍼 설정됨")
+    else: R.b('NET-035', "logging buffer-size / logging buffered 미설정", "로깅 버퍼 설정", "버퍼 로그 미설정 - 메모리 로그 없음")
+    lh = find(r'logging\s+host\s+\S+\s+\S+')
+    if lh: R.g('NET-036', f"원격 로그서버 {len(lh)}개: {'; '.join(lh[:3])}", "원격 syslog 서버 설정 (SIEM 연동)", f"로그서버 {len(lh)}개 설정됨 - 외부 전송 가능")
+    else: R.b('NET-036', "logging host 미설정", "원격 syslog 서버 설정", "로그 외부 전송 없음 - 장비 손상 시 로그 유실 위험")
+    lc = first(r'logging\s+console\s+\S+')
+    if not lc:
+        R.g('NET-037', "logging console 미설정 (ASA 기본: 콘솔 로깅 비활성)", "콘솔 로깅 중지 또는 critical 이상", "콘솔 로깅 중지")
     else:
-        results['NET-047'] = ng(fmt("DoS prevention/safeguard 미설정", "config dos_prevention / safeguard_engine", "DDoS 방어 미설정"))
+        lv = lc.split()[-1].lower()
+        if lv in ("emergencies", "alerts", "critical", "0", "1", "2"):
+            R.g('NET-037', lc, "콘솔 로깅 중지 또는 critical 이상", f"콘솔 로그 레벨 {lv}")
+        else:
+            R.b('NET-037', lc, "콘솔 로깅 중지 또는 critical 이상", f"콘솔 로그 레벨 {lv} - 불필요한 콘솔 로깅")
 
-    # NET-049: 명령어 권한 수준
-    admin_acc = find_lines(r'create\s+account\s+admin\b')
-    oper_acc = find_lines(r'create\s+account\s+operator\b')
-    user_acc = find_lines(r'create\s+account\s+user\b')
-    priv_info = f"admin={len(admin_acc)}, operator={len(oper_acc)}, user={len(user_acc)}"
-    if admin_acc and (oper_acc or user_acc):
-        results['NET-049'] = ok(fmt(f"권한 분리: {priv_info}", "명령어 권한 수준 분리", "역할별 계정 설정됨"))
+    # ── 외부 인터페이스 필터 ──
+    def acl_lines(name):
+        return [s for s in S if re.match(r'access-list\s+' + re.escape(name) + r'\s+', s, re.I)]
+    ag = {}
+    for s in S:
+        m = re.match(r'access-group\s+(\S+)\s+(in|out)\s+interface\s+(\S+)', s, re.I)
+        if m: ag[(m.group(3).lower(), m.group(2).lower())] = m.group(1)
+    ext_in = [(e, ag[(e.lower(), "in")]) for e in ext if (e.lower(), "in") in ag]
+    ext_acl_txt = []
+    for e, a in ext_in: ext_acl_txt += acl_lines(a)
+    anyany = [x for x in ext_acl_txt if re.search(r'\bpermit\s+ip\s+any4?\s+any4?\b', x, re.I)]
+    if anyany:
+        R.b('NET-038', f"외부 인터페이스 인바운드 ACL 에 전체 허용: {anyany[0]}", "외부 인터페이스 ingress 필터(bogon/RFC1918 차단 등)", "ingress 필터링 무력화 - 전체 허용 규칙 존재")
+    elif ext_in:
+        R.m('NET-038', f"외부 인터페이스 ACL: access-group {ext_in[0][1]} in interface {ext_in[0][0]} ({len(ext_acl_txt)}개 규칙)", "외부 인터페이스 ingress 필터", "ACL 규칙 내용·누락 수동 확인")
     else:
-        results['NET-049'] = mc(fmt(f"계정: {priv_info}", "명령어 권한 수준 분리", "권한 분리 수동 확인"))
+        R.b('NET-038', "외부 인터페이스 access-group in 미설정", "외부 인터페이스 ingress 패킷 필터 적용", "ingress ACL 미적용 - 위변조 패킷 유입 가능")
+    eg = [(k, v) for k, v in ag.items() if k[1] == "out"]
+    if eg: R.m('NET-039', f"egress ACL: access-group {eg[0][1]} out interface {eg[0][0][0]}", "외부 인터페이스 egress 필터", "egress ACL 설정됨 - 룰 내용 수동 확인")
+    else: R.b('NET-039', "access-group out 미설정", "외부 인터페이스 egress 필터 적용", "egress ACL 미적용 - 내부 정보 유출 필터 없음")
+    rpf = [s for s in find(r'ip\s+verify\s+reverse-path\s+interface\s+\S+') if s.split()[-1].lower() in [e.lower() for e in ext]]
+    bogon = [x for x in ext_acl_txt if re.search(r'\bdeny\s+ip\s+(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)', x, re.I)]
+    if rpf: R.g('NET-040', rpf[0], "ip verify reverse-path(uRPF) 또는 bogon 차단 ACL", "uRPF 스푸핑 방지 적용됨")
+    elif bogon: R.m('NET-040', f"RFC1918 차단 ACL: {bogon[0]}", "스푸핑 방지(uRPF 또는 bogon ACL)", "bogon 차단 ACL 설정됨 - 외부 인터페이스 적용 수동 확인")
+    else: R.b('NET-040', "ip verify reverse-path 미설정, RFC1918 차단 ACL 미발견", "uRPF 또는 bogon 차단 ACL", "스푸핑 방지 미설정 - IP 위조 패킷 허용 가능")
+    mc_ = [x for x in ext_acl_txt if re.search(r'\bdeny\b.*\b224\.0\.0\.0\b', x, re.I)]
+    if mc_: R.m('NET-041', f"멀티캐스트 차단 ACL: {mc_[0]}", "ACL 로 224.0.0.0 대역 유입 차단", "차단 ACL 존재 - 외부 인터페이스 적용 여부 확인")
+    else: R.b('NET-041', "224.0.0.0 차단 ACL 없음", "ACL 로 224.0.0.0 대역 유입 차단 (전용회선 연결 시 양호)", "멀티캐스트 차단 ACL 미설정 - 전용회선 연결이면 양호")
+    ic = [x for x in ext_acl_txt if re.search(r'\bdeny\s+icmp\b', x, re.I)] + find(r'icmp\s+deny\s+')
+    if ic: R.m('NET-042', f"ICMP 차단 규칙: {ic[0]}", "외부 ICMP 요청 차단", "ICMP 차단 규칙 발견 - 외부 인터페이스 적용 수동 확인")
+    else: R.b('NET-042', "ICMP 차단 규칙 없음", "외부 인터페이스 ICMP 제한", "ICMP 차단 미설정 - 네트워크 정보 노출 가능")
+    td = find(r'threat-detection\s+\S+')
+    if td: R.m('NET-047', f"threat-detection 설정 {len(td)}건: {td[0]}", "DDoS 방어(threat-detection·연결 제한) 설정", "설정 존재 - 임계값 적정성 수동 확인")
+    else: R.b('NET-047', "threat-detection 미설정", "DDoS 방어(threat-detection·연결 제한) 설정", "DDoS 방어 설정 없음 - 상단 DDoS 대응장비 여부 확인")
+    # 배너
+    bn = []
+    for s in find(r'banner\s+(exec|login|motd|asdm)\s+\S'):
+        bn.append(re.sub(r'^banner\s+\S+\s+', '', s, flags=re.I))
+    _net_banner_eval(R, bn, "banner exec/login/motd")
+    n_priv = len(find(r'privilege\s+'))
+    R.m('NET-049', f"privilege 설정 {n_priv}건", "명령어 권한 수준 분리", "권한 분리 적정성 수동 확인")
+    R.m('NET-052', f"nameif 인터페이스 {len(named)}개 중 shutdown {sum(1 for i in named if i['shut'])}개", "미사용 인터페이스 shutdown", "설정만으로 링크 상태 확인 불가 - 사용 여부 수동 확인")
+    # 취약 서비스
+    wk = []
+    if first(r'tftp-server\s+'): wk.append("TFTP")
+    if first(r'lldp\s+run\b'): wk.append("LLDP")
+    if wk: R.b('NET-057', f"활성 취약 서비스: {', '.join(wk)}", "취약 서비스(TFTP/LLDP 등) 비활성화", f"{len(wk)}개 비활성화 필요")
+    else: R.g('NET-057', "CDP/LLDP/Smart Install 해당 없음, TFTP 서버 설정 없음", "취약 서비스 비활성화", "주요 취약 서비스 비활성화 확인됨")
+    mf = first(r'aaa\s+local\s+authentication\s+attempts\s+max-fail\s+\d+')
+    if mf:
+        n = int(re.search(r'(\d+)\s*$', mf).group(1))
+        (R.g if n <= 5 else R.b)('NET-058', mf, "계정 잠금 임계값 5회 이하", f"로그인 실패 {n}회 잠금" if n <= 5 else f"임계값 {n}회 - 과다")
+    else:
+        R.b('NET-058', "aaa local authentication attempts max-fail 미설정", "로그인 실패 시 계정 잠금", "무제한 로그인 시도 허용 - 무차별 공격 취약")
+    return R.r
 
-    # NET-059: EoS
-    results['NET-059'] = mc(fmt("D-Link 장비 펌웨어/모델", "EoL/EoS 기준 지원 중인 장비 사용", "벤더 EoL 대조 수동 확인"))
 
-    return results
+def _net_nxos_checks(lines, text):
+    """Cisco NX-OS — feature 기반 서비스, snmp-server community ... group <role>, line vty/console, 인터페이스 하위 설정 전용 판정"""
+    L = [l.rstrip() for l in lines if l.strip() and not l.lstrip().startswith("!")]
+    S = [l.strip() for l in L]
+    R = _NR()
 
+    def find(pat):
+        return [s for s in S if re.match(pat, s, re.I)]
+    def first(pat):
+        r = find(pat)
+        return r[0] if r else None
+
+    def blocks(pat):
+        out, cur = [], None
+        for l in L:
+            if re.match(pat, l, re.I):
+                cur = (l.strip(), []); out.append(cur); continue
+            if cur is not None:
+                if l[:1] in (" ", "\t"):
+                    cur[1].append(l.strip())
+                else:
+                    cur = None
+        return out
+
+    def acl_entries(name):
+        for h, sub in blocks(r'ip(?:v4)?\s+access-list\s+' + re.escape(name) + r'\s*$'):
+            ent = []
+            for x in sub:
+                m = re.match(r'(?:\d+\s+)?(permit|deny)\s+(.*)$', x, re.I)
+                if m: ent.append((m.group(1).lower(), m.group(2)))
+            return ent
+        return None
+
+    _net_common_manual(R, "Cisco NX-OS")
+    feats = {m.group(1).lower() for s in S for m in [re.match(r'feature\s+(\S+)', s, re.I)] if m}
+    nofeats = {m.group(1).lower() for s in S for m in [re.match(r'no\s+feature\s+(\S+)', s, re.I)] if m}
+
+    # ── SNMP ──
+    comms, v3_weak = [], []
+    rw_roles = re.compile(r'admin|^rw$', re.I)
+    for s in find(r'snmp-server\s+community\s+'):
+        m = re.match(r'snmp-server\s+community\s+(\S+)(.*)$', s, re.I)
+        name, rest = m.group(1), m.group(2)
+        ent = next((c for c in comms if c["name"] == name), None)
+        if ent is None:
+            ent = {"name": name, "rw": False, "restricted": False}
+            comms.append(ent)
+        g = re.search(r'\bgroup\s+(\S+)', rest, re.I)
+        if g and rw_roles.search(g.group(1)): ent["rw"] = True; ent["label"] = f"{_comm_mask(name)}(group {g.group(1)})"
+        if re.search(r'\brw\b', rest, re.I): ent["rw"] = True
+        a = re.search(r'\buse-(?:ipv4)?acl\s+(\S+)', rest, re.I)
+        if a:
+            e = acl_entries(a.group(1))
+            if e is None: ent["restricted"] = None
+            else: ent["restricted"] = _acl_host_only_entries(e)[0] if e else None
+    has_v3 = False
+    v3_rw = []
+    for s in find(r'snmp-server\s+user\s+'):
+        m = re.match(r'snmp-server\s+user\s+(\S+)\s*(.*)$', s, re.I)
+        has_v3 = True
+        rest = m.group(2)
+        if re.search(r'\bauth\b', rest, re.I) and not re.search(r'\bpriv\b', rest, re.I):
+            v3_weak.append(s)
+        role0 = rest.split()[0] if rest.split() else ""
+        if re.search(r'admin', role0, re.I):
+            v3_rw.append(f"v3 사용자 {m.group(1)}(role {role0})")
+    _net_snmp_eval(R, comms, v3_weak, has_v3, v3_rw)
+    hosts = find(r'snmp-server\s+host\s+')
+    if hosts:
+        R.m('NET-006', f"SNMP 호스트 {len(hosts)}건: {hosts[0]}", "외부 인터페이스 SNMP 차단 또는 관리망(VRF) 분리", "외부 접근 여부 수동 확인")
+    else:
+        R.m('NET-006', "snmp-server host 미설정", "관리망 한정 SNMP", "수동 확인")
+
+    # ── 계정·인증 ──
+    users = find(r'username\s+\S+')
+    if users:
+        R.m('NET-007', f"로컬 계정 {len(users)}개: {', '.join(_net_uname(u) for u in users[:5])}",
+            "운영자 1인 1계정, 계정별 권한 적정", "1인 1계정·role(network-admin) 적정성 인터뷰 확인")
+    else:
+        R.b('NET-007', "로컬 계정(username) 미발견", "Local 사용자 설정", "Local 사용자 미설정")
+    am = first(r'aaa\s+authentication\s+login\s+default\s+(?!none\b)\S')
+    if am:
+        R.g('NET-008', f"{am}" + (" (외부 인증서버 TACACS+/RADIUS)" if re.search(r'group', am, re.I) else " (로컬 DB 인증)"), "AAA + 외부 인증서버(TACACS/RADIUS)", "AAA 인증 설정됨")
+    else:
+        R.b('NET-008', "aaa authentication login default 미설정" + (" (feature tacacs+ 만 활성)" if "tacacs+" in feats else ""), "AAA 인증 체계 적용", "AAA 미사용 - 중앙 인증 미적용")
+    weak, strong = [], []
+    for u in users:
+        m = re.match(r'username\s+(\S+)\s+password\s+(?:(\d)\s+)?(\S+)', u, re.I)
+        if not m: continue
+        typ, val = m.group(2), m.group(3)
+        if typ in (None, "0") and not val.startswith("$"):
+            weak.append(f"username {m.group(1)}: 평문")
+        elif val.startswith("$1$"):
+            weak.append(f"username {m.group(1)}: MD5 해시($1$)")
+        elif re.match(r'\$(5|6|8|9)\$', val):
+            strong.append(f"username {m.group(1)}: {val[:3]}")
+        else:
+            weak.append(f"username {m.group(1)}: type{typ or '?'} 약한 해시")
+    if weak:
+        R.b('NET-011', "; ".join(weak[:5]), "비밀번호 안전한 알고리즘(SHA-256 이상) 암호화", f"평문 또는 보안강도 낮은 알고리즘 {len(weak)}건")
+    elif strong:
+        R.g('NET-011', "; ".join(strong[:5]), "비밀번호 안전한 알고리즘(SHA-256 이상) 암호화", "모든 비밀번호 SHA-256 이상 해시")
+    else:
+        R.m('NET-011', "로컬 비밀번호 설정 미발견", "안전한 암호 알고리즘", "인증 서버 측 저장 방식 수동 확인")
+    R.m('NET-012', "비밀번호 복잡도 정책 (password strength-check)" + (" 사용" if first(r'password\s+strength-check') else " 미설정(NX-OS 기본 사용)"),
+        "영문·숫자·특수문자 혼합 8자 이상", "설정만으로 실제 복잡성 판단 불가 - 수동 확인")
+
+    # ── line vty / console ──
+    vty = blocks(r'line\s+vty\b')
+    con = blocks(r'line\s+console\b')
+    if not vty:
+        R.b('NET-013', "line vty 설정 없음 (access-class 미적용)", "line vty 에 access-class <ACL> in 적용", "VTY ACL 없음 - 모든 IP 에서 원격 접근 가능")
+    else:
+        acls = [m.group(1) for h, sub in vty for x in sub for m in [re.match(r'access-class\s+(\S+)\s+in', x, re.I)] if m]
+        if not acls:
+            R.b('NET-013', "line vty 에 access-class 미적용", "line vty 에 access-class <ACL> in 적용", "VTY ACL 없음 - 모든 IP 에서 원격 접근 가능")
+        else:
+            wide, unk = [], []
+            for a in acls:
+                e = acl_entries(a)
+                if e is None: unk.append(a)
+                elif not _acl_host_only_entries(e)[0]: wide.append(a)
+            if wide: R.b('NET-013', f"VTY ACL {', '.join(wide)} 가 대역·any 허용", "지정된 최소한의 IP 만 허용", "허용 범위 과다")
+            elif unk: R.m('NET-013', f"access-class {', '.join(unk)} (ACL 정의 없음)", "VTY ACL 최소 IP", "ACL 정의·허용 IP 수동 확인")
+            else: R.g('NET-013', f"line vty access-class {', '.join(sorted(set(acls)))} in", "VTY 에 접근 ACL 적용 (지정된 최소한의 IP)", "VTY ACL 적용됨 - 허가 IP 적정성 확인")
+    tmo, undefined = [], []
+    for nm, bl in (("line console", con), ("line vty", vty)):
+        if not bl:
+            continue
+        for h, sub in bl:
+            e = next((re.match(r'exec-timeout\s+(\d+)', x, re.I) for x in sub if re.match(r'exec-timeout\s+\d+', x, re.I)), None)
+            if e is None: undefined.append(nm)
+            else: tmo.append((nm, int(e.group(1))))
+    over = [f"{n}: exec-timeout {v}분" + (" (무제한)" if v == 0 else "") for n, v in tmo if v == 0 or v > 15]
+    if over:
+        R.b('NET-014', f"타임아웃 미흡: {'; '.join(over)}", "세션 타임아웃 15분 이하", "타임아웃 초과/무제한 라인 존재")
+    elif undefined:
+        R.m('NET-014', f"exec-timeout 미설정 라인: {', '.join(sorted(set(undefined)))}", "세션 타임아웃 15분 이하", "미설정 라인의 기본 타임아웃 수동 확인")
+    elif tmo:
+        R.g('NET-014', "; ".join(f"{n}: exec-timeout {v}분" for n, v in tmo), "세션 타임아웃 15분 이하", "모든 라인 타임아웃 기준 충족")
+    else:
+        R.m('NET-014', "line vty/console 설정 없음", "세션 타임아웃 설정", "수동 확인")
+    if "telnet" in feats:
+        R.b('NET-015', "feature telnet 활성", "SSH 전용 (no feature telnet)", "Telnet 평문 접속 허용")
+    elif "ssh" in nofeats:
+        R.g('NET-015', "feature telnet 미사용, feature ssh 도 비활성(원격 CLI 접속 불가)", "SSH 전용", "Telnet 비활성")
+    else:
+        R.g('NET-015', "feature telnet 미사용" + (" / feature ssh 활성" if "ssh" in feats else " (SSH 기본 활성)"), "SSH 전용", "Telnet 비활성 (NX-OS 기본)")
+    R.n('NET-016', "NX-OS 장비에 AUX 포트 설정 없음", "AUX 포트 비활성화", "해당 없음")
+    if first(r'ip\s+source-route\s*$'):
+        R.b('NET-022', "ip source-route 설정", "IP source routing 차단 (NX-OS 기본 비활성)", "IP 소스라우팅 허용 - 경로 우회 공격 위험")
+    else:
+        R.g('NET-022', "ip source-route 미설정" + (" (no ip source-route 명시)" if first(r'no\s+ip\s+source-route') else " (NX-OS 기본 비활성)"), "IP source routing 차단", "IP 소스라우팅 차단됨")
+
+    # ── L3 인터페이스 ──
+    ifs = blocks(r'interface\s+\S+')
+    l3 = [(h.split(None, 1)[1], sub) for h, sub in ifs
+          if any(re.match(r'ip address\s+\d', x, re.I) for x in sub) and not re.match(r'(mgmt|loopback|nve)', h.split(None, 1)[1], re.I)
+          and not any(re.match(r'shutdown\b', x, re.I) for x in sub)]
+    if l3:
+        pa = [n for n, sub in l3 if any(re.match(r'ip proxy-arp\b', x, re.I) for x in sub)]
+        db = [n for n, sub in l3 if any(re.match(r'ip directed-broadcast\b', x, re.I) for x in sub)]
+        nr = [n for n, sub in l3 if not any(re.match(r'no ip redirects\b', x, re.I) for x in sub)]
+        nu = [n for n, sub in l3 if not any(re.match(r'no ip unreachables\b', x, re.I) for x in sub)]
+        (R.b if pa else R.g)('NET-026', (f"ip proxy-arp 활성 인터페이스: {', '.join(pa)}" if pa else f"L3 인터페이스({', '.join(n for n, _ in l3)}) ip proxy-arp 미설정 (NX-OS 기본 비활성)"),
+                              "Proxy ARP 비활성화", "Proxy ARP 허용 - ARP 스푸핑 위험" if pa else "Proxy ARP 차단됨")
+        (R.b if db else R.g)('NET-027', (f"ip directed-broadcast 활성: {', '.join(db)}" if db else "ip directed-broadcast 설정 없음 (NX-OS 기본 비활성)"),
+                              "Directed Broadcast 차단", "Directed Broadcast 허용 - Smurf 공격 취약" if db else "Directed Broadcast 차단됨")
+        (R.b if nr else R.g)('NET-043', (f"no ip redirects 미설정 인터페이스: {', '.join(nr)}" if nr else "모든 L3 인터페이스 no ip redirects"),
+                              "인터페이스마다 no ip redirects", "ICMP Redirect 허용 - 라우팅 조작 가능" if nr else "ICMP Redirect 차단됨")
+        (R.b if nu else R.g)('NET-044', (f"no ip unreachables 미설정 인터페이스: {', '.join(nu)}" if nu else "모든 L3 인터페이스 no ip unreachables"),
+                              "인터페이스마다 no ip unreachables", "ICMP Unreachable 미차단 인터페이스 존재" if nu else "ICMP Unreachable 차단됨")
+        ag_in = [x for _, sub in l3 for x in sub if re.match(r'ip access-group\s+\S+\s+in', x, re.I)]
+        ag_out = [x for _, sub in l3 for x in sub if re.match(r'ip access-group\s+\S+\s+out', x, re.I)]
+        urpf = [x for _, sub in l3 for x in sub if re.match(r'ip verify unicast source', x, re.I)]
+        (R.m if ag_in or urpf else R.b)('NET-038', ("Ingress ACL/uRPF: " + "; ".join((ag_in + urpf)[:3])) if (ag_in or urpf) else "ip access-group in 미설정",
+                                         "외부 인터페이스 ingress 필터", "ACL 설정 확인됨 - 룰 내용 수동 확인" if (ag_in or urpf) else "ingress ACL 미적용 - 위변조 패킷 유입 가능")
+        (R.m if ag_out else R.b)('NET-039', "; ".join(ag_out[:2]) if ag_out else "ip access-group out 미설정", "외부 인터페이스 egress 필터",
+                                  "egress ACL 설정됨 - 룰 내용 수동 확인" if ag_out else "egress ACL 미적용 - 내부 정보 유출 필터 없음")
+        (R.g if urpf else R.b)('NET-040', urpf[0] if urpf else "ip verify unicast source 미설정", "uRPF 또는 bogon 차단 ACL", "uRPF 스푸핑 방지 적용됨" if urpf else "스푸핑 방지 미설정 - IP 위조 패킷 허용 가능")
+    else:
+        for c in ('NET-026', 'NET-027', 'NET-043', 'NET-044', 'NET-038', 'NET-039', 'NET-040'):
+            R.n(c, "IP 가 설정된 라우팅 인터페이스 없음", "L3 인터페이스 대상 항목", "해당 없음")
+    R.n('NET-045', "NX-OS ICMP mask-reply 설정 해당 없음", "ICMP Mask Reply 차단", "해당 없음")
+    R.n('NET-051', "NX-OS TCP keepalive 설정 해당 없음", "TCP keepalive 설정", "해당 없음")
+
+    # ── 불필요 서비스 ──
+    svc = []
+    if "telnet" in feats: svc.append("Telnet")
+    for f_, nm in (("ftp-server", "FTP 서버"), ("tftp-server", "TFTP 서버"), ("scp-server", None), ("nxapi", "NX-API(HTTP)")):
+        if f_ in feats and nm: svc.append(nm)
+    if first(r'ip\s+domain-lookup\s*$'): svc.append("Domain-lookup")
+    if comms: svc.append("SNMP(v1/v2c)")
+    if svc:
+        R.b('NET-030', f"활성 불필요 서비스 {len(svc)}개 - {'; '.join(svc)}", "SNMP-v1v2/Telnet/FTP·TFTP/Domain-lookup 등 불필요 서비스 비활성화", f"비활성화 필요: {', '.join(svc)}")
+    else:
+        R.g('NET-030', "불필요 서비스 미발견 (telnet·ftp/tftp·nxapi 비활성, SNMP v1/v2c 미사용, domain-lookup 비활성)", "주요 불필요 서비스 전체 비활성화", "기준 명시 서비스 비활성화 확인됨")
+    ntp = find(r'ntp\s+(server|peer)\s+\S+')
+    if ntp: R.g('NET-031', f"NTP 서버: {ntp[0]}" + (f" 외 {len(ntp)-1}개" if len(ntp) > 1 else ""), "NTP 서버 동기화 설정", f"NTP {len(ntp)}개 서버 설정됨")
+    else: R.b('NET-031', "NTP 서버 미설정", "ntp server 설정", "시간 동기화 미설정 - 로그 시간 신뢰도 저하")
+
+    # ── 로깅 ──
+    ls = find(r'logging\s+server\s+\S+')
+    lf = first(r'logging\s+logfile\s+\S+')
+    if ls or lf: R.g('NET-033', "; ".join((ls[:1] + ([lf] if lf else []))), "logging server 또는 logging logfile 설정", "로깅 설정됨")
+    else: R.b('NET-033', "logging server/logfile 설정 없음", "로깅 활성화", "로깅 미설정")
+    R.g('NET-034', first(r'logging\s+timestamp\s+\S+') or "logging timestamp 미지정 (NX-OS 로그는 기본 타임스탬프(seconds) 포함)", "로그 타임스탬프 포함", "로그 시간 기록됨")
+    if lf: R.g('NET-035', lf, "logging logfile 버퍼 크기 설정", "로그 파일 크기 설정됨")
+    else: R.m('NET-035', "logging logfile 미설정 (기본 messages 로그 파일 사용)", "로그 버퍼 크기 설정", "기본 로그 파일 크기 수동 확인")
+    if ls: R.g('NET-036', f"원격 로그서버 {len(ls)}개: {'; '.join(ls[:3])}", "원격 syslog 서버 설정 (SIEM 연동)", f"로그서버 {len(ls)}개 설정됨 - 외부 전송 가능")
+    else: R.b('NET-036', "logging server 미설정", "원격 syslog 서버 설정", "로그 외부 전송 없음 - 장비 손상 시 로그 유실 위험")
+    lc = first(r'logging\s+console\s*(\d+)?\s*$')
+    if first(r'no\s+logging\s+console\b'):
+        R.g('NET-037', "no logging console", "콘솔 로깅 중지 또는 critical 이상", "콘솔 로깅 중지")
+    elif lc:
+        mm = re.search(r'(\d+)\s*$', lc); lv = int(mm.group(1)) if mm else 2
+        (R.g if lv <= 2 else R.b)('NET-037', lc, "콘솔 로깅 중지 또는 critical 이상", f"콘솔 로그 레벨 {lv}")
+    else:
+        R.g('NET-037', "logging console 미설정 (NX-OS 기본 레벨 2(critical))", "콘솔 로깅 중지 또는 critical 이상", "콘솔 로그 레벨 critical")
+    # 배너
+    bn, inb, buf = [], False, []
+    for l in L:
+        m = re.match(r'banner\s+(motd|exec)\s+(\S)(.*)$', l, re.I)
+        if m and not inb:
+            d = m.group(2); rest = m.group(3)
+            if d in rest:
+                bn.append(rest.split(d)[0].strip())
+            else:
+                inb, buf = True, ([rest.strip()] if rest.strip() else []); delim = d
+            continue
+        if inb:
+            if delim in l:
+                buf.append(l.split(delim)[0].strip()); bn.append(" ".join(b for b in buf if b)); inb = False
+            else:
+                buf.append(l.strip())
+    _net_banner_eval(R, bn, "banner motd/exec")
+    # 스위치 포트 보안
+    swp = [(h, sub) for h, sub in ifs if any(re.match(r'switchport\b', x, re.I) for x in sub)]
+    if not swp:
+        R.n('NET-054', "스위치 포트(switchport) 없음", "스위치 포트 보안 설정", "해당 없음")
+    else:
+        ps = [h for h, sub in swp if any(re.match(r'switchport port-security', x, re.I) for x in sub)]
+        sn = first(r'ip\s+dhcp\s+snooping\s*$'); dai = first(r'ip\s+arp\s+inspection\s+vlan')
+        if ps or sn or dai:
+            R.g('NET-054', f"포트 보안 설정: port-security {len(ps)}개 포트" + (f", {sn}" if sn else "") + (f", {dai}" if dai else ""), "스위치 포트 보안 설정", "포트 보안 설정됨")
+        else:
+            R.b('NET-054', f"switchport 인터페이스 {len(swp)}개에 port-security/dhcp snooping/arp inspection 미설정", "스위치 포트 보안 설정", "포트 보안 미설정")
+    wk = []
+    if "lldp" in feats: wk.append("LLDP(feature lldp)")
+    if "tftp-server" in feats: wk.append("TFTP")
+    if not first(r'no\s+cdp\s+enable\s*$'): wk.append("CDP(기본 활성, no cdp enable 미설정)")
+    if wk: R.b('NET-057', f"활성 취약 서비스: {', '.join(wk)}", "취약 서비스(CDP/LLDP/TFTP 등) 비활성화", f"{len(wk)}개 비활성화 필요: {', '.join(wk)}")
+    else: R.g('NET-057', "LLDP·TFTP 비활성, CDP 비활성(no cdp enable)", "취약 서비스 비활성화", "주요 취약 서비스 비활성화 확인됨")
+    lb = first(r'login\s+block-for\s+\d+\s+attempts\s+\d+') or first(r'aaa\s+authentication\s+rejected\s+\d+')
+    if lb:
+        n = int(re.search(r'(?:attempts|rejected)\s+(\d+)', lb).group(1))
+        (R.g if n <= 5 else R.b)('NET-058', lb, "계정 잠금 임계값 5회 이하", f"로그인 실패 {n}회 차단" if n <= 5 else f"임계값 {n}회 - 과다")
+    else:
+        R.b('NET-058', "login block-for 미설정", "로그인 실패 시 차단 설정", "무제한 로그인 시도 허용 - 무차별 공격 취약")
+    n_role = len(find(r'role\s+name'))
+    n_shut = sum(1 for _, sub in ifs if any(re.match(r'shutdown\b', x, re.I) for x in sub))
+    R.m('NET-049', f"role 설정 {n_role}건", "명령어 권한(role) 분리", "role 분리 적정성 수동 확인")
+    R.m('NET-052', f"인터페이스 {len(ifs)}개 중 shutdown {n_shut}개", "미사용 인터페이스 shutdown", "설정만으로 링크 상태 확인 불가 - 수동 확인")
+    return R.r
+
+
+def _net_junos_checks(lines, text):
+    """Juniper JunOS — set 형식·계층형 모두 set 형식으로 정규화해 판정 (set system / set snmp / set interfaces / set firewall)"""
+    S = [re.sub(r'\s+', ' ', l).strip() for l in _junos_to_set(lines)]
+    S = [s for s in S if not s.startswith("set version")] + [s for s in S if s.startswith("set version")]
+    R = _NR()
+
+    def find(pat):
+        return [s for s in S if re.match(pat, s, re.I)]
+    def first(pat):
+        r = find(pat)
+        return r[0] if r else None
+
+    _net_common_manual(R, "Juniper JunOS")
+    # ── SNMP ──
+    comms, v3_weak, extra_rw = {}, [], []
+    clist = {}
+    for s in find(r'set snmp client-list\s+\S+\s+\S+'):
+        m = re.match(r'set snmp client-list\s+(\S+)\s+(\S+)', s)
+        clist.setdefault(m.group(1), []).append(m.group(2))
+    for s in find(r'set snmp community\s+\S+'):
+        m = re.match(r'set snmp community\s+("[^"]*"|\S+)\s*(.*)$', s)
+        name, rest = m.group(1).strip('"'), m.group(2)
+        c = comms.setdefault(name, {"name": name, "rw": False, "restricted": False, "_nets": []})
+        if re.match(r'authorization\s+read-write\b', rest): c["rw"] = True
+        mm = re.match(r'clients\s+(\S+)', rest)
+        if mm: c["_nets"].append(mm.group(1))
+        mm = re.match(r'client-list-name\s+(\S+)', rest)
+        if mm: c["_nets"] += clist.get(mm.group(1), ["0.0.0.0/0"] if mm.group(1) not in clist else [])
+    for c in comms.values():
+        nets = [n for n in c["_nets"] if not n.startswith("restrict")]
+        c["restricted"] = bool(nets) and all(re.search(r'/32$|/128$', n) for n in nets) if nets else False
+        if c["restricted"] is False and nets and any(n in ("0.0.0.0/0", "::/0") for n in nets): c["restricted"] = False
+    usm_users = {}
+    for s in find(r'set snmp v3 usm local-engine user\s+\S+\s+\S+'):
+        m = re.match(r'set snmp v3 usm local-engine user\s+(\S+)\s+(\S+)', s)
+        usm_users.setdefault(m.group(1), set()).add(m.group(2))
+    for u, ks in usm_users.items():
+        if any(k.startswith("authentication") for k in ks) and not any(k.startswith("privacy") for k in ks):
+            v3_weak.append(f"usm user {u}: authentication 만 설정 (privacy 없음)")
+    for s in find(r'set snmp v3 vacm access\b.*\bwrite-view\b'):
+        extra_rw.append("v3 vacm 쓰기 view: " + s[:70])
+    has_v3 = bool(usm_users or find(r'set snmp v3\b'))
+    cl = list(comms.values())
+    _net_snmp_eval(R, cl, v3_weak, has_v3, extra_rw)
+    if not comms and R.r['NET-005'][0] == RESULT_MANUAL:
+        R.m('NET-005', "SNMPv3 사용 (community 없음)", "SNMP 접근 단일 IP", "v3 접근 제한(client-list·방화벽 필터) 수동 확인")
+    n_snmp = len(find(r'set snmp\b'))
+    R.m('NET-006', f"snmp 설정 {n_snmp}건", "관리망 한정 SNMP / 외부 인터페이스 차단 필터", "방화벽 필터 적용 여부 수동 확인")
+
+    # ── 계정·인증 ──
+    users = sorted({m.group(1) for s in find(r'set system login user\s+\S+') for m in [re.match(r'set system login user\s+(\S+)', s)]})
+    if users:
+        R.m('NET-007', f"로컬 계정 {len(users)}개: {', '.join(users[:5])}", "운영자 1인 1계정, 계정별 권한 적정", "1인 1계정·class(super-user) 적정성 인터뷰 확인")
+    else:
+        R.b('NET-007', "로컬 계정(login user) 미발견", "Local 사용자 설정", "Local 사용자 미설정")
+    srv = find(r'set system (radius-server|tacplus-server)\s+\S+')
+    if srv:
+        R.g('NET-008', f"{srv[0].split()[2]} {srv[0].split()[3]} 외부 인증서버 연동" + (f", {first(r'set system authentication-order')}" if first(r'set system authentication-order') else ""),
+            "AAA + 외부 인증서버(TACACS+/RADIUS)", "중앙 집중 인증 적용됨")
+    else:
+        R.b('NET-008', "radius-server/tacplus-server 미설정 (로컬 인증만 사용)", "AAA + 외부 인증서버(TACACS+/RADIUS)", "중앙 인증 미적용")
+    noauth = [u for u in users if not find(r'set system login user ' + re.escape(u) + r' authentication\b')]
+    if noauth:
+        R.b('NET-009', f"인증 정보 없는 계정: {', '.join(noauth[:5])}", "계정별 비밀번호/SSH 키 설정", f"비밀번호 미설정 {len(noauth)}건")
+    else:
+        R.m('NET-009', f"계정 {len(users)}개 모두 인증 정보 설정", "계정별 비밀번호 설정 및 중복 사용 금지", "미설정 없음 - 해시 salt 로 중복 판정 불가, 인터뷰 확인")
+    if first(r'set system root-authentication\s+(encrypted-password|plain-text-password|ssh-)'):
+        R.g('NET-010', "root-authentication 설정됨", "root(관리자) 비밀번호 설정", "root 인증 정보 설정됨")
+    else:
+        R.b('NET-010', "root-authentication 미설정", "root(관리자) 비밀번호 설정", "root 계정 인증 정보 없음 - 즉시 설정 필요")
+    weak, strong = [], []
+    for s in find(r'set system (root-authentication|login user\s+\S+ authentication)\s+(encrypted-password|plain-text-password)'):
+        who = "root" if "root-authentication" in s else s.split()[4]
+        if "plain-text-password" in s:
+            weak.append(f"{who}: 평문 입력")
+            continue
+        mm = re.search(r'encrypted-password\s+"?\$(\w+)\$', s)
+        alg = mm.group(1) if mm else "?"
+        (strong if alg in ("5", "6", "sha256", "sha512") else weak).append(f"{who}: ${alg}$ " + ("해시" if alg in ("5", "6") else "(MD5 등 약한 해시)" if alg == "1" else ""))
+    if weak:
+        R.b('NET-011', "; ".join(weak[:5]), "비밀번호 안전한 알고리즘(SHA-256/512) 암호화", f"평문 또는 보안강도 낮은 알고리즘 {len(weak)}건")
+    elif strong:
+        R.g('NET-011', "; ".join(strong[:5]), "비밀번호 안전한 알고리즘(SHA-256/512) 암호화", "모든 비밀번호 SHA-256 이상 해시")
+    else:
+        R.m('NET-011', "Junos 비밀번호 저장 방식", "안전한 암호 알고리즘", "비밀번호 해시 알고리즘 수동 확인")
+    ml = first(r'set system login password minimum-length\s+\d+')
+    if ml:
+        nv = int(ml.split()[-1])
+        (R.m if nv >= 8 else R.b)('NET-012', ml, "영문·숫자·특수문자 혼합 8자 이상", f"최소 {nv}자 정책 - 실제 비밀번호 복잡성(크랙) 확인 필요" if nv >= 8 else f"최소 {nv}자 - 8자 이상 설정 필요")
+    else:
+        R.m('NET-012', "login password minimum-length 미설정", "비밀번호 복잡도 정책 적용", "복잡도 설정 수동 확인 (AAA 서버 정책 포함)")
+    # lo0 보호 필터
+    lo0 = find(r'set interfaces lo0 unit \d+ family inet6? filter input\s+\S+')
+    if lo0:
+        R.m('NET-013', f"lo0 입력 필터 적용: {lo0[0].split()[-1]} (루프백 필터로 RE 접근 제한)", "관리 접속(ssh)을 지정된 최소 IP 로 제한", "필터 내용(허용 IP) 수동 확인")
+    else:
+        R.b('NET-013', "lo0 에 입력 방화벽 필터 미적용 (원격 접속 IP 제한 없음)", "lo0 필터로 관리 접속 IP 제한", "모든 IP 에서 원격 접근 가능")
+    classes = {}
+    for s in find(r'set system login class\s+\S+\s+idle-timeout\s+\d+'):
+        m = re.match(r'set system login class\s+(\S+)\s+idle-timeout\s+(\d+)', s)
+        classes[m.group(1)] = int(m.group(2))
+    used = sorted({m.group(1) for s in find(r'set system login user\s+\S+\s+class\s+\S+') for m in [re.search(r'class\s+(\S+)', s)]})
+    if not used:
+        R.m('NET-014', "사용자 class 설정 없음", "세션 타임아웃 15분 이하", "수동 확인")
+    else:
+        bad_c = [f"class {c}: " + (f"idle-timeout {classes[c]}분" if c in classes else "idle-timeout 미설정(무제한)") for c in used if c not in classes or classes[c] == 0 or classes[c] > 15]
+        if bad_c:
+            R.b('NET-014', "; ".join(bad_c), "세션 idle-timeout 15분 이하", "타임아웃 초과/무제한 class 존재")
+        else:
+            R.g('NET-014', "; ".join(f"class {c}: idle-timeout {classes[c]}분" for c in used), "세션 idle-timeout 15분 이하", "모든 class 타임아웃 기준 충족")
+    tn = first(r'set system services telnet\b')
+    ssh1 = first(r'set system services ssh protocol-version v1\s*$') and not first(r'set system services ssh protocol-version v2')
+    if tn or ssh1:
+        R.b('NET-015', "; ".join(([tn] if tn else []) + ([f"SSH v1 사용: {ssh1}"] if ssh1 else [])), "SSH(v2) 전용 접속", "평문 접속 또는 취약 SSH 버전 허용")
+    elif first(r'set system services ssh\b'):
+        R.g('NET-015', "system services ssh 사용, telnet 미설정", "SSH(v2) 전용 접속", "SSH 전용")
+    else:
+        R.m('NET-015', "system services 에 ssh/telnet 모두 없음", "SSH 전용", "원격 관리 방식 수동 확인")
+    R.n('NET-016', "Junos 장비 AUX 포트 설정 없음", "AUX 포트 비활성화", "해당 없음")
+    R.n('NET-022', "Junos 는 IP 소스라우팅 패킷을 기본 폐기", "IP source routing 차단", "해당 없음")
+    pa = find(r'set interfaces\s+\S+\s+unit\s+\d+\s+proxy-arp\b')
+    (R.b if pa else R.g)('NET-026', (f"proxy-arp 활성: {pa[0]}" if pa else "proxy-arp 설정 없음 (Junos 기본 비활성)"), "Proxy ARP 비활성화", "Proxy ARP 허용 - ARP 스푸핑 위험" if pa else "Proxy ARP 차단됨")
+    db = find(r'set interfaces\s+\S+\s+unit\s+\d+\s+family inet targeted-broadcast\b')
+    (R.b if db else R.g)('NET-027', (f"targeted-broadcast 활성: {db[0]}" if db else "targeted-broadcast 설정 없음 (Junos 기본 비활성)"), "Directed Broadcast 차단", "Directed Broadcast 허용 - Smurf 공격 취약" if db else "Directed Broadcast 차단됨")
+    R.n('NET-051', "Junos TCP keepalive 설정 해당 없음", "TCP keepalive 설정", "해당 없음")
+    # 불필요 서비스
+    svc = []
+    for pat, nm in ((r'set system services telnet\b', "Telnet"), (r'set system services ftp\b', "FTP"), (r'set system services rlogin\b', "rlogin"),
+                    (r'set system services rsh\b', "rsh"), (r'set system services finger\b', "finger"), (r'set system services xnm-clear-text\b', "xnm-clear-text"),
+                    (r'set system services web-management http(\s|$)', "HTTP 웹관리"), (r'set system services dhcp\b', "DHCP 서버")):
+        if first(pat): svc.append(nm)
+    if comms: svc.append("SNMP(v1/v2c)")
+    if svc:
+        R.b('NET-030', f"활성 불필요 서비스 {len(svc)}개 - {'; '.join(svc)}", "SNMP-v1v2/Telnet/FTP/HTTP 등 불필요 서비스 비활성화", f"비활성화 필요: {', '.join(svc)}")
+    else:
+        R.g('NET-030', "불필요 서비스 미발견 (telnet·ftp·http·SNMP v1/v2c 미사용)", "주요 불필요 서비스 전체 비활성화", "기준 명시 서비스 비활성화 확인됨")
+    ntp = find(r'set system ntp (server|peer)\s+\S+')
+    if ntp: R.g('NET-031', f"NTP 서버: {ntp[0]}" + (f" 외 {len(ntp)-1}개" if len(ntp) > 1 else ""), "NTP 서버 동기화 설정", f"NTP {len(ntp)}개 서버 설정됨")
+    else: R.b('NET-031', "NTP 서버 미설정", "set system ntp server 설정", "시간 동기화 미설정 - 로그 시간 신뢰도 저하")
+    sl = find(r'set system syslog (host|file|user)\s+\S+')
+    if sl: R.g('NET-033', f"syslog 설정 {len(sl)}건: {sl[0]}", "syslog 설정", "로깅 설정됨")
+    else: R.b('NET-033', "set system syslog 미설정", "syslog 설정", "로깅 미설정")
+    R.g('NET-034', "Junos syslog 메시지는 기본적으로 타임스탬프 포함", "로그 시간 기록", "Junos 로그 시간 기본 포함")
+    sf = find(r'set system syslog file\s+\S+')
+    if sf: R.g('NET-035', f"로컬 로그 파일: {sf[0]}", "로그 파일(버퍼) 설정", "로그 파일 설정됨")
+    else: R.b('NET-035', "set system syslog file 미설정", "로그 파일(버퍼) 설정", "로컬 로그 파일 없음")
+    sh = find(r'set system syslog host\s+\S+')
+    if sh: R.g('NET-036', f"원격 로그서버 {len({s.split()[4] for s in sh})}개: {sh[0]}", "원격 syslog 서버 설정 (SIEM 연동)", "외부 전송 가능")
+    else: R.b('NET-036', "set system syslog host 미설정", "원격 syslog 서버 설정", "로그 외부 전송 없음 - 장비 손상 시 로그 유실 위험")
+    sc = first(r'set system syslog console\s+\S+\s+\S+')
+    if sc:
+        lv = sc.split()[-1].lower()
+        (R.g if lv in ("emergency", "alert", "critical", "none") else R.b)('NET-037', sc, "콘솔 로깅 critical 이상", f"콘솔 로그 레벨 {lv}")
+    else:
+        R.m('NET-037', "syslog console 설정 없음", "콘솔 로깅 중지 또는 critical 이상", "콘솔 로그 레벨 수동 확인")
+    msg = first(r'set system login (message|announcement)\s+.+')
+    _net_banner_eval(R, [re.sub(r'^set system login \S+\s+', '', msg).strip('"')] if msg else [], "login message")
+    wk = []
+    if first(r'set protocols lldp\b') and not first(r'set protocols lldp disable'): wk.append("LLDP")
+    if first(r'set system services (tftp|finger)\b'): wk.append("TFTP/Finger")
+    (R.b if wk else R.g)('NET-057', (f"활성 취약 서비스: {', '.join(wk)}" if wk else "LLDP·TFTP·Finger 미사용"), "취약 서비스(LLDP/TFTP/Finger 등) 비활성화",
+                         f"{len(wk)}개 비활성화 필요" if wk else "주요 취약 서비스 비활성화 확인됨")
+    tr = first(r'set system login retry-options tries-before-disconnect\s+\d+')
+    if tr:
+        n = int(tr.split()[-1])
+        (R.g if n <= 5 else R.b)('NET-058', tr + (f" / {first(r'set system login retry-options lockout-period')}" if first(r'set system login retry-options lockout-period') else ""),
+                                  "로그인 실패 5회 이하 차단", f"로그인 실패 {n}회 후 차단" if n <= 5 else f"임계값 {n}회 - 과다")
+    else:
+        R.b('NET-058', "login retry-options 미설정 (기본 10회)", "로그인 실패 시 차단 설정", "임계값 과다/미설정 - 무차별 공격 취약")
+    R.m('NET-049', f"login class 설정 {len(find(r'set system login class'))}건", "명령어 권한(class permissions) 분리", "권한 분리 적정성 수동 확인")
+    return R.r
+
+
+def _alteon_sections(lines):
+    """Alteon /c/... 경로별 설정 줄 {경로: [설정]} (/cfg/ → /c/ 정규화)"""
+    sec, cur = {}, None
+    for l in lines:
+        s = l.strip()
+        if not s or s.startswith(("/*", "script ")):
+            continue
+        if s.startswith("/"):
+            cur = re.sub(r'^/cfg/', '/c/', s.split()[0].rstrip()); sec.setdefault(cur, [])
+            rest = s.split(None, 1)
+            if len(rest) > 1: sec[cur].append(rest[1])
+        elif cur is not None:
+            sec[cur].append(s)
+    return sec
+
+
+def _net_alteon_checks(lines, text):
+    """Alteon — /c/sys/access(tnet·sshd·snmp), /c/sys/ssnmp(rcomm·wcomm·snmpv3), /c/sys/ntp, /c/sys/syslog 전용 판정"""
+    sec = _alteon_sections(lines)
+    R = _NR()
+    flat = [(p, s) for p, v in sec.items() for s in v]
+
+    def vals(path_pat, key):
+        out = []
+        for p, s in flat:
+            if re.match(path_pat, p):
+                m = re.match(key + r'\s+("[^"]*"|\S+)', s, re.I)
+                if m: out.append(m.group(1).strip('"'))
+        return out
+
+    _net_common_manual(R, "Alteon")
+    rc = [v for v in vals(r'^/c/sys(/ssnmp)?$', r'rcomm') if v]
+    wc = [v for v in vals(r'^/c/sys(/ssnmp)?$', r'wcomm') if v]
+    v3mode = (vals(r'^/c/sys/ssnmp$', r'snmpv3') or [""])[0].lower()
+    acc_snmp = (vals(r'^/c/sys/access$', r'snmp') or [""])[0].lower()
+    comms = [{"name": n, "rw": False, "restricted": (True if sec.get('/c/sys/access/mgmt') else False)} for n in rc] + \
+            [{"name": n, "rw": True, "restricted": (True if sec.get('/c/sys/access/mgmt') else False)} for n in wc]
+    if acc_snmp == "w" and not wc:
+        comms.append({"name": "(snmp w)", "rw": True, "restricted": None, "label": "SNMP 접근 권한 w(읽기/쓰기)"})
+    if v3mode in ("v1v2v3", "v1v2") and not comms:
+        comms.append({"name": "public", "rw": False, "restricted": False})
+    has_v3 = any(p.startswith('/c/sys/ssnmp/snmpv3') for p in sec) or v3mode in ("v3only", "v1v2v3")
+    _net_snmp_eval(R, comms, [], has_v3)
+    if v3mode == "v3only" and not (rc or wc):
+        R.g('NET-003', "snmpv3 v3only (v1/v2c community 없음)", "SNMP v3 사용", "SNMP v3 전용")
+    acc_ok = acc_snmp in ("r", "d", "disable") and not wc
+    if acc_snmp in ("r",) and R.r['NET-004'][0] != RESULT_BAD:
+        R.g('NET-004', "SNMP 접근 권한 r(읽기 전용)", "RW(쓰기) 권한 미사용", "RO 권한만 설정됨")
+    users = [v for p, s in flat if re.match(r'^/c/sys/access/user/uid', p) for v in [s] if re.match(r'name\s', s, re.I)]
+    if users:
+        un_ = [re.sub(r'name\s+', '', u).strip('"') for u in users[:5]]
+        R.m('NET-007', f"로컬 계정 {len(users)}개: {', '.join(un_)}", "운영자 1인 1계정, 계정별 권한 적정", "1인 1계정·권한 적정성 인터뷰 확인")
+    elif any(p.startswith('/c/sys/access/user') for p in sec):
+        R.m('NET-007', "기본 사용자 계정(user/oper/admin) 설정", "운영자 1인 1계정, 계정별 권한 적정", "계정 구성 인터뷰 확인")
+    else:
+        R.b('NET-007', "로컬 계정 설정 미발견", "Local 사용자 설정", "Local 사용자 미설정")
+    pw = [(p, s) for p, s in flat if re.match(r'^/c/sys/access/user', p) and re.match(r'(usrpw|admpw|pswd|passw)', s, re.I)]
+    plain = [s.split()[0] for p, s in pw if not re.search(r'"?(ENC:|enc:|\$)', s)]
+    if plain:
+        R.b('NET-011', f"평문으로 보이는 비밀번호 항목: {', '.join(sorted(set(plain)))}", "비밀번호 암호화 저장", "비밀번호 평문 저장")
+    elif pw:
+        R.m('NET-011', "비밀번호 암호화 저장 (ENC)", "안전한 암호 알고리즘", "저장 알고리즘 수동 확인")
+    tn = [p for p, s in flat if re.match(r'^/c/sys(/access)?$', p) and re.match(r'tnet\s+(ena|on)\b', s, re.I)]
+    sshd = [p for p, s in flat if re.match(r'^/c/sys(/access)?$', p) and re.match(r'sshd\s+(ena|on)\b', s, re.I)]
+    if tn:
+        R.b('NET-015', "Alteon tnet ena (Telnet 허용)", "암호화 프로토콜(SSH)만 허용", "Telnet 평문 접속 허용")
+    elif sshd:
+        R.g('NET-015', "Alteon sshd ena, tnet 비활성", "SSH 전용", "SSH 전용 접속")
+    else:
+        R.m('NET-015', "Alteon 원격 접속 설정 미확인", "SSH 전용", "원격 관리 프로토콜 수동 확인")
+    svc = []
+    if tn: svc.append("Telnet")
+    if [1 for p, s in flat if re.match(r'^/c/sys/access$', p) and re.match(r'http\s+(ena|on)\b', s, re.I)]: svc.append("HTTP 관리")
+    if comms and (rc or wc or v3mode in ("v1v2v3", "v1v2")): svc.append("SNMP(v1/v2c)")
+    if svc: R.b('NET-030', f"활성 불필요 서비스 {len(svc)}개 - {'; '.join(svc)}", "SNMP-v1v2/Telnet/HTTP 등 불필요 서비스 비활성화", f"비활성화 필요: {', '.join(svc)}")
+    else: R.g('NET-030', "불필요 서비스 미발견 (Telnet·HTTP 관리·SNMP v1/v2c 비활성)", "주요 불필요 서비스 전체 비활성화", "기준 명시 서비스 비활성화 확인됨")
+    ntp_on = [1 for p, s in flat if re.match(r'^/c/sys/ntp$', p) and re.match(r'(on|ena)\b', s, re.I)]
+    ntp_srv = vals(r'^/c/sys/ntp$', r'(?:prisrv|secsrv)')
+    if ntp_on and ntp_srv: R.g('NET-031', f"NTP 서버 {len(ntp_srv)}개: {', '.join(ntp_srv[:3])}", "NTP 서버 동기화 설정", "NTP 설정됨")
+    else: R.b('NET-031', "NTP 서버 미설정 또는 off", "NTP 설정", "시간 동기화 미설정 - 로그 시간 신뢰도 저하")
+    sh = vals(r'^/c/sys/syslog$', r'(?:host|hst\d?)')
+    if sh:
+        R.g('NET-033', f"syslog 서버: {', '.join(sh[:3])}", "syslog 설정", "로깅 설정됨")
+        R.g('NET-036', f"원격 로그서버 {len(sh)}개: {', '.join(sh[:3])}", "원격 syslog 서버 설정", "외부 전송 가능")
+    else:
+        R.b('NET-033', "syslog 서버 미설정", "syslog 설정", "로깅 미설정")
+        R.b('NET-036', "syslog host 미설정", "원격 syslog 서버 설정", "로그 외부 전송 없음 - 장비 손상 시 로그 유실 위험")
+    return R.r
+
+
+def _net_a10_checks(lines, text):
+    """A10 ACOS — snmp-server SNMPv1-v2c <사용자> / community read|read-write, enable-management service, terminal idle-timeout 전용 판정"""
+    L = [l.rstrip() for l in lines if l.strip() and not l.lstrip().startswith("!")]
+    S = [l.strip() for l in L]
+    R = _NR()
+
+    def find(pat):
+        return [s for s in S if re.match(pat, s, re.I)]
+    def first(pat):
+        r = find(pat)
+        return r[0] if r else None
+
+    _net_common_manual(R, "A10 ACOS")
+    comms, v3_weak, cur = [], [], None
+    for l in L:
+        if re.match(r'snmp-server\s+SNMPv1-v2c\s+\S+', l, re.I):
+            cur = True; continue
+        m = re.match(r'\s+community\s+(read-write|read)\s+(\S+)(.*)$', l, re.I)
+        if m and cur:
+            rest = m.group(3)
+            rm = re.search(r'\bremote\s+(\S+)\s+(\S+)', rest, re.I)
+            restricted = bool(rm) and rm.group(2) == "255.255.255.255"
+            comms.append({"name": m.group(2), "rw": m.group(1).lower() == "read-write", "restricted": restricted})
+            continue
+        if re.match(r'\S', l):
+            cur = None
+    has_v3 = bool(find(r'snmp-server\s+SNMPv3\b'))
+    for s in find(r'snmp-server\s+SNMPv3\s+group\s+\S+\s+v3\s+(?!priv)'):
+        v3_weak.append(s)
+    _net_snmp_eval(R, comms, v3_weak, has_v3)
+    adm = find(r'admin\s+\S+\s+password')
+    if adm:
+        R.m('NET-007', f"로컬 관리자 {len(adm)}명: {', '.join(a.split()[1] for a in adm[:5])}", "운영자 1인 1계정, 계정별 권한 적정", "1인 1계정·권한 적정성 인터뷰 확인")
+    else:
+        R.m('NET-007', "admin 계정 설정 미발견(기본 admin 계정 사용 여부 확인)", "Local 사용자 설정", "기본 계정 사용 여부 수동 확인")
+    plain = [a.split()[1] for a in adm if not re.search(r'password\s+encrypted\b', a, re.I)] + \
+            ([ "enable-password" ] if first(r'enable-password\s+(?!encrypted\b)\S+') else [])
+    if plain: R.b('NET-011', f"암호화되지 않은 비밀번호 설정: {', '.join(plain[:5])}", "비밀번호 암호화 저장", f"평문 저장 {len(plain)}건")
+    elif adm: R.m('NET-011', "비밀번호 모두 encrypted 형식", "안전한 암호 알고리즘", "저장 알고리즘 수동 확인")
+    it = first(r'terminal\s+idle-timeout\s+\d+')
+    if it:
+        n = int(it.split()[-1])
+        if n == 0 or n > 15: R.b('NET-014', it + (" (무제한)" if n == 0 else ""), "세션 타임아웃 15분 이하", "타임아웃 초과/무제한")
+        else: R.g('NET-014', it, "세션 타임아웃 15분 이하", f"{n}분 설정")
+    else:
+        R.m('NET-014', "terminal idle-timeout 미설정", "세션 타임아웃 15분 이하", "기본 타임아웃 수동 확인")
+    em = find(r'enable-management\s+service\s+\S+')
+    em_names = [e.split()[-1].lower() for e in em]
+    if "telnet" in em_names:
+        R.b('NET-015', "enable-management service telnet 활성", "SSH(https) 전용 관리", "Telnet 평문 접속 허용")
+    elif "ssh" in em_names:
+        R.g('NET-015', f"관리 서비스: {', '.join(em_names)} (telnet 없음)", "SSH 전용", "SSH 전용 접속")
+    else:
+        R.m('NET-015', "enable-management 설정 미확인", "SSH 전용", "원격 관리 프로토콜 수동 확인")
+    svc = []
+    if "telnet" in em_names: svc.append("Telnet 관리")
+    if "http" in em_names: svc.append("HTTP 관리")
+    if comms: svc.append("SNMP(v1/v2c)")
+    if svc: R.b('NET-030', f"활성 불필요 서비스 {len(svc)}개 - {'; '.join(svc)}", "SNMP-v1v2/Telnet/HTTP 등 불필요 서비스 비활성화", f"비활성화 필요: {', '.join(svc)}")
+    else: R.g('NET-030', "불필요 서비스 미발견 (Telnet·HTTP 관리·SNMP v1/v2c 비활성)", "주요 불필요 서비스 전체 비활성화", "기준 명시 서비스 비활성화 확인됨")
+    ntp = find(r'ntp\s+server\s+\S+')
+    if ntp: R.g('NET-031', f"NTP 서버: {ntp[0]}" + (f" 외 {len(ntp)-1}개" if len(ntp) > 1 else ""), "NTP 서버 동기화 설정", f"NTP {len(ntp)}개 서버 설정됨")
+    else: R.b('NET-031', "NTP 서버 미설정", "ntp server 설정", "시간 동기화 미설정 - 로그 시간 신뢰도 저하")
+    lg = find(r'logging\s+host\s+\S+')
+    if lg:
+        R.g('NET-033', f"로깅 설정: {lg[0]}", "syslog 설정", "로깅 설정됨")
+        R.g('NET-036', f"원격 로그서버 {len(lg)}개: {'; '.join(lg[:3])}", "원격 syslog 서버 설정", "외부 전송 가능")
+    else:
+        R.b('NET-033', "logging host 미설정", "syslog 설정", "로깅 미설정")
+        R.b('NET-036', "logging host 미설정", "원격 syslog 서버 설정", "로그 외부 전송 없음 - 장비 손상 시 로그 유실 위험")
+    bn = [re.sub(r'^banner\s+\S+\s+', '', s, flags=re.I) for s in find(r'banner\s+(login|motd|exec)\s+\S')]
+    _net_banner_eval(R, bn, "banner login/motd")
+    return R.r
 
 def build_net_checks(lines, text):
     """
-    다중 벤더 네트워크 장비 점검
-    Cisco IOS/IOS-XE / ASA / Juniper JunOS / Alteon / Dell FTOS / D-Link
+    다중 벤더 네트워크 장비 점검 — 벤더별 판정 후 결과 문구의 community·비밀번호·해시·키 마스킹
+    Cisco IOS/IOS-XE / ASA / NX-OS / Juniper JunOS / Alteon / A10 / Dell FTOS / D-Link
+    NET-001~NET-059 → {code: (결과, 현황문자열)}
+    """
+    raw = _build_net_checks_raw(lines, text)
+    return {k: (v[0], mask_net_secrets(v[1])) for k, v in raw.items()}
+
+
+def _build_net_checks_raw(lines, text):
+    vendor = detect_net_vendor(text)
+    if vendor == "DLINK":
+        return build_dlink_checks(lines, text)
+    nos = _net_os(text)
+    if nos == "ASA":
+        return _net_asa_checks(lines, text)
+    if nos == "NXOS":
+        return _net_nxos_checks(lines, text)
+    if vendor == "JUNIPER":
+        return _net_junos_checks(lines, text)
+    if vendor == "ALTEON":
+        return _net_alteon_checks(lines, text)
+    if vendor == "A10":
+        return _net_a10_checks(lines, text)
+    return _net_checks_ios(lines, text)
+
+def _net_checks_ios(lines, text):
+    """
+    Cisco IOS / IOS-XE / Dell FTOS 등 IOS 계열 문법 장비 점검 (그 외 벤더는 _build_net_checks_raw 에서 전용 함수로 분기)
     NET-001~NET-059 → {code: (결과, 현황문자열)}
     """
     vendor = detect_net_vendor(text)
@@ -1085,16 +2095,20 @@ def build_net_checks(lines, text):
         ifaces = []
         cur_if = None
         for l in lines:
-            m = re.match(r'\s*interface\s+(\S+)', l, re.I)
+            m = re.match(r'interface\s+(\S+)(?:\s+(\d[\d/.:]*))?', l, re.I)
             if m:
                 if cur_if: ifaces.append(cur_if)
-                cur_if = {"name": m.group(1), "shutdown": False, "has_ip": False, "switchport": False}
+                cur_if = {"name": m.group(1) + ((" " + m.group(2)) if m.group(2) else ""), "shutdown": False, "has_ip": False, "switchport": False, "sub": []}
             elif cur_if:
-                if re.search(r'^\s*shutdown', l, re.I):  cur_if["shutdown"] = True
-                if re.search(r'ip address', l, re.I):    cur_if["has_ip"] = True
-                if re.search(r'switchport', l, re.I):    cur_if["switchport"] = True
-                if re.match(r'^[a-z!]', l, re.I) and not l.startswith(' '):
+                if re.match(r'^\S', l):   # 들여쓰기 없는 줄 = 인터페이스 블록 종료
                     ifaces.append(cur_if); cur_if = None
+                    continue
+                s = l.strip()
+                if not s: continue
+                cur_if["sub"].append(s)
+                if re.match(r'shutdown\s*$', s, re.I):  cur_if["shutdown"] = True
+                if re.match(r'ip address\s+(\d|dhcp|negotiated)', s, re.I) or re.match(r'ip unnumbered\s', s, re.I):  cur_if["has_ip"] = True
+                if re.match(r'switchport\b', s, re.I):  cur_if["switchport"] = True
         if cur_if: ifaces.append(cur_if)
         return ifaces
 
@@ -1112,7 +2126,7 @@ def build_net_checks(lines, text):
             if in_named:
                 if re.match(r'^\S', l):
                     in_named = False; continue
-                m = re.match(r'(?:\d+\s+)?(permit|deny)\s+(.*)$', s, re.I)
+                m = re.match(r'(?:(?:seq\s+)?\d+\s+)?(permit|deny)\s+(.*)$', s, re.I)
                 if m: out.append((m.group(1).lower(), m.group(2)))
         return out if found else None
 
@@ -1154,108 +2168,55 @@ def build_net_checks(lines, text):
     # ──────────────────────────────────────────────────────────────
     # NET-003: SNMP 버전
     # ──────────────────────────────────────────────────────────────
-    has_comm  = find_lines(r'snmp-server community\s+\S+|/c/cfg/sys/ssnmp')
-    has_v3    = any_m(r'snmp-server.*version 3|snmp-server group.*v3|snmpv3')
-    pub_priv  = find_lines(r'snmp-server community\s+(public|private)\b')
+    comms, v3_weak, v3_rw, acl_items = [], [], [], []
+
+    def _acl_state(name):
+        if not name: return False
+        ent = acl_entries(name)
+        if ent is None: return None
+        return _acl_host_only_entries(ent)[0] if ent else None
+
+    for ln in find_lines(r'^\s*snmp-server\s+community\s+'):
+        m = re.match(r'\s*snmp-server\s+community\s+(?:(\d)\s+)?(\S+)(.*)$', ln, re.I)
+        enc, cname, rest = m.group(1), m.group(2), m.group(3)
+        rw, acl, tk = False, None, rest.split()
+        i = 0
+        while i < len(tk):
+            w = tk[i].lower()
+            if w == "view": i += 2; continue
+            if w == "ro": i += 1; continue
+            if w == "rw": rw = True; i += 1; continue
+            if w == "ipv6": i += 2; continue
+            if w == "ipv4": i += 1; continue
+            acl = tk[i]; i += 1
+        comms.append({"name": cname, "rw": rw, "enc": enc in ("7", "5", "6"), "restricted": _acl_state(acl)})
+    for ln in find_lines(r'^\s*snmp-server\s+group\s+\S+\s+v3\b'):
+        m = re.match(r'\s*snmp-server\s+group\s+(\S+)\s+v3\s+(\S+)(.*)$', ln, re.I)
+        if m.group(2).lower() != "priv": v3_weak.append(ln.strip())
+        if re.search(r'\bwrite\s+\S+', m.group(3), re.I): v3_rw.append(f"v3 group {m.group(1)} 쓰기 view")
+        am = re.search(r'\baccess\s+(?:ipv6\s+\S+\s+)?(\S+)', m.group(3), re.I)
+        acl_items.append({"name": m.group(1), "label": f"v3 group {m.group(1)}", "restricted": _acl_state(am.group(1) if am else None)})
+    names_seen = {c["name"] for c in comms}
+    for ln in find_lines(r'^\s*snmp-server\s+host\s+'):
+        mh = re.search(r'\bversion\s+(1|2c)(?:\s+\S+)?\s+(\S+)\s*$', ln, re.I) or re.search(r'^\s*snmp-server\s+host\s+\S+\s+(?:(?:traps|informs)\s+)?(?!version\b)(\S+)\s*$', ln, re.I)
+        if mh and mh.group(mh.lastindex).lower() not in ("traps", "informs") and mh.group(mh.lastindex) not in names_seen:
+            comms.append({"name": mh.group(mh.lastindex), "rw": False, "trap": True, "restricted": None})
+            names_seen.add(mh.group(mh.lastindex))
+    has_comm = [c for c in comms if not c.get("trap")]
+    has_v3 = any_m(r'snmp-server.*version 3|snmp-server group.*v3|snmp-server user\b|snmpv3')
     v3_groups = find_lines(r'snmp-server group\s+\S+\s+v3\s+\S+')
-    v3_weak   = [g for g in v3_groups if not re.search(r'\sv3\s+priv\b', g, re.I)]
-    if v3_weak:
-        results['NET-003'] = ng(fmt(f"SNMPv3 보안레벨 AuthPriv 미적용: {v3_weak[0]}", "SNMP v3 사용 시 보안레벨 AuthPriv(priv)",
-                                    "SNMPv3 auth/noauth 그룹 존재 - priv 적용 필요"))
-    elif has_v3 and not has_comm:
-        results['NET-003'] = ok(fmt(
-            f"SNMP v3 전용 사용 ({fline(r'snmp-server group.*v3')})",
-            "SNMP v3 사용 시 보안레벨 AuthPriv",
-            "SNMP v3 priv 적용됨"
-        ))
-    elif pub_priv:
-        results['NET-003'] = ng(fmt(
-            f"기본 community 사용: {pub_priv[0]}",
-            "public/private community 미사용",
-            "기본 community 사용 - 즉시 변경 필요"
-        ))
-    elif has_comm:
-        # 평가기준 복잡도: 영문+숫자 10자 이상 또는 영문+숫자+특수문자 8자 이상 (암호화된 문자열은 판정 불가)
-        weak_c, ok_c, unk = [], [], []
-        for ln in has_comm:
-            m = re.search(r'snmp-server community\s+(?:\d\s+)?(\S+)', ln, re.I)
-            if not m:
-                unk.append(ln.strip()); continue
-            cs = m.group(1)
-            if re.search(r'community\s+[0-9]\s+\S+', ln, re.I):
-                unk.append(f"{cs[:4]}…(암호화)"); continue
-            has_a, has_d = bool(re.search(r'[A-Za-z]', cs)), bool(re.search(r'\d', cs))
-            has_s = bool(re.search(r'[^A-Za-z0-9]', cs))
-            good = has_a and has_d and (len(cs) >= 10 or (has_s and len(cs) >= 8))
-            masked = cs[:2] + "*" * max(0, len(cs) - 2)
-            (ok_c if good else weak_c).append(f"{masked}({len(cs)}자)")
-        if weak_c:
-            results['NET-003'] = ng(fmt(f"복잡도 미달 community: {', '.join(weak_c[:3])}",
-                                        "영문+숫자 10자 이상 또는 영문+숫자+특수 8자 이상 (v3 권고)", "community 복잡도 미달"))
-        elif unk:
-            results['NET-003'] = mc(fmt(f"community 확인 불가: {', '.join(unk[:3])}", "community 복잡도", "수동 확인"))
-        else:
-            results['NET-003'] = mc(fmt(f"v2c community 복잡도 충족: {', '.join(ok_c[:3])}",
-                                        "SNMP v3 사용 가능한 환경에서 v2 이용 시 취약",
-                                        "복잡도 충족 - SNMPv3 사용 가능 환경인지 확인 (가능하면 취약)"))
-    else:
-        results['NET-003'] = ok(fmt("SNMP 미사용 (snmp-server 설정 없음)", "SNMP 미사용 시 양호", "SNMP 미사용 확인됨"))
-
-    # NET-004: SNMP community 권한
-    rw_comm = find_lines(r'snmp-server community\s+\S+\s+RW')
-    if rw_comm:
-        results['NET-004'] = ng(fmt(
-            f"RW community: {rw_comm[0]}",
-            "SNMP RW(쓰기) community 미사용",
-            f"RW community {len(rw_comm)}개 설정 - 제거 필요"
-        ))
-    elif has_v3 and not has_comm:
-        results['NET-004'] = ok(fmt("SNMP v3 사용 (community 없음)", "RW community 미사용", "RW community 없음"))
-    elif has_comm:
-        results['NET-004'] = ok(fmt(
-            f"RO community만 사용: {has_comm[0]}",
-            "RW community 미사용",
-            "RO community만 설정됨"
-        ))
-    else:
-        results['NET-004'] = na(fmt("SNMP 미사용", "해당 없음", "SNMP 미사용"))
-
-    # NET-005: SNMP ACL
-    if has_comm or v3_groups:
-        # 평가기준: ACL 미적용 또는 단일 IP 단위가 아니면(예: 10.10.10.0/25) 취약
-        no_acl, acl_refs = [], []
-        for ln in has_comm:
-            m = re.search(r'snmp-server community\s+(?:\d\s+)?\S+(?:\s+view\s+\S+)?\s+(?:RO|RW)\s+(?:ipv6\s+\S+\s+)?(\S+)\s*$', ln, re.I)
-            (acl_refs.append((ln, m.group(1))) if m else no_acl.append(ln))
-        for g in v3_groups:
-            m = re.search(r'\saccess\s+(?:ipv6\s+\S+\s+)?(\S+)', g, re.I)
-            (acl_refs.append((g, m.group(1))) if m else no_acl.append(g))
-        wide, unknown, okl = [], [], []
-        for ln, acl in acl_refs:
-            ent = acl_entries(acl)
-            if ent is None:
-                unknown.append(acl); continue
-            good, w = acl_host_only(ent)
-            if good is None: unknown.append(f"{acl}(extended)")
-            else: (okl.append(acl) if good else wide.append(f"ACL {acl}: {w[0]}"))
-        if no_acl:
-            results['NET-005'] = ng(fmt(f"ACL 미적용: {no_acl[0]}", "SNMP ACL 을 단일 IP 단위로 적용", f"ACL 없는 SNMP 설정 {len(no_acl)}건"))
-        elif wide:
-            results['NET-005'] = ng(fmt("; ".join(wide[:3]), "SNMP ACL 을 단일 IP 단위로 적용 (예: 10.10.10.0/25 취약)", "대역·any 허용 ACL"))
-        elif unknown:
-            results['NET-005'] = mc(fmt(f"참조 ACL 정의 없음: {', '.join(unknown)}", "SNMP ACL 단일 IP", "ACL 정의·허용 IP 수동 확인"))
-        else:
-            results['NET-005'] = ok(fmt(f"단일 IP ACL 적용: {', '.join(okl)}", "SNMP ACL 단일 IP", "SNMP 접근 IP 단일 호스트로 제한됨 (불필요 IP 여부 확인)"))
-    else:
-        results['NET-005'] = na(fmt("SNMP 미사용", "해당 없음", "SNMP 미사용"))
+    pub_priv = [c for c in comms if c["name"].lower() in ("public", "private")]
+    _tmp = _NR()
+    _net_snmp_eval(_tmp, comms, v3_weak, has_v3, v3_rw, acl_items)
+    results.update(_tmp.r)
 
     # NET-006: 외부 인터페이스 SNMP 차단
     vrf_only = any_m(r'snmp-server host.*vrf\s+\S+.*version 3') and not has_comm
-    acl_deny_snmp = any_m(r'deny.*udp.*161|deny.*snmp')
+    acl_deny_snmp = find_lines(r'deny.*udp.*161|deny.*snmp')
     if vrf_only:
         results['NET-006'] = ok(fmt("VRF Mgmt 전용 SNMP v3 호스트 설정 (관리망 분리)", "관리망 한정 SNMP 허용", "외부 SNMP 접근 차단됨"))
     elif acl_deny_snmp:
-        results['NET-006'] = ok(fmt("외부 SNMP 차단 ACL 적용됨", "외부 인터페이스 SNMP 차단 ACL", "외부 SNMP 차단 확인됨"))
+        results['NET-006'] = mc(fmt(f"SNMP(udp 161) 차단 규칙: {acl_deny_snmp[0][:70]}", "외부 인터페이스 SNMP 차단 ACL", "차단 규칙 정의 확인 - 외부 인터페이스 적용 여부 수동 확인"))
     else:
         snmp_hosts = find_lines(r'snmp-server host\s+\S+')
         host_str = ", ".join(snmp_hosts[:3]) if snmp_hosts else "없음"
@@ -1301,7 +2262,7 @@ def build_net_checks(lines, text):
         ))
 
     # NET-008: AAA
-    aaa_new = any_m(r'aaa new-model')
+    aaa_new = any_m(r'^\s*aaa new-model')
     tacacs  = find_lines(r'tacacs server\s+\S+|tacacs-server host\s+\S+')
     radius  = find_lines(r'radius server\s+\S+|radius-server host\s+\S+')
     if aaa_new and (tacacs or radius):
@@ -1348,7 +2309,7 @@ def build_net_checks(lines, text):
     no_pw_lines = [l for l in no_pw_lines if not re.search(r'secret|password\s+\d?\s*\S{3,}', l, re.I)]
 
     all_user_lines = find_lines(r'^\s*username\s+')
-    has_pw_lines   = [l for l in all_user_lines if re.search(r'secret|password', l, re.I)]
+    has_pw_lines   = [l for l in all_user_lines if re.search(r'\b(secret|password|sha256-password|sha512-password)\s+\S', l, re.I) and not re.search(r'\bnopassword\b', l, re.I)]
     # D-Link 등은 'username X password ..' 와 'username X privilege N' 을 별도 줄로 저장 → 다른 줄에 비밀번호가 있으면 제외
     pw_users = {m.group(1) for l in has_pw_lines for m in [re.match(r'\s*username\s+(\S+)', l, re.I)] if m}
     no_pw_lines = [l for l in no_pw_lines
@@ -1410,8 +2371,8 @@ def build_net_checks(lines, text):
         ))
 
     # NET-010: enable secret
-    es = fline(r'enable secret')
-    ep = fline(r'enable password')
+    es = fline(r'^\s*enable\s+(?:algorithm-type\s+\S+\s+)?(?:secret|sha256-password|sha512-password)\b')
+    ep = fline(r'^\s*enable\s+password\b')
     if not es and not ep:
         results['NET-010'] = ng(fmt("enable secret/password 미설정", "enable secret 설정 필수", "enable 접근 무인증 - 즉시 설정 필요"))
     elif ep and not es:
@@ -1422,13 +2383,18 @@ def build_net_checks(lines, text):
 
     # NET-011: 사용자·관리자 비밀번호 암호화 및 알고리즘 강도 (type 0=평문, 7=가역, 5=MD5, 4=취약 SHA256 → 취약 / 8·9 → 양호)
     weak, strong = [], []
-    type_name = {0: "평문", 7: "type7(가역)", 5: "type5(MD5)", 4: "type4(취약 SHA256)", 8: "type8(PBKDF2)", 9: "type9(scrypt)"}
-    for ln in find_lines(r'^\s*(username\s+\S+.*\s(secret|password)\s|enable\s+(secret|password)\s)'):
+    type_name = {0: "평문", 7: "type7(가역)", 5: "type5(MD5)", 4: "type4(취약 SHA256)", 8: "type8(PBKDF2)", 9: "type9(scrypt)", 6: "type6(AES)"}
+    for ln in find_lines(r'^\s*(username\s+\S+.*\s(secret|password|sha256-password|sha512-password)\s|enable\s+(?:algorithm-type\s+\S+\s+)?(secret|password|sha256-password|sha512-password)\s)'):
+        if re.search(r'\bnopassword\b', ln, re.I): continue
+        alg = re.search(r'algorithm-type\s+(\w+)', ln, re.I)
         m = re.search(r'\b(secret|password)\s+(\d)\s+\S', ln, re.I)
-        kind = (m.group(1).lower() if m else re.search(r'\b(secret|password)\b', ln, re.I).group(1).lower())
-        t = int(m.group(2)) if m else (5 if kind == "secret" else 0)
-        who = re.sub(r'\s+(secret|password)\s+.*$', '', ln.strip(), flags=re.I)
-        (strong if t in (8, 9) else weak).append(f"{who}: {type_name.get(t, f'type{t}')}")
+        if re.search(r'\bsha(256|512)-password\b', ln, re.I): t_ = 8
+        elif alg: t_ = {"scrypt": 9, "sha256": 8, "md5": 5}.get(alg.group(1).lower(), 5)
+        elif m: t_ = int(m.group(2))
+        else: t_ = 5 if re.search(r'\bsecret\b', ln, re.I) else 0
+        who = re.sub(r'\s+algorithm-type\s+\S+', '', ln.strip(), flags=re.I)
+        who = re.sub(r'\s+(secret|password|sha256-password|sha512-password)\s+.*$', '', who, flags=re.I)
+        (strong if t_ in (8, 9) else weak).append(f"{who}: {type_name.get(t_, 'type' + str(t_))}")
     pw_enc = any_m(r'^\s*service password-encryption')
     if weak:
         results['NET-011'] = ng(fmt("; ".join(weak[:5]), "비밀번호 안전한 알고리즘(type 8/9) 암호화",
@@ -1474,16 +2440,19 @@ def build_net_checks(lines, text):
                 f"VTY ACL 없음 - 모든 IP에서 원격 접근 가능"
             ))
         elif acl_lines:
-            any_acl, unk_acl = [], []
+            any_acl, unk_acl, band_acl = [], [], []
             for al in acl_lines:
                 nm = re.search(r'access-class\s+(\S+)', al).group(1)
                 ent = acl_entries(nm)
                 if ent is None: unk_acl.append(nm)
                 elif any(a == "permit" and re.match(r'(ip\s+|tcp\s+)?any\b', r, re.I) for a, r in ent): any_acl.append(nm)
+                elif not _acl_host_only_entries(ent)[0]: band_acl.append(nm)
             if any_acl:
                 results['NET-013'] = ng(fmt(f"VTY ACL 에 permit any: {', '.join(any_acl)}", "지정된 최소한의 IP 만 허용", "모든 IP 허용 ACL"))
             elif unk_acl:
                 results['NET-013'] = mc(fmt(f"{'; '.join(acl_lines)} (ACL 정의 없음: {', '.join(unk_acl)})", "VTY ACL 최소 IP", "ACL 정의·허용 IP 수동 확인"))
+            elif band_acl:
+                results['NET-013'] = mc(fmt(f"VTY ACL {', '.join(band_acl)} 가 대역 허용", "VTY ACL 단일 IP", "허용 대역 적정성 수동 확인"))
             else:
                 results['NET-013'] = ok(fmt(
                     f"{'; '.join(acl_lines)}",
@@ -1540,6 +2509,8 @@ def build_net_checks(lines, text):
     elif any_m(r'^feature \S') and not any_m(r'transport input'):   # NX-OS: VTY transport 명령 없음, Telnet 은 feature telnet 으로 활성
         results['NET-015'] = ng(fmt("feature telnet 활성", "SSH 전용 (no feature telnet)", "Telnet 평문 접속 허용")) if any_m(r'^feature telnet\b') \
             else ok(fmt(f"NX-OS feature telnet 미사용{' / feature ssh' if any_m(r'^feature ssh') else ''}", "SSH 전용", "Telnet 비활성 (NX-OS 기본)"))
+    elif vendor == "DELL" and any_m(r'^\s*ip telnet server enable'):
+        results['NET-015'] = ng(fmt("ip telnet server enable (Telnet 서버 활성)", "Telnet 차단, SSH 전용", "Telnet 평문 접속 허용"))
     elif not vty_blocks:
         results['NET-015'] = mc(fmt("VTY 없음", "VTY transport input ssh", "수동 확인"))
     else:
@@ -1583,20 +2554,20 @@ def build_net_checks(lines, text):
     # NET-022: source routing (라우터만 해당)
     if is_pure_l2:
         results['NET-022'] = na(fmt("L2 스위치", "라우터 해당 항목", "L2 스위치 N-A"))
-    elif any_m(r'no ip source-route'):
+    elif any_m(r'^\s*no ip source-route') and not any_m(r'^\s*ip source-route'):
         results['NET-022'] = ok(fmt("no ip source-route 설정됨", "no ip source-route 설정", "IP 소스라우팅 차단됨"))
     else:
         results['NET-022'] = ng(fmt("no ip source-route 미설정 (기본 활성)", "no ip source-route 명시 설정", "IP 소스라우팅 허용 - 경로 우회 공격 위험"))
 
     # NET-026: Proxy ARP
-    no_proxy = find_lines(r'no ip proxy-arp')
-    real_ip = [i for i in ifaces if i["has_ip"] and "Loopback" not in i["name"]]
+    real_ip = [i for i in ifaces if i["has_ip"] and not i["shutdown"] and not re.match(r'(loopback|null|tunnel)', i["name"], re.I)]
+    pa_miss = [i["name"] for i in real_ip if not any(re.match(r'no ip proxy-arp\b', x, re.I) for x in i["sub"])]
     if not real_ip:
         results['NET-026'] = na(fmt("IP 라우팅 인터페이스 없음", "Proxy ARP 비활성화", "라우팅 없음"))
-    elif len(no_proxy) >= len(real_ip):
-        results['NET-026'] = ok(fmt(f"no ip proxy-arp: {len(no_proxy)}개 인터페이스", "모든 인터페이스 Proxy ARP 비활성", "Proxy ARP 전체 차단됨"))
-    elif no_proxy:
-        results['NET-026'] = ng(fmt(f"no ip proxy-arp {len(no_proxy)}개 / 전체 IP 인터페이스 {len(real_ip)}개", "no ip proxy-arp 설정 (인터페이스별)", f"{len(real_ip) - len(no_proxy)}개 인터페이스 Proxy ARP 허용"))
+    elif not pa_miss:
+        results['NET-026'] = ok(fmt(f"no ip proxy-arp: {len(real_ip)}개 인터페이스 전체", "모든 인터페이스 Proxy ARP 비활성", "Proxy ARP 전체 차단됨"))
+    elif len(pa_miss) < len(real_ip):
+        results['NET-026'] = ng(fmt(f"no ip proxy-arp 미설정 인터페이스 {len(pa_miss)}/{len(real_ip)}개: {', '.join(pa_miss[:4])}", "no ip proxy-arp 설정 (인터페이스별)", f"{len(pa_miss)}개 인터페이스 Proxy ARP 허용"))
     else:
         results['NET-026'] = ng(fmt(f"no ip proxy-arp 미설정 (IP 인터페이스 {len(real_ip)}개)", "no ip proxy-arp 전체 설정", "Proxy ARP 허용 - ARP 스푸핑 위험"))
 
@@ -1640,8 +2611,8 @@ def build_net_checks(lines, text):
                 svc_disabled.append(sname)
 
         # 2. SNMP (v1/v2c community 사용 = 불필요/위험 서비스)
-        snmp_pub  = find_lines(r"snmp-server community\s+(public|private)")
-        snmp_v12  = find_lines(r"snmp-server community\s+\S+")
+        snmp_pub  = find_lines(r"^\s*snmp-server community\s+(?:\d\s+)?(public|private)\b")
+        snmp_v12  = find_lines(r"^\s*snmp-server community\s+\S+")
         snmp_v3   = any_m(r"snmp-server.*version 3|snmp-server group.*v3")
         if snmp_pub:
             svc_enabled.append("SNMP(기본community)")
@@ -1672,31 +2643,36 @@ def build_net_checks(lines, text):
             svc_disabled.append("BOOTP서버")
 
         # 5. DHCP 서버
-        if (any_m(r"^\s*service dhc") or any_m(r"ip dhcp pool")) and not any_m(r"no service dhcp"):
+        if (any_m(r"^\s*service dhcp") or any_m(r"^\s*ip dhcp pool")) and not any_m(r"^\s*no service dhcp"):
             svc_enabled.append("DHCP서버")
             svc_detail["DHCP서버"] = fline(r"ip dhcp pool") or "dhcp pool 설정됨"
         else:
             svc_disabled.append("DHCP서버")
 
         # 6. Domain lookup (기본 활성 - 명시 비활성화 없으면 취약)
-        if not any_m(r"no ip domain.?lookup|no ip domain lookup"):
+        if vendor == "DELL" or _net_brand(text)[0] == "D-LINK":   # IOS 기본값(활성) 가정 항목은 이 제조사에 적용하지 않음
+            if any_m(r"^\s*ip domain.?lookup\b"):
+                svc_enabled.append("Domain-lookup"); svc_detail["Domain-lookup"] = fline(r"^\s*ip domain.?lookup") or "ip domain lookup"
+            else:
+                svc_disabled.append("Domain-lookup")
+        elif not any_m(r"^\s*no ip domain.?lookup"):
             svc_enabled.append("Domain-lookup")
             svc_detail["Domain-lookup"] = "no ip domain-lookup 미설정 (기본 활성화 상태)"
         else:
-            l = fline(r"no ip domain.?lookup")
+            l = fline(r"^\s*no ip domain.?lookup")
             svc_disabled.append(f"Domain-lookup(비활성:{l})")
 
         # 7. PAD
-        if any_m(r"^\s*service pa"):
+        if any_m(r"^\s*service pad\b") and not any_m(r"^\s*no service pad\b"):
             svc_enabled.append("PAD")
-            svc_detail["PAD"] = fline(r"service pad") or "service pad"
+            svc_detail["PAD"] = fline(r"^\s*service pad") or "service pad"
         else:
             svc_disabled.append("PAD")
 
         # 8. Finger
-        if any_m(r"^\s*service finge|^\s*ip finge"):
+        if any_m(r"^\s*service finger\b|^\s*ip finger\b"):
             svc_enabled.append("Finger")
-            svc_detail["Finger"] = fline(r"service finger|ip finger") or "finger"
+            svc_detail["Finger"] = fline(r"^\s*(service|ip) finger") or "finger"
         else:
             svc_disabled.append("Finger")
 
@@ -1791,8 +2767,8 @@ def build_net_checks(lines, text):
     elif vendor == "JUNIPER":
         results['NET-034'] = ok(fmt("Junos 기본 타임스탬프 포함", "로그 시간 기록", "Junos 로그 시간 기본 포함"))
     else:
-        ts_log = fline(r'service timestamps log')
-        ts_dbg = fline(r'service timestamps debug')
+        ts_log = fline(r'^\s*service timestamps log')
+        ts_dbg = fline(r'^\s*service timestamps debug')
         if ts_log:
             results['NET-034'] = ok(fmt(
                 f"{ts_log}" + (f" / {ts_dbg}" if ts_dbg else ""),
@@ -1800,7 +2776,7 @@ def build_net_checks(lines, text):
                 "로그 타임스탬프 설정됨 - 정확한 시간 기록"
             ))
         else:
-            results['NET-034'] = ng(fmt("service timestamps log 미설정", "service timestamps log datetime msec 설정 필요", "로그에 시간 미포함 - 사후 분석 어려움"))
+            results['NET-034'] = ng(fmt(("no service timestamps log (명시적 비활성)" if any_m(r'^\s*no service timestamps log') else "service timestamps log 미설정"), "service timestamps log datetime msec 설정 필요", "로그에 시간 미포함 - 사후 분석 어려움"))
 
     # NET-035: 로그 버퍼 크기
     if vendor == "ASA":
@@ -1812,10 +2788,10 @@ def build_net_checks(lines, text):
         else:
             results['NET-035'] = ng(fmt("logging buffer-size 미설정", "logging buffer-size 16384 이상", "버퍼 미설정"))
     else:
-        buf = fline(r'logging buffered\s+')
+        buf = fline(r'^\s*logging buffered\b')
         if buf:
-            m = re.search(r'logging buffered\s+(\d+)(?:\s+(\S+))?', buf, re.I)
-            size  = int(m.group(1)) if m else 0
+            m = re.search(r'logging buffered\s+(\d+)(?:\s+(\S+))?', buf, re.I) or re.search(r'logging buffered\s+()(\S+)?', buf, re.I)
+            size  = int(m.group(1)) if m and m.group(1) else 0
             level = m.group(2) if m and m.group(2) else "informational"
             # 평가기준: 버퍼 메모리 설정이 없을 경우만 취약 (크기 무관)
             results['NET-035'] = ok(fmt(
@@ -1834,7 +2810,8 @@ def build_net_checks(lines, text):
     elif vendor == "JUNIPER":
         log_hosts = find_lines(r'set system syslog host\s+\S+')
     else:
-        log_hosts = find_lines(r'logging host\s+\S+')
+        log_hosts = find_lines(r'^\s*logging\s+(?:host\s+|server\s+)?\d{1,3}(?:\.\d{1,3}){3}\b') + find_lines(r'^\s*logging\s+host\s+\S+') + find_lines(r'^\s*logging\s+server\s+\S+')
+        log_hosts = list(dict.fromkeys(log_hosts))
 
     if log_hosts:
         hosts_str = "; ".join(log_hosts[:3])
@@ -1975,15 +2952,17 @@ def build_net_checks(lines, text):
             results[c] = na(fmt("L2 스위치", "라우터 해당 항목", "L2 스위치 N-A"))
     else:
         # NET-043~046: ICMP 세부
-        no_redir = find_lines(r'no ip redirects')
-        no_unrch = find_lines(r'no ip unreachables')
-        no_mask  = find_lines(r'no ip mask-reply')
-        results['NET-043'] = ok(fmt(f"no ip redirects: {len(no_redir)}개 인터페이스", "no ip redirects 설정", "ICMP Redirect 차단됨")) if (no_redir or any_m(r'no ip redirects')) else ng(fmt("no ip redirects 미설정", "no ip redirects 인터페이스 적용", "ICMP Redirect 허용 - 라우팅 조작 가능"))
-        _ipif = [i for i in ifaces if i["has_ip"] and not re.match(r'(loopback|null)', i["name"], re.I)]
-        if no_unrch and len(no_unrch) >= len(_ipif):
-            results['NET-044'] = ok(fmt(f"no ip unreachables: {len(no_unrch)}개 인터페이스", "인터페이스마다 no ip unreachables", "ICMP Unreachable 차단됨"))
+        l3_if = [i for i in ifaces if i["has_ip"] and not i["shutdown"] and not re.match(r'(loopback|null|tunnel)', i["name"], re.I)]
+        redir_miss = [i["name"] for i in l3_if if not any(re.match(r'no ip redirects\b', x, re.I) for x in i["sub"])]
+        unr_miss = [i["name"] for i in l3_if if not any(re.match(r'no ip unreachables\b', x, re.I) for x in i["sub"])]
+        if not l3_if:
+            results['NET-043'] = na(fmt("IP 인터페이스 없음", "no ip redirects", "해당 없음"))
+            results['NET-044'] = na(fmt("IP 인터페이스 없음", "no ip unreachables", "해당 없음"))
         else:
-            results['NET-044'] = ng(fmt(f"no ip unreachables {len(no_unrch)}개 / IP 인터페이스 {len(_ipif)}개", "인터페이스마다 no ip unreachables", "ICMP Unreachable 미차단 인터페이스 존재"))
+            results['NET-043'] = ng(fmt(f"no ip redirects 미설정 인터페이스 {len(redir_miss)}/{len(l3_if)}개: {', '.join(redir_miss[:4])}", "인터페이스마다 no ip redirects", "ICMP Redirect 허용 - 라우팅 조작 가능")) if redir_miss \
+                else ok(fmt(f"no ip redirects: {len(l3_if)}개 인터페이스 전체", "인터페이스마다 no ip redirects", "ICMP Redirect 차단됨"))
+            results['NET-044'] = ng(fmt(f"no ip unreachables 미설정 인터페이스 {len(unr_miss)}/{len(l3_if)}개: {', '.join(unr_miss[:4])}", "인터페이스마다 no ip unreachables", "ICMP Unreachable 미차단 인터페이스 존재")) if unr_miss \
+                else ok(fmt(f"no ip unreachables: {len(l3_if)}개 인터페이스 전체", "인터페이스마다 no ip unreachables", "ICMP Unreachable 차단됨"))
         # 평가기준: 인터페이스에 ip mask-reply 설정이 '존재'할 때만 취약 (IOS 기본 비활성)
         mask_on = [l.strip() for l in find_lines(r'^\s*ip mask-reply')]
         results['NET-045'] = ng(fmt(f"ip mask-reply 설정: {len(mask_on)}개 인터페이스", "ip mask-reply 미설정", "Subnet Mask 정보 노출 가능")) if mask_on else ok(fmt("ip mask-reply 설정 없음 (IOS 기본 비활성)", "ip mask-reply 미설정", "ICMP Mask Reply 비활성"))
@@ -2081,9 +3060,9 @@ def build_net_checks(lines, text):
     # ──────────────────────────────────────────────────────────────
     # NET-051: TCP keepalive (다시 - 설정값 + 방향)
     # ──────────────────────────────────────────────────────────────
-    ka_in  = any_m(r'service tcp-keepalives-in')
-    ka_out = any_m(r'service tcp-keepalives-out')
-    ka_gen = any_m(r'service tcp-keepalives\b')
+    ka_in  = any_m(r'^\s*service tcp-keepalives-in')
+    ka_out = any_m(r'^\s*service tcp-keepalives-out')
+    ka_gen = any_m(r'^\s*service tcp-keepalives\b')
 
     if ka_in and ka_out:
         results['NET-051'] = ok(fmt(
@@ -2259,29 +3238,65 @@ def build_net_checks(lines, text):
     else:
         results['NET-058'] = ng(fmt("login block-for / authentication failure rate 미설정", "로그인 실패 시 차단 설정", "무제한 로그인 시도 허용 - 무차별 공격 취약"))
 
-    # 벤더 전용 파서가 없는 항목은 IOS 문법 기준으로 판정되므로, 비 Cisco 장비의 '취약'은 수동확인으로 전환
-    _aware = {"JUNIPER": {"NET-007", "NET-011", "NET-030", "NET-031", "NET-033", "NET-034", "NET-036", "NET-037", "NET-050", "NET-057"},
-              "ALTEON":  {"NET-007", "NET-015", "NET-030", "NET-031", "NET-033", "NET-036"}}
-    if vendor == "JUNIPER" and not any_m(r'^set '):   # 계층형(show configuration) 형식은 set 기반 전용 파서 적용 불가
-        _aware["JUNIPER"] = set()
+    # 벤더 전용 파서가 없는 항목은 IOS 문법 기준으로 판정되므로, 비 Cisco 장비는 IOS 문법을 적용할 수 없는 항목을 수동확인으로 전환
+    #   (근거 문구에 IOS 명령을 노출하지 않는다 — 벤더 문법으로 판정할 수 있는 항목만 유지)
+    _aware = {"DELL": {"NET-003", "NET-004", "NET-005", "NET-006", "NET-007", "NET-009", "NET-010", "NET-011", "NET-013", "NET-014", "NET-015",
+                       "NET-016", "NET-030", "NET-031", "NET-033", "NET-035", "NET-036", "NET-037", "NET-050", "NET-057"}}
     if vendor not in ("CISCO", "ASA"):
+        _vname = {"DELL": "Dell FTOS"}.get(vendor, vendor)
         for _c, _v in list(results.items()):
             if _v[0] in (RESULT_BAD, RESULT_GOOD, RESULT_NA) and _c not in _aware.get(vendor, set()):
-                results[_c] = mc(f"{vendor} 설정 문법 자동 판정 미지원 - 수동 확인 (IOS 기준 참고: {_v[1][:120]})")
+                results[_c] = mc(f"{_vname} 장비는 이 항목의 설정 문법 자동 판정을 지원하지 않음 - 장비에서 직접 확인 (수동 확인)")
 
-    # IOS 유사 문법 D-Link(DGS-3630 등): Cisco 기본값(미설정 = 활성) 가정 항목은 수동확인, CDP 는 미지원
+    # IOS 유사 문법 D-Link(DGS-3630 등): 제조사 기본값(미설정 = 활성) 가정 항목은 수동확인, CDP 는 미지원
     if _net_brand(text)[0] == "D-LINK":
         for _c in ("NET-022", "NET-026", "NET-034", "NET-043", "NET-044", "NET-051"):
             if results.get(_c, ("",))[0] == RESULT_BAD:
-                results[_c] = mc(f"D-Link 장비 - Cisco 기본값 기준 판정 불가, 장비 기본값 확인 필요 (IOS 기준 참고: {results[_c][1][:120]})")
+                results[_c] = mc(f"D-Link 장비 - 해당 기능의 제조사 기본값 확인이 필요하여 설정만으로 판정 불가 (수동 확인)")
         if results.get('NET-057', ("",))[0] == RESULT_BAD:
             _m = re.search(r'활성 취약 서비스:\s*([^\[]+)', results['NET-057'][1])
             _w = re.sub(r'CDP\([^)]*\)|\bCDP\b', '', _m.group(1) if _m else '').strip(' ,')
             _w = re.sub(r',\s*,', ',', _w)
-            results['NET-057'] = (ng(fmt(f"활성 취약 서비스: {_w}", "취약 서비스(CDP/LLDP/TFTP/Finger/identd/Smart Install 등) 비활성화",
+            results['NET-057'] = (ng(fmt(f"활성 취약 서비스: {_w}", "취약 서비스(LLDP/TFTP/Finger/identd 등) 비활성화",
                                          "취약 서비스 활성 - 비활성화 필요")) if _w else
                                   ok(fmt("CDP 미지원 장비(D-Link), 기타 기준 취약 서비스 미사용",
-                                         "취약 서비스(CDP/LLDP/TFTP/Finger/identd/Smart Install 등) 비활성화", "양호")))
+                                         "취약 서비스(LLDP/TFTP/Finger/identd 등) 비활성화", "양호")))
+        # line console/telnet/ssh + session-timeout / access-class / ip telnet server (D-Link IOS 유사 CLI)
+        _dl = _cfg_blocks(lines, r"^line\s+(console|telnet|ssh)\b")
+        _enc = any_m(r'^\s*service password-encryption')
+        _tel_off = any_m(r'^\s*no ip telnet server\b')
+        _act = [(h, sub) for h, sub in _dl if not h.lower().startswith("line console") and not (h.lower().startswith("line telnet") and _tel_off)]
+        if _act:
+            _noacl = [h for h, sub in _act if not any(x.lower().startswith("access-class") for x in sub)]
+            if _noacl:
+                results['NET-013'] = ng(fmt(f"access-class 미적용 라인: {', '.join(_noacl)}", "원격 접속 라인(telnet/ssh)에 access-class 적용", "원격 접속 IP 제한 없음"))
+            else:
+                _acls = [x.split()[1] for _, sub in _act for x in sub if x.lower().startswith("access-class") and len(x.split()) > 1]
+                _wide = [n for n in _acls if (acl_entries(n) is not None and not _acl_host_only_entries(acl_entries(n))[0])]
+                results['NET-013'] = (ng(fmt(f"접속 ACL {', '.join(_wide)} 가 any·대역 허용", "지정된 최소 IP 만 허용", "허용 범위 과다")) if _wide else
+                                      ok(fmt(f"원격 접속 라인 {len(_act)}개 모두 access-class 적용: {', '.join(sorted(set(_acls)))}", "원격 접속 IP 제한", "접속 ACL 적용됨 - 허가 IP 적정성 확인")))
+        _tos, _badt = [], []
+        for h, sub in _dl:
+            _m = next((re.match(r"session-timeout\s+(\d+)", x, re.I) for x in sub if re.match(r"session-timeout\s+\d+", x, re.I)), None)
+            _v = int(_m.group(1)) if _m else 3
+            _tos.append(f"{h}: session-timeout {_v}분" + ("" if _m else "(기본값)"))
+            if _v == 0 or _v > 15: _badt.append(f"{h}: {'무제한' if _v == 0 else str(_v) + '분'}")
+        if _dl:
+            results['NET-014'] = (ng(fmt(f"타임아웃 미흡: {'; '.join(_badt)}", "세션 타임아웃 15분 이하", "타임아웃 초과/무제한 라인 존재")) if _badt else
+                                  ok(fmt("; ".join(_tos), "세션 타임아웃 15분 이하", "모든 라인 타임아웃 기준 충족")))
+        if _tel_off:
+            results['NET-015'] = ok(fmt("no ip telnet server (Telnet 서버 비활성)", "Telnet 차단, SSH 전용", "Telnet 차단됨"))
+        else:
+            results['NET-015'] = ng(fmt("Telnet 서버 비활성화 설정(no ip telnet server) 없음 - 기본 활성", "Telnet 차단, SSH 전용", "Telnet 평문 접속 허용"))
+        _pw_plain = find_lines(r'^\s*(username\s+\S+.*\spassword\s+0\s|enable\s+password\s+0\s)')
+        _has_pw = find_lines(r'^\s*(username\s+\S+.*\spassword\s|enable\s+password\s)')
+        if _has_pw and not _enc:
+            results['NET-011'] = ng(fmt(f"service password-encryption 미설정 - 비밀번호 평문 저장 {len(_has_pw)}건", "비밀번호 암호화 저장", "비밀번호 평문 저장"))
+        elif _has_pw:
+            results['NET-011'] = mc(fmt("service password-encryption 설정 (D-Link 제공 최고 수준 암호화)", "안전한 암호 알고리즘", "저장 알고리즘의 보안강도 수동 확인"))
+        if find_lines(r'^\s*enable\s+password\b'):
+            results['NET-010'] = (ok(fmt("enable password 설정 + service password-encryption", "enable 비밀번호 설정·암호화", "enable 비밀번호 암호화 저장")) if _enc else
+                                  ng(fmt("enable password 설정 (암호화 저장 아님)", "enable 비밀번호 설정·암호화", "enable 비밀번호 평문 저장")))
 
     # NET-059: EoS
     results['NET-059'] = mc(fmt(
@@ -2297,12 +3312,24 @@ def build_net_checks(lines, text):
 # 점검 파일 헤더에서 대상 유형 탐지 (OS/DB/네트워크 세부 분기용)
 # ================================================================
 def _net_brand(text):
-    """config 머리말(주석)의 제조사·모델·펌웨어 — 설정 문법이 IOS 계열이어도 실제 제조사 식별 (예: D-Link DGS-3630)"""
+    """config 머리말(주석)의 제조사·모델·펌웨어 — 설정 문법이 IOS 계열이어도 실제 제조사 식별 (예: D-Link DGS-3630),
+    Cisco ASA·NX-OS·Dell FTOS 는 OS 종류를 제조사 표기에 포함 (보고서 OS 열·조치 명령 선택에 사용)"""
     head = "\n".join(l for l in text.splitlines()[:30] if l.lstrip().startswith(("!", "#")))
     m = re.search(r"\b((?:DGS|DES|DXS|DWS)-[\w-]+)", head, re.I)
     if m or re.search(r"d-link", head, re.I):
         fw = re.search(r"Firmware:\s*(?:Build\s*)?(\S+)", head, re.I)
         return "D-LINK", (m.group(1) if m else ""), (fw.group(1) if fw else "")
+    nos = _net_os(text)
+    if nos == "ASA":
+        v = re.search(r"^ASA Version\s+(\S+)", text, re.M)
+        hw = re.search(r"Hardware:\s*(ASA\w+)", text)
+        return "CISCO ASA", (hw.group(1) if hw else ""), (v.group(1) if v else "")
+    if nos == "NXOS":
+        v = re.search(r"^version\s+(\S+)", text, re.M)
+        return "CISCO NX-OS", "", (v.group(1) if v else "")
+    if nos == "DELL":
+        v = re.search(r"^!\s*Version\s+(\S+)", text, re.M | re.I)
+        return "DELL FTOS", "", (v.group(1) if v else "")
     return "", "", ""
 
 
@@ -2322,7 +3349,32 @@ def _cfg_blocks(lines, pat):
     return out
 
 
+def _net_acl_entries(lines, name):
+    """번호/이름 ACL 의 (permit|deny, 본문) 목록 — 정의가 없으면 None"""
+    out, found, in_named = [], False, False
+    for l in lines:
+        s = l.strip()
+        m = re.match(r'access-list\s+(\S+)\s+(permit|deny)\s+(.*)$', s, re.I)
+        if m and m.group(1) == name:
+            found = True; out.append((m.group(2).lower(), m.group(3))); continue
+        m = re.match(r'ip(?:v4)? access-list\s+(?:(?:standard|extended)\s+)?(\S+)', s, re.I)
+        if m and re.match(r'^\S', l):
+            in_named = (m.group(1) == name); found = found or in_named; continue
+        if in_named:
+            if re.match(r'^\S', l):
+                in_named = False; continue
+            m = re.match(r'(?:(?:seq\s+)?\d+\s+)?(permit|deny)\s+(.*)$', s, re.I)
+            if m: out.append((m.group(1).lower(), m.group(2)))
+    return out if found else None
+
+
 def build_net_kisa_checks(lines, text):
+    """주요정보(MI) N-xx 직접 판정 + 결과 문구의 community·비밀번호·해시·키 마스킹"""
+    raw = _build_net_kisa_checks_raw(lines, text)
+    return {k: (v[0], mask_net_secrets(v[1])) for k, v in raw.items()}
+
+
+def _build_net_kisa_checks_raw(lines, text):
     """
     주요정보(MI) 2026 상세가이드 N-xx 항목 직접 판정 (IOS 계열 문법 장비)
     - 평가기준 NET-030/NET-057 등이 여러 가이드 항목을 통합 점검 → 서비스별 분리 판정
@@ -2330,7 +3382,7 @@ def build_net_kisa_checks(lines, text):
     - 제조사(D-Link 등) 기본값 차이 반영, L3 인터페이스 보유 여부로 인터페이스 항목 적용
     """
     vendor = detect_net_vendor(text)
-    if vendor not in ("CISCO", "ASA"):
+    if vendor != "CISCO" or _net_os(text) == "NXOS":   # ASA·NX-OS·Juniper·Dell 등은 IOS 문법 판정을 쓰지 않고 전자금융 항목(NET-)의 벤더별 판정에서 변환
         return {}
     brand, model, _ = _net_brand(text)
     dlink = brand == "D-LINK"
@@ -2349,7 +3401,8 @@ def build_net_kisa_checks(lines, text):
     r = {}
     ifs = _cfg_blocks(lines, r"^interface\s+\S+")
     l3_ifs = [h.split(None, 1)[1] for h, sub in ifs
-              if any(re.match(r"ip address\s+\d", x, re.I) for x in sub)
+              if any(re.match(r"ip address\s+(\d|dhcp|negotiated)|ip unnumbered\s", x, re.I) for x in sub)
+              and not any(re.match(r"shutdown\s*$", x, re.I) for x in sub)
               and not re.match(r"(?i)(mgmt|management|loopback|null)", h.split(None, 1)[1])]
     routing = bool(on(r"^\s*(ip routing|router\s+(ospf|bgp|eigrp|rip|isis))\b"))
     switch = bool(on(r"^\s*(vlan\s+\d|spanning-tree)")) or any(re.match(r"(?i)vlan", n) for n in l3_ifs) \
@@ -2361,11 +3414,20 @@ def build_net_kisa_checks(lines, text):
     remote = _cfg_blocks(lines, r"^line\s+(vty|telnet|ssh)\b")
     rnames = ", ".join(h for h, _ in remote)
     if remote:
-        acl = [x for _, sub in remote for x in sub if x.lower().startswith("access-class")] \
-            or [on(r"^\s*(ip\s+)?(ssh|telnet)\s+.*access-class\b|^\s*ip\s+(ssh|telnet)\s+acl\b|.*trusted-host")]
-        acl = [a for a in acl if a]
-        r["N-06"] = ((RESULT_GOOD, f"원격 접속 접근 제한 설정: {acl[0]}") if acl
-                     else (RESULT_BAD, f"원격 접속 라인({rnames})에 접근 제한 ACL(access-class) 미설정"))
+        act = [(h, sub) for h, sub in remote if not any(re.fullmatch(r"(?i)transport input none|no exec", x) for x in sub)]
+        noacl = [h for h, sub in act if not any(x.lower().startswith("access-class") for x in sub)]
+        gacl = on(r"^\s*(ip\s+)?(ssh|telnet)\s+.*access-class\b|^\s*ip\s+(ssh|telnet)\s+acl\b")
+        names = [x.split()[1] for _, sub in act for x in sub if x.lower().startswith("access-class") and len(x.split()) > 1]
+        anyacl = [n for n in names if _net_acl_entries(lines, n) is not None
+                  and any(a_ == "permit" and re.match(r"(?i)(ip\s+|tcp\s+)?any\b", r_) for a_, r_ in _net_acl_entries(lines, n))]
+        if not act:
+            r["N-06"] = (RESULT_GOOD, f"원격 접속 라인({rnames}) 모두 접속 차단(transport input none / no exec)")
+        elif noacl and not gacl:
+            r["N-06"] = (RESULT_BAD, f"원격 접속 라인({', '.join(noacl)})에 접근 제한 ACL(access-class) 미설정")
+        elif anyacl:
+            r["N-06"] = (RESULT_BAD, f"원격 접속 ACL({', '.join(sorted(set(anyacl)))})에 permit any - 접속 IP 제한 효과 없음")
+        else:
+            r["N-06"] = (RESULT_GOOD, f"원격 접속 접근 제한 설정: {gacl or ', '.join(sorted(set(names)))} (라인 {len(act)}개)")
         tos = []
         for h, sub in remote:
             m = next((re.match(r"exec-timeout\s+(\d+)(?:\s+(\d+))?", x, re.I) for x in sub
