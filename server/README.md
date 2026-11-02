@@ -6,7 +6,7 @@
 |------|----|------|------|
 | `check_server.sh` | Linux / AIX / HP-UX / Solaris | 전자금융 · 주요정보 | **이것만 실행하면 됨** — 메뉴에서 기준 선택 (`srv` / `u` / `all`) |
 | `check_server_u.sh` | Linux / Unix | 주요정보 U-01~67 | `check_server.sh` 가 호출 (단독 실행도 가능) |
-| `check_server_srv.sh` | Linux / Unix | 전자금융 SRV | 전자금융 단독 실행용 |
+| `check_server_srv.sh` | Linux / Unix | 전자금융 SRV | 전자금융 단독 실행용 — `check_server.sh srv` 를 실행 (결과 `_srv` 파일명) |
 | `run_server.bat` | Windows Server 2008 R2~2025 | 전자금융 · 주요정보 | **이것만 실행하면 됨** — 관리자 권한, 메뉴에서 기준 선택 |
 | `check_server.ps1` | Windows Server | 전자금융 SRV | `run_server.bat` 가 호출 |
 | `check_server_w.ps1` | Windows Server | 주요정보 W-01~64 | `run_server.bat` 가 호출 |

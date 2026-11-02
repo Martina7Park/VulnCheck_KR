@@ -1,7 +1,8 @@
 @echo off
 title Server Security Check
 
-net session >nul 2>&1
+rem 관리자 권한 확인: net session 은 Server 서비스 중지 시 관리자여도 실패 → fltmc 사용
+fltmc >nul 2>&1
 if %errorlevel% neq 0 (
     echo [ERROR] Run as Administrator.
     echo         Right-click this file ^> Run as administrator

@@ -54,7 +54,7 @@ $hn     = $env:COMPUTERNAME
 # PS 2.0(2008 R2 기본) 호환: Get-CimInstance 가 없으면 Get-WmiObject 로 대체
 if (-not (Get-Command Get-CimInstance -EA SilentlyContinue)) {
     function Get-CimInstance {
-        param([Parameter(Position=0)][Alias('Class')][string]$ClassName, [string]$Namespace = 'root\cimv2', [string]$Filter, $ErrorAction)
+        param([Parameter(Position=0)][Alias('Class')][string]$ClassName, [string]$Namespace = 'root\cimv2', [string]$Filter)   # -ErrorAction 은 공통 매개변수(중복 선언 시 PS 2.0 에서 모든 호출 실패)
         $p = @{ Class = $ClassName; Namespace = $Namespace; ErrorAction = 'SilentlyContinue' }
         if ($Filter) { $p.Filter = $Filter }
         Get-WmiObject @p
@@ -104,8 +104,8 @@ function Get-SvcState([string]$Name) {
         return @{Status="$($s.Status)";Start=$st}
     } catch {
         # Get-CimInstance 우선, WMI 미사용 환경을 위한 레지스트리 폴백
-        $s = Get-CimInstance Win32_Service -Filter "Name='$Name'" -EA SilentlyContinue
-        if ($s) { return @{Status=$s.State;Start=$s.StartMode} }
+        $ws = Get-CimInstance Win32_Service -Filter "Name='$Name'" -EA SilentlyContinue
+        if ($ws) { return @{Status=$ws.State;Start=$ws.StartMode} }
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
         if (Test-Path $regPath) {
             $r = Get-ItemProperty $regPath -EA SilentlyContinue
@@ -153,7 +153,7 @@ function Get-LocalGroupMemberNames([string]$sid) {   # 로캘 무관(SID → 그
     try {
         $gn = (New-Object Security.Principal.SecurityIdentifier $sid).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
         $g  = [ADSI]"WinNT://$env:COMPUTERNAME/$gn,group"
-        return @($g.psbase.Invoke('Members') | ForEach-Object { ($_.GetType().InvokeMember('ADsPath','GetProperty',$null,$_,$null) -replace '^WinNT://','') -replace '/','\' })
+        return ,@($g.psbase.Invoke('Members') | ForEach-Object { ($_.GetType().InvokeMember('ADsPath','GetProperty',$null,$_,$null) -replace '^WinNT://','') -replace '/','\' })
     } catch { return $null }
 }
 function Get-IisFtpSites {   # IIS 7+ FTP 사이트별 설정(siteDefaults 상속 반영). $null = 설정 파일 없음/파싱 실패, @() = FTP 바인딩 사이트 없음
@@ -174,8 +174,8 @@ function Get-IisFtpSites {   # IIS 7+ FTP 사이트별 설정(siteDefaults 상�
         $out += New-Object PSObject -Property @{
             Name    = $s.name
             Anon    = & $pick $fs.security.authentication.anonymousAuthentication.enabled $d.security.authentication.anonymousAuthentication.enabled
-            Ctl     = & $pick $fs.security.ssl.controlChannelPolicy $d.security.ssl.controlChannelPolicy
-            Dat     = & $pick $fs.security.ssl.dataChannelPolicy $d.security.ssl.dataChannelPolicy
+            Ctl     = $(if ($v = & $pick $fs.security.ssl.controlChannelPolicy $d.security.ssl.controlChannelPolicy) { $v } else { 'SslRequire' })   # 미기재 = IIS FTP 스키마 기본값 SslRequire
+            Dat     = $(if ($v = & $pick $fs.security.ssl.dataChannelPolicy $d.security.ssl.dataChannelPolicy) { $v } else { 'SslRequire' })
             Banner  = & $pick $fs.messages.suppressDefaultBanner $d.messages.suppressDefaultBanner
             IpRestr = [bool]($ip -and ("$($ip.allowUnlisted)" -eq 'false' -or @($ip.add | Where-Object { $_ }).Count -gt 0))
             Root    = if ($vd) { [Environment]::ExpandEnvironmentVariables("$($vd.physicalPath)") } else { $null } }
@@ -288,7 +288,7 @@ try {
     $vuln020 = @()
     Get-SmbShare -EA Stop | Where-Object {$_.Name -notmatch "^IPC\$"} | ForEach-Object {
         $acl = Get-SmbShareAccess -Name $_.Name -EA SilentlyContinue
-        if ($acl | Where-Object {$_.AccountName -match "Everyone" -and $_.AccessRight -ne "Deny"}) {
+        if ($acl | Where-Object {$_.AccountName -match "Everyone|모든 사용자" -and "$($_.AccessControlType)" -eq "Allow"}) {
             $vuln020 += $_.Name
         }
     }
@@ -442,8 +442,8 @@ else { Pass "SRV-072" "Administrator 계정명 변경됨: $an072" }
 # ── SRV-073: 관리자 그룹 불필요 사용자 ─────────────────────────
 try {
     Evd "SRV-073" "net localgroup Administrators 2>`$null"
-    $members073 = @(Get-LocalGroupMemberNames 'S-1-5-32-544'); $started073 = $false
-    if ($members073.Count -eq 0) { foreach ($line in (net localgroup Administrators 2>$null)) {
+    $members073 = Get-LocalGroupMemberNames 'S-1-5-32-544'; $started073 = $false
+    if ($null -eq $members073 -or $members073.Count -eq 0) { $members073 = @();  foreach ($line in (net localgroup Administrators 2>$null)) {
         if ($line -match "^---") { $started073 = $true; continue }
         if ($started073 -and $line.Trim() -ne "" -and $line -notmatch "^The command|^명령을") {
             $members073 += $line.Trim()
@@ -586,7 +586,8 @@ foreach ($ln in 'Application','Security','System') {
     $svc = "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\$ln"; $pol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\$ln"
     $rga = Get-Reg $svc 'RestrictGuestAccess'
     $mxK = Get-Reg $pol 'MaxSize'   # 그룹 정책: KB 단위(우선)
-    $mxB = if ($null -ne $mxK) { [int64]$mxK * 1KB } else { Get-Reg $svc 'MaxSize' }
+    $mxB = if ($null -ne $mxK) { ([int64]$mxK -band 0xFFFFFFFFL) * 1KB } else { Get-Reg $svc 'MaxSize' }
+    if ($null -eq $mxK -and $null -ne $mxB) { $mxB = [int64]$mxB -band 0xFFFFFFFFL }   # 레지스트리 DWORD 는 Int32 로 읽혀 2GB 초과 시 음수
     $inf108 += "$ln RestrictGuestAccess=$rga MaxSize=$(if ($null -ne $mxB) { '{0}KB' -f [int64]($mxB/1KB) } else { '?' })$(if ($null -ne $mxK) { '(정책)' })"
     if ("$rga" -eq '0') { $bad108 += "$ln Guest 접근 허용" } elseif ($null -eq $rga) { $unk108 += "$ln RestrictGuestAccess 없음" }
     if ($null -eq $mxB) { $unk108 += "$ln MaxSize 없음" } elseif ([int64]$mxB -lt 10240KB) { $bad108 += "$ln 로그 크기 $([int64]($mxB/1KB))KB(<10240KB)" }

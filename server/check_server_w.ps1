@@ -24,7 +24,7 @@ $hn     = $env:COMPUTERNAME
 # PS 2.0(2008 R2 기본) 호환: Get-CimInstance 가 없으면 Get-WmiObject 로 대체
 if (-not (Get-Command Get-CimInstance -EA SilentlyContinue)) {
     function Get-CimInstance {
-        param([Parameter(Position=0)][Alias('Class')][string]$ClassName, [string]$Namespace = 'root\cimv2', [string]$Filter, $ErrorAction)
+        param([Parameter(Position=0)][Alias('Class')][string]$ClassName, [string]$Namespace = 'root\cimv2', [string]$Filter)   # -ErrorAction 은 공통 매개변수(중복 선언 시 PS 2.0 에서 모든 호출 실패)
         $p = @{ Class = $ClassName; Namespace = $Namespace; ErrorAction = 'SilentlyContinue' }
         if ($Filter) { $p.Filter = $Filter }
         Get-WmiObject @p
@@ -74,8 +74,8 @@ function Get-SvcState([string]$Name) {
         return @{Status="$($s.Status)";Start=$st}
     } catch {
         # Get-CimInstance 우선, WMI 미사용 환경을 위한 레지스트리 폴백
-        $s = Get-CimInstance Win32_Service -Filter "Name='$Name'" -EA SilentlyContinue
-        if ($s) { return @{Status=$s.State;Start=$s.StartMode} }
+        $ws = Get-CimInstance Win32_Service -Filter "Name='$Name'" -EA SilentlyContinue
+        if ($ws) { return @{Status=$ws.State;Start=$ws.StartMode} }
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
         if (Test-Path $regPath) {
             $r = Get-ItemProperty $regPath -EA SilentlyContinue
@@ -123,7 +123,7 @@ function Get-LocalGroupMemberNames([string]$sid) {   # 로캘 무관(SID → 그
     try {
         $gn = (New-Object Security.Principal.SecurityIdentifier $sid).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
         $g  = [ADSI]"WinNT://$env:COMPUTERNAME/$gn,group"
-        return @($g.psbase.Invoke('Members') | ForEach-Object { ($_.GetType().InvokeMember('ADsPath','GetProperty',$null,$_,$null) -replace '^WinNT://','') -replace '/','\' })
+        return ,@($g.psbase.Invoke('Members') | ForEach-Object { ($_.GetType().InvokeMember('ADsPath','GetProperty',$null,$_,$null) -replace '^WinNT://','') -replace '/','\' })
     } catch { return $null }
 }
 function Get-IisFtpSites {   # IIS 7+ FTP 사이트별 설정(siteDefaults 상속 반영). $null = 설정 파일 없음/파싱 실패, @() = FTP 바인딩 사이트 없음
@@ -144,8 +144,8 @@ function Get-IisFtpSites {   # IIS 7+ FTP 사이트별 설정(siteDefaults 상�
         $out += New-Object PSObject -Property @{
             Name    = $s.name
             Anon    = & $pick $fs.security.authentication.anonymousAuthentication.enabled $d.security.authentication.anonymousAuthentication.enabled
-            Ctl     = & $pick $fs.security.ssl.controlChannelPolicy $d.security.ssl.controlChannelPolicy
-            Dat     = & $pick $fs.security.ssl.dataChannelPolicy $d.security.ssl.dataChannelPolicy
+            Ctl     = $(if ($v = & $pick $fs.security.ssl.controlChannelPolicy $d.security.ssl.controlChannelPolicy) { $v } else { 'SslRequire' })   # 미기재 = IIS FTP 스키마 기본값 SslRequire
+            Dat     = $(if ($v = & $pick $fs.security.ssl.dataChannelPolicy $d.security.ssl.dataChannelPolicy) { $v } else { 'SslRequire' })
             Banner  = & $pick $fs.messages.suppressDefaultBanner $d.messages.suppressDefaultBanner
             IpRestr = [bool]($ip -and ("$($ip.allowUnlisted)" -eq 'false' -or @($ip.add | Where-Object { $_ }).Count -gt 0))
             Root    = if ($vd) { [Environment]::ExpandEnvironmentVariables("$($vd.physicalPath)") } else { $null } }
@@ -185,7 +185,9 @@ $lsa  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
 $pol  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
 $lmsv = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
 $tsP  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-$rdpOn = ("$(Get-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections')" -eq '0')
+$rdpDeny = Get-Reg $tsP 'fDenyTSConnections'   # 그룹 정책 우선
+if ($null -eq $rdpDeny) { $rdpDeny = Get-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' }
+$rdpOn = ("$rdpDeny" -eq '0')
 $ftpSites = Get-IisFtpSites
 $ftpSvc = Get-SvcState 'FTPSVC'; if (-not $ftpSvc) { $ftpSvc = Get-SvcState 'MSFTPSVC' }
 $ftpOn = $ftpSvc -and "$($ftpSvc.Status)" -match 'Running'
@@ -284,7 +286,7 @@ if ("$lb" -eq '0') { Fail "W-13" "'콘솔 로그온 시 로컬 계정에서 빈 
 
 # W-14 원격터미널 접속 가능한 사용자 그룹 제한
 $rdu = Get-LocalGroupMemberNames 'S-1-5-32-555'
-EvdQ "W-14" "원격 데스크톱 사용 / Remote Desktop Users 구성원" "fDenyTSConnections=$(Get-Reg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections') / $(@($rdu) -join ', ')"
+EvdQ "W-14" "원격 데스크톱 사용 / Remote Desktop Users 구성원" "fDenyTSConnections=$rdpDeny(정책 우선) / $(if ($null -eq $rdu) { '조회 실패' } else { @($rdu) -join ', ' })"
 if (-not $rdpOn) { Pass "W-14" "원격 데스크톱 사용 안 함 (fDenyTSConnections=1)" }
 elseif ($null -eq $rdu) { MC "W-14" "Remote Desktop Users 구성원 조회 실패 - 확인 필요" }
 elseif (-not @($rdu).Count) { Fail "W-14" "원격 데스크톱 사용 중이나 관리자 외 원격 접속 전용 계정 없음 (Remote Desktop Users 비어 있음 - 관리자 계정으로 원격 접속)" }
@@ -299,8 +301,16 @@ if ("$fk" -eq '2') { Pass "W-15" "'강력한 키 보호' - 키를 사용할 때�
 Evd "W-16" "Get-SmbShare -EA SilentlyContinue | Where-Object { `$_.Name -notmatch '\$$' } | ForEach-Object { Get-SmbShareAccess -Name `$_.Name } | Format-Table -AutoSize"
 $shr = @(Get-CimInstance Win32_Share -EA SilentlyContinue | Where-Object { $_.Type -eq 0 -and $_.Name -notmatch '\$$' })
 $ev16 = @()
-foreach ($s in $shr) { $a = @(Get-SmbShareAccess -Name $s.Name -EA SilentlyContinue | Where-Object { "$($_.AccountName)" -match 'Everyone|모든 사용자' -and "$($_.AccessControlType)" -eq 'Allow' }); if ($a.Count) { $ev16 += $s.Name } }
-if ($ev16.Count) { Fail "W-16" "Everyone 권한이 있는 공유: $($ev16 -join ', ')" } elseif ($shr.Count) { Pass "W-16" "일반 공유 $($shr.Count)개에 Everyone 권한 없음: $(($shr | ForEach-Object { $_.Name }) -join ', ')" } else { Pass "W-16" "일반 공유 디렉터리 없음" }
+$unk16 = @(); $hasSSA = [bool](Get-Command Get-SmbShareAccess -EA SilentlyContinue)
+foreach ($s in $shr) {
+    if ($hasSSA) { $a = @(Get-SmbShareAccess -Name $s.Name -EA SilentlyContinue | Where-Object { "$($_.AccountName)" -match 'Everyone|모든 사용자' -and "$($_.AccessControlType)" -eq 'Allow' }); if ($a.Count) { $ev16 += $s.Name }; continue }
+    # Windows 2008 R2 등 SmbShare 모듈 없음 → Win32_LogicalShareSecuritySetting (AceType 0 = Allow, S-1-1-0 = Everyone)
+    $ss = Get-WmiObject Win32_LogicalShareSecuritySetting -Filter "Name='$($s.Name -replace "'", "\'")'" -EA SilentlyContinue
+    $sd = if ($ss) { $ss.GetSecurityDescriptor() } else { $null }
+    if (-not $sd -or $sd.ReturnValue -ne 0) { $unk16 += $s.Name; continue }
+    if (@($sd.Descriptor.DACL | Where-Object { $_ -and $_.Trustee.SIDString -eq 'S-1-1-0' -and [int]$_.AceType -eq 0 }).Count) { $ev16 += $s.Name }
+}
+if ($ev16.Count) { Fail "W-16" "Everyone 권한이 있는 공유: $($ev16 -join ', ')" } elseif ($unk16.Count) { MC "W-16" "공유 권한 조회 실패: $($unk16 -join ', ') - 공유 속성 [권한]에서 Everyone 허용 여부 확인" } elseif ($shr.Count) { Pass "W-16" "일반 공유 $($shr.Count)개에 Everyone 권한 없음: $(($shr | ForEach-Object { $_.Name }) -join ', ')" } else { Pass "W-16" "일반 공유 디렉터리 없음" }
 
 # W-17 하드디스크 기본 공유 제거 (AutoShareServer=0, C$ 등 없음)
 $as = Get-Reg $lmsv 'AutoShareServer'; $dsh = @(Get-CimInstance Win32_Share -EA SilentlyContinue | Where-Object { $_.Name -match '^([A-Z]\$|ADMIN\$)$' } | ForEach-Object { $_.Name })
@@ -308,10 +318,10 @@ EvdQ "W-17" "AutoShareServer / 기본 공유" "$as / $($dsh -join ', ')"
 if ("$as" -eq '0' -and -not $dsh.Count) { Pass "W-17" "기본 공유 제거 (AutoShareServer=0)" } else { Fail "W-17" "기본 공유 존재 또는 자동 생성 (AutoShareServer=$(if ($null -eq $as) { '미정의=1' } else { $as }), 기본 공유: $(if ($dsh.Count) { $dsh -join ', ' } else { '없음' }))" }
 
 # W-18 불필요한 서비스 제거 (가이드 '일반적으로 불필요한 서비스')
-$svcA = [ordered]@{ Alerter="Alerter"; ClipSrv="Clipbook"; Browser="Computer Browser"; Messenger="Messenger"; mnmsrvc="NetMeeting Remote Desktop Sharing"; simptcp="Simple TCP/IP Services"
+$svcA = @{ RemoteRegistry="Remote Registry"; Alerter="Alerter"; ClipSrv="Clipbook"; Browser="Computer Browser"; Messenger="Messenger"; mnmsrvc="NetMeeting Remote Desktop Sharing"; simptcp="Simple TCP/IP Services"
     WZCSVC="Wireless Zero Configuration"; WmdmPmSN="Portable Media Serial Number"; ImapiService="IMAPI CD-Burning COM Service"; ERSvc="Error Reporting Service"; Irmon="Infrared Monitor"
     HidServ="Human Interface Device Access"; upnphost="Universal Plug and Play Device Host"; TrkWks="Distributed Link Tracking Client"; TrkSvr="Distributed Link Tracking Server" }
-$svcB = [ordered]@{ wuauserv="Automatic Updates(패치 관리 서버·수동 패치 시 불필요)"; CryptSvc="Cryptographic Services"; Dhcp="DHCP Client(고정 IP 시 불필요)"; Dnscache="DNS Client"; Spooler="Print Spooler(프린터 미사용 시 불필요)" }
+$svcB = @{ wuauserv="Automatic Updates(패치 관리 서버·수동 패치 시 불필요)"; CryptSvc="Cryptographic Services"; Dhcp="DHCP Client(고정 IP 시 불필요)"; Dnscache="DNS Client"; Spooler="Print Spooler(프린터 미사용 시 불필요)" }
 Evd "W-18" "Get-Service $((@($svcA.Keys)+@($svcB.Keys)) -join ',') -EA SilentlyContinue | Select-Object Name,DisplayName,Status,StartType | Format-Table -AutoSize"
 $runA = @(); foreach ($k in $svcA.Keys) { $s = Get-Service $k -EA SilentlyContinue; if ($s -and "$($s.Status)" -eq 'Running') { $runA += "$($svcA[$k])($k)" } }
 $runB = @(); foreach ($k in $svcB.Keys) { $s = Get-Service $k -EA SilentlyContinue; if ($s -and "$($s.Status)" -eq 'Running') { $runB += "$($svcB[$k])" } }
@@ -336,19 +346,30 @@ if (-not $ftpOn) {
 } else {
     $plain = @($ftpSites | Where-Object { "$($_.Ctl)" -notmatch 'SslRequire' -or "$($_.Dat)" -notmatch 'SslRequire' } | ForEach-Object { $_.Name })
     if ($null -eq $ftpSites) { MC "W-21" "FTP 서비스 구동 - IIS 설정 파싱 실패, FTPS(SSL 필요) 여부 확인" } elseif ($plain.Count) { Fail "W-21" "암호화되지 않은 FTP 허용 사이트(SSL 필요 아님): $($plain -join ', ')" } else { Pass "W-21" "FTP 사이트 모두 SSL 필요(FTPS)" }
+    if ($null -eq $ftpSites) { foreach ($c in "W-22","W-23","W-24") { MC $c "FTP 서비스 구동 - IIS 설정(applicationHost.config) 파싱 실패, FTP 사이트 설정 수동 확인" } } else {
     $ev22 = @(); foreach ($s in @($ftpSites)) { if ($s.Root -and (Test-Path $s.Root)) { $ac = @((Get-Acl $s.Root -EA SilentlyContinue).Access | Where-Object { (Get-AceSid $_) -eq 'S-1-1-0' }); if ($ac.Count) { $ev22 += "$($s.Name)($($s.Root))" } } }
     if ($ev22.Count) { Fail "W-22" "FTP 홈 디렉터리 Everyone 권한: $($ev22 -join ', ')" } else { Pass "W-22" "FTP 홈 디렉터리 Everyone 권한 없음" }
     $an23 = @($ftpSites | Where-Object { "$($_.Anon)" -eq 'true' } | ForEach-Object { $_.Name })
     if ($an23.Count) { Fail "W-23" "FTP 익명 인증 사용: $($an23 -join ', ')" } else { Pass "W-23" "FTP 익명 인증 사용 안 함" }
     $ip24 = @($ftpSites | Where-Object { -not $_.IpRestr } | ForEach-Object { $_.Name })
     if ($ip24.Count) { Fail "W-24" "FTP IP 접근 제어 미설정: $($ip24 -join ', ')" } else { Pass "W-24" "FTP 사이트 IP 접근 제어 설정" }
+    }
 }
 
 # W-25 DNS Zone Transfer (SecureSecondaries 0=모두 허용) / W-32 DNS 동적 업데이트 (AllowUpdate 0=없음)
 $zr = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\DNS Server\Zones'
 $zones = @(if (Test-Path $zr) { Get-ChildItem $zr -EA SilentlyContinue | Where-Object { $_.PSChildName -notmatch '^(TrustAnchors|RootDNSServers)$' } })
 EvdQ "W-25" "DNS 서비스 / 영역별 SecureSecondaries·AllowUpdate" "$(if ($dnsSvc) { $dnsSvc.Status } else { '미설치' }) / $(($zones | ForEach-Object { $p=Get-ItemProperty $_.PSPath; "$($_.PSChildName): xfer=$($p.SecureSecondaries) update=$($p.AllowUpdate)" }) -join '; ')"
+$dz = @(); if ($dnsOn -and (Get-Command Get-DnsServerZone -EA SilentlyContinue)) { $dz = @(Get-DnsServerZone -EA SilentlyContinue | Where-Object { -not $_.IsAutoCreated -and $_.ZoneName -ne 'TrustAnchors' -and "$($_.ZoneType)" -eq 'Primary' }) }
+if ($dz.Count) { EvdQ "W-25" "Get-DnsServerZone (AD 통합 영역 포함)" (($dz | ForEach-Object { "$($_.ZoneName): AD=$($_.IsDsIntegrated) xfer=$($_.SecureSecondaries) update=$($_.DynamicUpdate)" }) -join "`n") }
 if (-not $dnsOn) { Pass "W-25" "DNS 서비스 미사용"; Pass "W-32" "DNS 서비스 미사용" }
+elseif ($dz.Count) {   # DnsServer 모듈(2012+): SecureSecondaries TransferAnyServer = 모두 허용, DynamicUpdate None 이 아니면 사용
+    $x25 = @($dz | Where-Object { "$($_.SecureSecondaries)" -eq 'TransferAnyServer' } | ForEach-Object { $_.ZoneName })
+    if ($x25.Count) { Fail "W-25" "영역 전송을 모든 서버에 허용: $($x25 -join ', ')" } else { Pass "W-25" "영역 전송 허용 안 함 또는 특정 서버로 제한 ($($dz.Count)개 주 영역)" }
+    $u32 = @($dz | Where-Object { "$($_.DynamicUpdate)" -ne 'None' } | ForEach-Object { "$($_.ZoneName)($($_.DynamicUpdate))" })
+    if ($u32.Count) { Fail "W-32" "동적 업데이트 설정 영역: $($u32 -join ', ') - 가이드: '없음' (AD 통합 영역은 업무상 필요 시 '보안만' 예외 근거 확인)" } else { Pass "W-32" "모든 영역 동적 업데이트 없음" }
+}
+elseif (-not $zones.Count) { MC "W-25" "DNS 서비스 구동 중이나 영역 조회 불가(AD 통합 영역 가능) - DNS 관리자에서 영역 전송 설정 확인"; MC "W-32" "DNS 서비스 구동 중이나 영역 조회 불가(AD 통합 영역 가능) - DNS 관리자에서 동적 업데이트 설정 확인" }
 else {
     $x25 = @($zones | Where-Object { "$((Get-ItemProperty $_.PSPath).SecureSecondaries)" -eq '0' } | ForEach-Object { $_.PSChildName })
     if ($x25.Count) { Fail "W-25" "영역 전송을 모든 서버에 허용: $($x25 -join ', ')" } else { Pass "W-25" "영역 전송 허용 안 함 또는 특정 서버로 제한 ($($zones.Count)개 영역)" }
@@ -429,7 +450,8 @@ else { $age = ((Get-Date) - [datetime]$hf.InstalledOn).Days
 
 # W-39 백신 프로그램 업데이트 / W-45 백신 프로그램 설치
 $mp = $null; try { $mp = Get-MpComputerStatus -EA Stop } catch {}
-$avSvc = @(Get-Service -EA SilentlyContinue | Where-Object { "$($_.Status)" -eq 'Running' -and ($_.DisplayName -match 'AhnLab|V3 |ALYac|Symantec|McAfee|Trend Micro|Kaspersky|ESET|Sophos|CrowdStrike|SentinelOne|Trellix|Bitdefender|Cylance|Carbon Black' -or $_.Name -eq 'WinDefend') } | ForEach-Object { $_.DisplayName })
+$avKw  = '(?i)(microsoft|windows) defender|\bV3\b|ahnlab|alyac|virobot|hauri|sophos|symantec|endpoint protection|mcafee|trellix|trend ?micro|apex ?one|kaspersky|eset|bitdefender|avast|avira|cylance|carbon ?black|crowdstrike|falcon|sentinel ?one|antivirus|anti-?malware|백신'
+$avSvc = @(Get-Service -EA SilentlyContinue | Where-Object { "$($_.Status)" -eq 'Running' -and ($_.Name -match '^(WinDefend|WdNisSvc)$' -or ($_.DisplayName -match $avKw -and $_.DisplayName -notmatch '(?i)firewall|방화벽')) } | ForEach-Object { $_.DisplayName })
 EvdQ "W-45" "Defender / 백신 서비스" "$(if ($mp) { "AMServiceEnabled=$($mp.AMServiceEnabled) RealTime=$($mp.RealTimeProtectionEnabled) Sig=$($mp.AntivirusSignatureLastUpdated)" } else { '조회 불가' }) / $($avSvc -join ', ')"
 if (($mp -and $mp.AMServiceEnabled) -or $avSvc.Count) { Pass "W-45" "백신 설치: $(($avSvc + @(if ($mp -and $mp.AMServiceEnabled -and -not ($avSvc -match 'Defender')) { 'Microsoft Defender' })) -join ', ')" } else { Fail "W-45" "백신 프로그램 미탐지" }
 if ($mp -and $mp.AMServiceEnabled -and $mp.AntivirusSignatureLastUpdated) { $sa = ((Get-Date) - $mp.AntivirusSignatureLastUpdated).Days
@@ -440,7 +462,7 @@ else { Fail "W-39" "백신 프로그램 미탐지 - 업데이트 불가" }
 # ═══════════════ 4. 로그 관리 ═══════════════
 # W-40 정책에 따른 시스템 로깅 (감사 정책 권고 기준)  secedit 값: 0 없음 / 1 성공 / 2 실패 / 3 성공·실패
 if (-not $secOK) { MC "W-40" $secMsg } else {
-    $need = [ordered]@{ AuditAccountManage=@(2,'계정 관리: 실패'); AuditAccountLogon=@(3,'계정 로그온 이벤트: 성공/실패'); AuditPrivilegeUse=@(3,'권한 사용: 성공/실패')
+    $need = @{ AuditAccountManage=@(2,'계정 관리: 실패'); AuditAccountLogon=@(3,'계정 로그온 이벤트: 성공/실패'); AuditPrivilegeUse=@(3,'권한 사용: 성공/실패')
                         AuditDSAccess=@(2,'디렉터리 서비스 액세스: 실패'); AuditLogonEvents=@(3,'로그온 이벤트: 성공/실패'); AuditPolicyChange=@(3,'정책 변경: 성공/실패') }
     $miss = @(); $vals = @()
     foreach ($k in $need.Keys) { $v = Int0 (Get-SecPol $k); $vals += "$k=$v"; if ($null -eq $v -or (($v -band $need[$k][0]) -ne $need[$k][0])) { $miss += $need[$k][1] } }
@@ -529,6 +551,7 @@ if ("$apd" -eq '1') { Pass "W-55" "'사용자가 프린터 드라이버를 설�
 # W-56 SMB 세션 중단 관리 (로그온 시간 만료 시 연결 끊기 + 유휴 15분 이하)
 $efl = Get-Reg $lmsv 'EnableForcedLogOff'; $adc = Get-Reg $lmsv 'AutoDisconnect'; EvdQ "W-56" "EnableForcedLogOff / AutoDisconnect(분)" "$efl / $adc"
 $adcDef = ($null -eq $adc); if ($adcDef) { $adc = 15 }   # 미정의 = Windows 기본 15분
+$adc = [int64]$adc -band 0xFFFFFFFFL   # DWORD 가 Int32 로 읽혀 0xFFFFFFFF(연결 끊지 않음)가 -1 이 되는 것 방지
 if ("$efl" -ne '0' -and [int64]$adc -le 15) { Pass "W-56" "로그온 시간 만료 시 연결 끊기 사용$(if ($null -eq $efl) { '(기본값)' }), 유휴 ${adc}분$(if ($adcDef) { '(기본값)' })" } else { Fail "W-56" "SMB 세션 중단 설정 미흡 (EnableForcedLogOff=$efl, AutoDisconnect=${adc}분; 기준 사용 + 15분 이하)" }
 
 # W-57 로그온 시 경고 메시지
@@ -546,7 +569,7 @@ if ($null -eq $lm) { Pass "W-59" "LAN Manager 인증 수준 미정의 - Windows 
 
 # W-60 보안 채널 데이터 디지털 암호화 또는 서명 (3개 정책 사용)
 $nl = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'
-$v60 = [ordered]@{ RequireSignOrSeal=(Get-Reg $nl 'RequireSignOrSeal'); SealSecureChannel=(Get-Reg $nl 'SealSecureChannel'); SignSecureChannel=(Get-Reg $nl 'SignSecureChannel') }
+$v60 = @{ RequireSignOrSeal=(Get-Reg $nl 'RequireSignOrSeal'); SealSecureChannel=(Get-Reg $nl 'SealSecureChannel'); SignSecureChannel=(Get-Reg $nl 'SignSecureChannel') }
 EvdQ "W-60" "Netlogon 보안 채널 정책" (($v60.Keys | ForEach-Object { "$_=$($v60[$_])" }) -join ', ')
 $off60 = @($v60.Keys | Where-Object { "$($v60[$_])" -eq '0' })
 if ($off60.Count) { Fail "W-60" "보안 채널 정책 사용 안 함: $($off60 -join ', ')" } else { Pass "W-60" "보안 채널 데이터 암호화·서명 3개 정책 사용 (미정의는 기본값 사용)" }

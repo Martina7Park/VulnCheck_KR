@@ -232,7 +232,7 @@ result() {
 evd() {
     local item="$1"; shift
     printf '[%s] %s $ %s\n' "$item" "$(date '+%H:%M:%S')" "$*" >> "$_EVD"
-    eval "$@" >> "$_EVD" 2>&1
+    eval "$@" >> "$_EVD" 2>&1 </dev/null
     printf '\n' >> "$_EVD"
 }
 evd_file() {
@@ -253,9 +253,8 @@ get_perm() {
         [ -n "$rf" ] && [ -e "$rf" ] && f="$rf" || { echo ""; return; }
     fi
     case "$OS_FAMILY" in
-    AIX)     istat "$f" 2>/dev/null | awk '/Mode/{print $NF}' | head -1 ;;
     BSD)     stat -f "%Lp" "$f" 2>/dev/null ;;
-    SOLARIS|HPUX) ls -lL "$f" 2>/dev/null | awk '{p=substr($1,2);r=0;for(i=1;i<=9;i++){c=substr(p,i,1);if(c!="-")r+=2^(9-i)};printf "%03o\n",r}' ;;
+    AIX|SOLARIS|HPUX) ls -ldL "$f" 2>/dev/null | awk '{p=substr($1,2);r=0;for(i=1;i<=9;i++){c=substr(p,i,1);if(c!="-")r+=2^(9-i)};printf "%03o\n",r}' ;;
     *)       stat -c "%a" "$f" 2>/dev/null ;;
     esac
 }
@@ -267,22 +266,26 @@ get_owner() {
         [ -n "$rf" ] && [ -e "$rf" ] && f="$rf" || { echo ""; return; }
     fi
     case "$OS_FAMILY" in
-    AIX)     istat "$f" 2>/dev/null | awk '/Owner/{print $2}' ;;
     BSD)     stat -f "%Su" "$f" 2>/dev/null ;;
-    SOLARIS|HPUX) ls -lL "$f" 2>/dev/null | awk '{print $3}' ;;
+    AIX|SOLARIS|HPUX) ls -ldL "$f" 2>/dev/null | awk '{print $3}' ;;
     *)       stat -c "%U" "$f" 2>/dev/null ;;
     esac
 }
 _TO=$(command -v timeout 2>/dev/null)
 _to() { local s="$1"; shift; if [ -n "$_TO" ]; then "$_TO" "$s" "$@"; else "$@"; fi; }   # timeout 없는 AIX·HP-UX·Solaris 10 은 제한 없이 실행
 _aix_default() { awk '/^default:/{f=1;next} /^[^ 	*#]/{f=0} f' /etc/security/user 2>/dev/null; }   # AIX default 스탠자 본문 (awk 범위식은 시작행에서 바로 종료되는 결함)
+_comm() { if [ "$OS_FAMILY" = HPUX ]; then UNIX95=1 ps -e -o comm= 2>/dev/null; else ps -e -o comm= 2>/dev/null; fi | sed 's#.*/##'; }
 is_running() {
     local svc="$1"
-    command -v systemctl >/dev/null 2>&1 && systemctl is-active "$svc" 2>/dev/null | grep -q "^active" && return 0
-    command -v service  >/dev/null 2>&1 && service "$svc" status 2>/dev/null | grep -qiE "running|started" && return 0
-    command -v lssrc    >/dev/null 2>&1 && lssrc -s "$svc" 2>/dev/null | grep -qi "active" && return 0
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl is-active "$svc" 2>/dev/null | grep -q "^active" && return 0
+    elif command -v service >/dev/null 2>&1; then   # SysV: 'is not running' 제외
+        service "$svc" status 2>/dev/null | grep -qiE "is running|active \(running\)|start/running" && return 0
+    fi
+    command -v lssrc    >/dev/null 2>&1 && lssrc -s "$svc" 2>/dev/null | awk 'NR>1 && $NF=="active"{f=1} END{exit !f}' && return 0
     command -v svcs     >/dev/null 2>&1 && svcs -H "$svc" 2>/dev/null | grep -q "^online" && return 0
-    ps -ef 2>/dev/null | grep -v grep | grep -qiw "$svc" && return 0
+    # 프로세스 이름(comm)으로만 비교 — 다른 명령의 인자('tail -f named.log' 등) 오탐 방지
+    _comm | awk -v s="$svc" '$0==s || (index($0,s)==1 && substr($0,length(s)+1) ~ /^[0-9.]+$/) {f=1} END{exit !f}' && return 0
     return 1
 }
 get_pam_files() {
@@ -380,8 +383,10 @@ check_U01() {
         for f in /etc/ssh/sshd_config /opt/ssh/etc/sshd_config; do
             [ -z "$val" ] && [ -f "$f" ] && val=$(grep -i "^[[:space:]]*PermitRootLogin" "$f" 2>/dev/null | awk '{print $2}' | head -1)
         done
-        local why=""
-        if [ "$(echo "$val" | tr 'A-Z' 'a-z')" != "no" ]; then
+        local why="" sshd_on=0
+        { [ -f /etc/ssh/sshd_config ] || [ -f /opt/ssh/etc/sshd_config ] || is_running sshd; } && sshd_on=1
+        if [ $sshd_on -eq 0 ] && [ $tel -eq 0 ]; then result "U-01|양호|원격 터미널 서비스(SSH·Telnet) 미사용"; return; fi
+        if [ $sshd_on -eq 1 ] && [ "$(echo "$val" | tr 'A-Z' 'a-z')" != "no" ]; then
             why="SSH PermitRootLogin=${val:-미설정(기본값 root 로그인 허용)}"
         fi
         if [ $tel -eq 1 ] && grep -qE '^pts' /etc/securetty 2>/dev/null; then why="${why:+${why} / }Telnet 사용, /etc/securetty 에 pts 허용"; fi
@@ -416,7 +421,7 @@ check_U02() {
         cur="MIN_PASSWORD_LENGTH=${ml:-미설정}, 문자종류 최소입력 ${cls}종, MAXDAYS=${mx:-미설정}, MINDAYS=${mn:-미설정}, HISTORY=${hi:-미설정}" ;;
     *)
         local cfg="" f
-        for f in /etc/security/pwquality.conf /etc/security/pwquality.conf.d/*.conf; do
+        for f in /etc/security/pwquality.conf /etc/security/pwquality.conf.d/*.conf /etc/security/pwhistory.conf; do
             [ -f "$f" ] && cfg="${cfg} $(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | tr '\n' ' ')"
         done
         for f in $(get_pam_files) /etc/pam.d/password-auth /etc/pam.d/common-password /etc/pam.d/system-auth; do
@@ -429,7 +434,7 @@ check_U02() {
         mx=$(grep '^PASS_MAX_DAYS' /etc/login.defs 2>/dev/null | awk '{print $2}'); mn=$(grep '^PASS_MIN_DAYS' /etc/login.defs 2>/dev/null | awk '{print $2}')
         [ "${dc:-0}" -lt 0 ] 2>/dev/null && cls=$((cls+1)); [ "${oc:-0}" -lt 0 ] 2>/dev/null && cls=$((cls+1))
         { [ "${uc:-0}" -lt 0 ] 2>/dev/null || [ "${lc:-0}" -lt 0 ] 2>/dev/null; } && cls=$((cls+1))
-        [ "${mc:-0}" -ge 3 ] 2>/dev/null && cls=3
+        [ "${mc:-0}" -ge 4 ] 2>/dev/null && cls=3   # minclass=3 은 대·소문자·숫자만으로도 충족 → 특수문자 강제 아님 (가이드: 영문·숫자·특수문자)
         cur="minlen=${ml:-미설정}, dcredit=${dc:-미설정}, ucredit=${uc:-미설정}, lcredit=${lc:-미설정}, ocredit=${oc:-미설정}$([ -n "$mc" ] && echo ", minclass=${mc}"), PASS_MAX_DAYS=${mx:-미설정}, PASS_MIN_DAYS=${mn:-미설정}, remember=${hi:-미설정}" ;;
     esac
     [ "${ml:-0}" -ge 8 ] 2>/dev/null || bad="${bad}, 최소길이 8자 미만"
@@ -448,14 +453,29 @@ check_U03() {
         [ "${lc:-0}" -gt 0 ] 2>/dev/null && [ "${lc}" -le 10 ] 2>/dev/null && \
             result "U-03|양호|AIX loginretries=${lc}" || result "U-03|취약|AIX loginretries=${lc:-미설정}" ;;
     *)
-        local deny=""
-        for f in $(get_pam_files) /etc/pam.d/password-auth; do
-            [ -f "$f" ] || continue
-            deny=$(grep -v "^#" "$f" 2>/dev/null | grep -E "pam_faillock|pam_tally2" | grep -oE 'deny=[0-9]+' | head -1 | cut -d= -f2)
-            [ -n "$deny" ] && break
-        done
-        [ -n "$deny" ] && [ "$deny" -le 10 ] 2>/dev/null && \
-            result "U-03|양호|계정 잠금 임계값=${deny}" || result "U-03|취약|계정 잠금 임계값 미설정 (deny=${deny:-미설정})" ;;
+        local deny="" mod="" src=""
+        case "$OS_FAMILY" in
+        SOLARIS) grep -qE '^[[:space:]]*LOCK_AFTER_RETRIES=YES' /etc/security/policy.conf 2>/dev/null && { deny=$(sed -n 's/^[[:space:]]*RETRIES=\([0-9]*\).*/\1/p' /etc/default/login 2>/dev/null | tail -1); deny=${deny:-5}; mod="policy.conf LOCK_AFTER_RETRIES=YES"; src="RETRIES" ;}
+                 evd "U-03" "grep LOCK_AFTER_RETRIES /etc/security/policy.conf; grep RETRIES /etc/default/login" ;;
+        HPUX)    if [ -f /tcb/files/auth/system/default ]; then deny=$(sed -n 's/.*u_maxtries#\([0-9]*\).*/\1/p' /tcb/files/auth/system/default 2>/dev/null | head -1); mod="Trusted Mode"; src="u_maxtries"
+                 else deny=$(sed -n 's/^[[:space:]]*AUTH_MAXTRIES=\([0-9]*\).*/\1/p' /etc/default/security 2>/dev/null | tail -1); mod="/etc/default/security"; src="AUTH_MAXTRIES"; fi ;;
+        *)
+            for f in $(get_pam_files) /etc/pam.d/password-auth; do
+                [ -f "$f" ] || continue
+                grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | grep -qE "pam_faillock|pam_tally2?\.so" || continue
+                mod=$(grep -vE '^[[:space:]]*#' "$f" | grep -oE "pam_faillock|pam_tally2?" | head -1)
+                deny=$(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | grep -E "pam_faillock|pam_tally2?\.so" | grep -oE 'deny=[0-9]+' | head -1 | cut -d= -f2)
+                src="${f}"; break
+            done
+            # PAM 에 pam_faillock 이 있고 deny= 인자가 없으면 /etc/security/faillock.conf (없으면 기본 3)
+            if [ "$mod" = "pam_faillock" ] && [ -z "$deny" ]; then
+                deny=$(grep -vE '^[[:space:]]*#' /etc/security/faillock.conf 2>/dev/null | sed -n 's/^[[:space:]]*deny[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' | tail -1)
+                src="/etc/security/faillock.conf"; [ -z "$deny" ] && { deny=3; src="pam_faillock 기본값"; }
+            fi ;;
+        esac
+        if [ -z "$mod" ]; then result "U-03|취약|계정 잠금 모듈·정책 미설정 (pam_faillock/pam_tally 없음)"
+        elif [ "${deny:-0}" -ge 1 ] 2>/dev/null && [ "$deny" -le 10 ] 2>/dev/null; then result "U-03|양호|계정 잠금 임계값 ${deny}회 (${mod}, ${src})"
+        else result "U-03|취약|계정 잠금 임계값 ${deny:-미설정}$([ "$deny" = "0" ] && echo '(0=잠금 안 함)') (${mod}, 기준 1~10회)"; fi ;;
     esac
 }
 
@@ -485,7 +505,7 @@ check_U06() {
     local users; users=$(awk -F: '$3>=500 && $3<60000 && $7!~/(nologin|false)$/ {print $1}' /etc/passwd 2>/dev/null | tr '\n' ' ')
     local sub; sub=$(command -v su 2>/dev/null || echo /bin/su)
     local sp; sp=$(get_perm "$sub")
-    if grep -v "^#" /etc/pam.d/su 2>/dev/null | grep -q "pam_wheel"; then
+    if grep -vE '^[[:space:]]*#' /etc/pam.d/su 2>/dev/null | grep -E '^[[:space:]]*auth[[:space:]]+(required|requisite)[[:space:]]+pam_wheel' | grep -qvE '[[:space:]](trust|deny)([[:space:]]|$)'; then
         result "U-06|양호|su 사용 그룹 제한 (pam_wheel)"
     elif [ -n "$sp" ] && ! _perm_over "$sp" 4750 && [ "$(ls -l "$sub" 2>/dev/null | awk '{print $4}')" != "root" ]; then
         result "U-06|양호|su 명령어 권한 ${sp}, 그룹 $(ls -l "$sub" | awk '{print $4}') 으로 사용 제한"
@@ -544,10 +564,11 @@ check_U12() {
     local tmout=""
     for f in /etc/profile /etc/bashrc /etc/bash.bashrc /etc/environment /root/.bashrc /root/.profile /etc/profile.d/*.sh; do
         [ -f "$f" ] || continue
-        local t=$(grep -h "TMOUT\|tmout" "$f" 2>/dev/null | grep -v "^#" | grep -oE "[0-9]+" | head -1)
+        local t=$(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null | sed -n 's/.*TMOUT[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -1)
         [ -n "$t" ] && tmout=$t && break
     done
     if [ -z "$tmout" ]; then result "U-12|취약|TMOUT 미설정"
+    elif [ "$tmout" -eq 0 ] 2>/dev/null; then result "U-12|취약|TMOUT=0 (세션 종료 없음)"
     elif [ "$tmout" -le 600 ] 2>/dev/null; then result "U-12|양호|TMOUT=${tmout}초"
     else result "U-12|취약|TMOUT=${tmout}초 (600초 초과)"; fi
 }
@@ -612,19 +633,30 @@ check_U18() {
 
 check_U19() { _check_file_perm "U-19" "/etc/hosts" 644 "root" "/etc/hosts"; }
 
-check_U20() {
-    local found=0 f
-    for f in /etc/inetd.conf /etc/xinetd.conf; do
-        [ -f "$f" ] && { found=1; _check_file_perm "U-20" "$f" 600 "root" "$f"; }
+_check_files_perm() {   # 여러 파일을 한 항목으로 판정 (결과 1줄). 대상 파일이 없으면 1 반환
+    local code="$1" max="$2" req_owner="$3"; shift 3
+    local f perm owner bad="" good="" any=0
+    for f in "$@"; do
+        [ -f "$f" ] || continue; any=1
+        evd "$code" "ls -la $f 2>/dev/null"
+        perm=$(get_perm "$f"); owner=$(get_owner "$f")
+        if ! echo " ${req_owner//|/ } " | grep -q " ${owner} "; then bad="${bad} ${f}(소유자=${owner})"
+        elif [ -z "$perm" ] || _perm_over "$perm" "$max"; then bad="${bad} ${f}(권한=${perm:-확인불가})"
+        else good="${good} ${f}(${owner}/${perm})"; fi
     done
+    [ $any -eq 0 ] && return 1
+    if [ -n "$bad" ]; then result "$code|취약|소유자 ${req_owner//|/ 또는 }·권한 ${max} 이하 필요:${bad}"
+    else result "$code|양호|소유자·권한 적정:${good}"; fi
+}
+check_U20() {
+    local found=0
+    _check_files_perm "U-20" 600 "root" /etc/inetd.conf /etc/xinetd.conf /etc/xinetd.d/* && found=1
     [ $found -eq 0 ] && { evd "U-20" "ls -la /etc/xinetd.conf /etc/inetd.conf 2>/dev/null"; result "U-20|양호|inetd/xinetd 미사용 (/etc/inetd.conf·/etc/xinetd.conf 없음 - 권한을 점검할 파일 없음)"; }
 }
 
 check_U21() {
-    local found=0 f
-    for f in /etc/syslog.conf /etc/rsyslog.conf; do
-        [ -f "$f" ] && { found=1; _check_file_perm "U-21" "$f" 640 "root|bin|sys" "$f"; }
-    done
+    local found=0
+    _check_files_perm "U-21" 640 "root|bin|sys" /etc/syslog.conf /etc/rsyslog.conf && found=1
     [ $found -eq 0 ] && { evd "U-21" "ls -la /etc/rsyslog.conf /etc/syslog.conf 2>/dev/null"; result "U-21|양호|syslog.conf 없음 - 권한을 점검할 파일 없음 (로깅 정책은 U-66)"; }
 }
 
@@ -670,7 +702,7 @@ check_U25() {
 
 check_U26() {
     evd "U-26" "_to 15 find /dev -type f 2>/dev/null | head -20"
-    local cnt=$(_to 15 find /dev -type f ! -name "MAKEDEV" ! -name ".udev" 2>/dev/null | wc -l)
+    local cnt=$(_to 15 find /dev -type f ! -name "MAKEDEV" ! -name ".udev" ! -path "/dev/shm/*" ! -path "/dev/mqueue/*" 2>/dev/null | wc -l)
     [ "${cnt:-0}" -gt 0 ] 2>/dev/null && result "U-26|취약|/dev 비정상 파일 ${cnt}개" || result "U-26|양호|/dev 비정상 파일 없음"
 }
 
@@ -694,13 +726,15 @@ check_U27() {
 
 check_U28() {
     evd "U-28" "cat /etc/hosts.allow /etc/hosts.deny 2>/dev/null | head -20"
-    local has=0
-    [ -f /etc/hosts.allow ] && [ -s /etc/hosts.allow ] && has=1
-    [ -f /etc/hosts.deny ] && [ -s /etc/hosts.deny ] && has=1
-    command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q "running" && has=1
-    command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "active" && has=1
-    command -v iptables >/dev/null 2>&1 && iptables -n -L 2>/dev/null | grep -qE "ACCEPT|DROP|REJECT" && has=1
-    [ $has -eq 1 ] && result "U-28|양호|접속 IP/포트 제한 설정됨" || result "U-28|수동확인|접속 제한 수동 확인"
+    evd "U-28" "firewall-cmd --state 2>/dev/null; ufw status 2>/dev/null | head -5; iptables -S INPUT 2>/dev/null | head -20"
+    local how=""
+    grep -vE '^[[:space:]]*(#|$)' /etc/hosts.deny 2>/dev/null | grep -qiE '^[[:space:]]*ALL[[:space:]]*:[[:space:]]*ALL' && how="${how} hosts.deny ALL:ALL"
+    command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -qx "running" && how="${how} firewalld"
+    command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active" && how="${how} ufw"
+    command -v iptables >/dev/null 2>&1 && { [ "$(iptables -S INPUT 2>/dev/null | grep -c '^-A INPUT')" -gt 0 ] || iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)'; } && how="${how} iptables(INPUT)"
+    command -v ipfstat >/dev/null 2>&1 && [ -n "$(ipfstat -io 2>/dev/null | grep -v '^empty')" ] && how="${how} ipfilter"
+    if [ -n "$how" ]; then result "U-28|양호|접속 IP/포트 제한 설정:${how}"
+    else result "U-28|수동확인|호스트 방화벽·TCP Wrapper(hosts.deny ALL:ALL) 접근 제한 없음 - 상위 방화벽 등 접근통제 확인 (미통제 시 취약)"; fi
 }
 
 check_U29() {
@@ -778,7 +812,11 @@ check_U35() {
         used="${used} Samba"
         grep -vE '^[[:space:]]*[#;]' /etc/samba/smb.conf 2>/dev/null | grep -qiE '^[[:space:]]*(guest ok|public)[[:space:]]*=[[:space:]]*yes' && vuln="${vuln} Samba guest ok/public=yes"
     fi
-    if [ -f /etc/exports ] && grep -vE '^[[:space:]]*#' /etc/exports 2>/dev/null | grep -qE 'anonuid|all_squash|\(.*insecure'; then used="${used} NFS"; fi
+    if [ -f /etc/exports ]; then
+        used="${used} NFS"
+        grep -vE '^[[:space:]]*#' /etc/exports 2>/dev/null | grep -qE 'anonuid|anongid|all_squash|\(.*insecure|[(,]anon=[0-9]' && vuln="${vuln} NFS 익명(anon·all_squash·insecure) 옵션"
+    fi
+    grep -vE '^[[:space:]]*#' /etc/dfs/dfstab 2>/dev/null | grep -qE 'anon=[0-9]' && { used="${used} NFS(dfstab)"; vuln="${vuln} NFS dfstab anon= 옵션"; }
     if [ -n "$vuln" ]; then result "U-35|취약|공유 서비스 익명 접근 허용:${vuln}"
     elif [ -n "$used" ]; then result "U-35|양호|공유 서비스(${used# }) 익명 접근 제한"
     else result "U-35|양호|익명 접근 가능한 공유 서비스(FTP·Samba) 미사용"; fi
@@ -895,6 +933,17 @@ check_U45() {
 check_U46() {
     evd "U-46" "ls -la /usr/sbin/sendmail /usr/lib/sendmail 2>/dev/null"
     local vuln=""
+    if ! is_running sendmail && ! is_running master && ! is_running postfix && ! is_running exim && ! is_running exim4; then
+        result "U-46|양호|SMTP 서비스 미사용 (가이드 조치 방법: 미사용 시 서비스 중지·비활성화 → 조치 상태)"; return
+    fi
+    if ! is_running sendmail; then   # Postfix: postsuper / Exim: exiqgrep 일반 사용자 실행 제한
+        for sm in /usr/sbin/postsuper /usr/sbin/exiqgrep; do
+            [ -e "$sm" ] || continue
+            local pp; pp=$(get_perm "$sm"); [ -n "$pp" ] && [ $(( ${pp: -1} & 1 )) -eq 1 ] && vuln="${vuln} ${sm}(${pp}, other 실행 가능)"
+        done
+        [ -n "$vuln" ] && result "U-46|취약|일반 사용자 메일 큐 관리 명령 실행 가능:${vuln}" || result "U-46|양호|postsuper/exiqgrep 일반 사용자 실행 제한"
+        return
+    fi
     for sm in /usr/sbin/sendmail /usr/lib/sendmail /usr/lib/sendmail.sendmail; do
         [ -e "$sm" ] || [ -L "$sm" ] || continue
         local perm=$(get_perm "$sm")
@@ -953,16 +1002,23 @@ check_U49() {
 
 check_U50() {
     is_running named || { evd "U-50" "ps -ef 2>/dev/null | grep named | grep -v grep"; result "U-50|양호|DNS 미실행"; return; }
-    evd "U-50" "grep -i allow-transfer /etc/named.conf /etc/bind/named.conf 2>/dev/null"
-    for conf in /etc/named.conf /etc/bind/named.conf; do
-        [ -f "$conf" ] || continue
-        grep -q "allow-transfer.*none" "$conf" 2>/dev/null && { result "U-50|양호|Zone Transfer 차단"; return; }
-        grep -q "allow-transfer" "$conf" 2>/dev/null && { result "U-50|수동확인|allow-transfer 허용 대상 확인"; return; }
-        result "U-50|취약|Zone Transfer 제한 미설정"; return
-    done
-    result "U-50|수동확인|named.conf 수동 확인"
+    evd "U-50" "grep -i allow-transfer /etc/named.conf /etc/bind/named.conf /etc/bind/named.conf.options /etc/bind/named.conf.local /etc/named.rfc1912.zones 2>/dev/null"
+    local nc; nc=$(_named_all)
+    [ -z "$nc" ] && { result "U-50|수동확인|named.conf 수동 확인"; return; }
+    if echo "$nc" | grep -qiE 'allow-transfer[[:space:]]*\{[^}]*any'; then result "U-50|취약|allow-transfer any (모든 서버에 Zone Transfer 허용)"
+    elif echo "$nc" | grep -qiE 'allow-transfer[[:space:]]*\{[[:space:]]*none'; then result "U-50|양호|Zone Transfer 차단 (allow-transfer none)"
+    elif echo "$nc" | grep -qi 'allow-transfer'; then result "U-50|수동확인|allow-transfer 허용 대상 확인: $(echo "$nc" | grep -io 'allow-transfer[^;]*;[^}]*}' | head -2 | tr '\n' ' ')"
+    else result "U-50|취약|Zone Transfer 제한 미설정 (allow-transfer 없음 - BIND 기본 전체 허용)"; fi
 }
 
+_named_all() {   # named.conf + include 파일 (주석 제거)
+    local c f inc
+    for c in /etc/named.conf /etc/bind/named.conf /etc/named/named.conf; do
+        [ -f "$c" ] || continue
+        inc=$(sed -n 's/^[[:space:]]*include[[:space:]]*"\([^"]*\)".*/\1/p' "$c" 2>/dev/null)
+        for f in "$c" $inc; do [ -f "$f" ] && cat "$f" 2>/dev/null; done
+    done | sed 's#//.*##; s/#.*//'
+}
 check_U51() {
     is_running named || { evd "U-51" "ps -ef 2>/dev/null | grep named | grep -v grep"; result "U-51|양호|DNS 서비스 미사용 (가이드 조치 방법: 미사용 시 서비스 중지·비활성화 → 조치 상태)"; return; }
     evd "U-51" "grep -i allow-update /etc/named.conf /etc/bind/named.conf 2>/dev/null"
@@ -979,8 +1035,9 @@ check_U51() {
             fi
         fi
     done
-    [ $vuln -eq 1 ] && result "U-51|취약|DNS 동적 업데이트 any 허용" || \
-        result "U-51|수동확인|allow-update 미설정 (기본값 확인)"
+    [ $vuln -eq 1 ] && { result "U-51|취약|DNS 동적 업데이트 any 허용"; return; }
+    if [ -n "$(_named_all)" ] && ! _named_all | grep -qi 'allow-update'; then result "U-51|양호|allow-update 미설정 (BIND 기본값 none - 동적 업데이트 차단)"
+    else result "U-51|수동확인|allow-update 설정 확인 필요"; fi
 }
 
 check_U52() {
@@ -1001,7 +1058,7 @@ check_U53() {
     if is_running vsftpd; then
         for cf in /etc/vsftpd/vsftpd.conf /etc/vsftpd.conf; do
             [ -f "$cf" ] || continue
-            if grep -qi "ftpd_banner" "$cf" 2>/dev/null; then
+            if grep -qiE '^[[:space:]]*(ftpd_banner|banner_file)[[:space:]]*=' "$cf" 2>/dev/null; then
                 result "U-53|양호|vsftpd 배너 커스터마이징됨"; return
             fi
         done
@@ -1009,7 +1066,7 @@ check_U53() {
     elif is_running proftpd; then
         for cf in /etc/proftpd/proftpd.conf /etc/proftpd.conf; do
             [ -f "$cf" ] || continue
-            if grep -qi "ServerIdent.*off\|ServerName" "$cf" 2>/dev/null; then
+            if grep -qiE '^[[:space:]]*ServerIdent[[:space:]]+(off|on[[:space:]]+")' "$cf" 2>/dev/null; then
                 result "U-53|양호|ProFTPD 배너 제한됨"; return
             fi
         done
@@ -1111,11 +1168,17 @@ check_U61() {
 
 check_U62() {
     evd "U-62" "cat /etc/motd /etc/issue 2>/dev/null | head -10"
+    local f c dflt=""
     for f in /etc/motd /etc/issue /etc/issue.net; do
-        [ -f "$f" ] && [ -s "$f" ] && { result "U-62|양호|경고 메시지 설정됨 (${f})"; return; }
+        [ -f "$f" ] && [ -s "$f" ] || continue
+        c=$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null)
+        # 배포판 기본 문구(OS 이름·버전·\n \l 이스케이프)만 있으면 경고 메시지로 보지 않음
+        if echo "$c" | grep -qiE 'unauthori|authorized|warning|prohibit|monitor|경고|허가|인가|금지|무단'; then result "U-62|양호|경고 메시지 설정됨 (${f})"; return; fi
+        dflt="${dflt} ${f}"
     done
-    grep -qi "banner" /etc/ssh/sshd_config 2>/dev/null && { result "U-62|양호|SSH 배너 설정됨"; return; }
-    result "U-62|취약|경고 메시지 미설정"
+    if grep -qiE '^[[:space:]]*Banner[[:space:]]+/' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null; then result "U-62|양호|SSH Banner 설정됨"; return; fi
+    if [ -n "$dflt" ]; then result "U-62|수동확인|배너 파일 존재(${dflt# }) 하나 경고 문구 미확인 - 비인가 사용 금지 경고 내용인지 확인 (배포판 기본 문구면 취약)"
+    else result "U-62|취약|경고 메시지 미설정"; fi
 }
 
 check_U63() {
@@ -1145,7 +1208,7 @@ check_U65() {
         result "U-65|양호|ntpd 실행 중"; return
     fi
     for cf in /etc/ntp.conf /etc/chrony.conf /etc/chrony/chrony.conf; do
-        [ -f "$cf" ] && grep -qv "^#" "$cf" 2>/dev/null && grep -qi "server\|pool" "$cf" 2>/dev/null && {
+        [ -f "$cf" ] && grep -qiE '^[[:space:]]*(server|pool|peer)[[:space:]]' "$cf" 2>/dev/null && {
             result "U-65|수동확인|NTP 설정 파일 존재 (${cf}) - 동기화 상태 확인"; return
         }
     done
