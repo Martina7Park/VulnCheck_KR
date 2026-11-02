@@ -10,8 +10,9 @@
 | D-Link (IOS 유사 문법·네이티브 CLI) | `show running-config` / `show config current_config` (또는 웹 콘솔 백업) | 자동 판정 |
 | Alteon | `/cfg/dump` | 주요 항목 자동 판정 + 나머지 수동확인 |
 | A10 / Dell / Huawei 등 | `show running-config` / `display current-configuration` | 제조사 식별만 - 대부분 수동확인 |
+| FRRouting(FRR)·Quagga 라우팅 데몬 | `vtysh -c "show running-config"` | 제조사 식별만 - 수동확인 (장비 보안 설정은 호스트 OS 점검 `server/` 대상) |
 
-추출한 파일을 `<장비명>.txt` (또는 `.cfg` · `.conf` · `.log`) 로 저장해 `converter/network/config/` 에 넣습니다. 결과 항목: 전자금융 NET-xxx / 주요정보 N-01~38. 호스트명·OS 버전은 config 에서 읽습니다 (`hostname`, `set system host-name`, `sysname` 등).
+추출한 파일을 `<장비명>.txt` (또는 `.cfg` · `.conf` · `.log`) 로 저장해 `converter/network/config/` 에 넣습니다. 주요정보(2026 상세가이드) 변환은 전자금융 기준 엑셀이 없어도 실행됩니다 (전자금융 변환은 기준 엑셀 필요). 결과 항목: 전자금융 NET-xxx / 주요정보 N-01~38. 호스트명·OS 버전은 config 에서 읽습니다 (`hostname`, `set system host-name`, `sysname` 등).
 
 - IOS 유사 문법 D-Link(DGS-3630)는 config 머리말로 제조사를 식별해 제조사 기본값으로 판정합니다 — Telnet·HTTP 서버 기본 활성, SSH 서버·Domain Lookup·Proxy ARP 기본 비활성, 로깅(버퍼 포함) 기본 활성, 라인 session-timeout 기본 3분. running-config 에는 기본값과 다른 설정만 나오므로 `no ip http server` 가 없으면 웹 서버가 켜진 것으로 봅니다.
 - 비밀번호 값을 가리고 제출하면(`password 0` 뒤 값 없음) 비밀번호 설정·복잡성 항목은 수동확인으로 나옵니다.

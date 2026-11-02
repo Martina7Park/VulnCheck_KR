@@ -655,6 +655,7 @@ def detect_net_vendor(text):
                   if not re.match(r'\s*(description|hostname|sysname|banner|alias|name\s|set system host-name|snmp-server (location|contact))', l))
     if re.search(r'alteon|radware|^/c/sys|^/cfg/sys', t, re.M): return "ALTEON"
     if re.search(r'a10networks|vthunder|\bacos\b|^!version \S+.*build|^slb |^interface management\s*$', t, re.M): return "A10"
+    if re.search(r'^frr (version|defaults)\b|^! zebra configuration|^! quagga\b|^quagga version', t, re.M): return "FRR"
     if re.search(r'^:?\s*(asa|pix) version \d', t, re.M): return "ASA"
     if re.search(r'\bftos\b|dell networking|force10|^boot system stack-unit|^stack-unit \d+ provision', t, re.M): return "DELL"
     dl = sum(bool(re.search(p, t, re.M)) for p in (
@@ -2356,9 +2357,11 @@ def build_net_checks(lines, text):
     if vendor == "JUNIPER" and not any_m(r'^set '):   # 계층형(show configuration) 형식은 set 기반 전용 파서 적용 불가
         _aware["JUNIPER"] = set()
     if vendor not in ("CISCO", "ASA"):
+        _why = ("라우팅 데몬(FRR/Quagga) config - 접속·계정·로그 등 장비 보안 설정은 호스트 OS(리눅스) 점검(server/check_server.sh) 대상, 수동 확인"
+                if vendor == "FRR" else f"{vendor} 설정 문법 자동 판정 미지원 - 수동 확인")
         for _c, _v in list(results.items()):
             if _v[0] in (RESULT_BAD, RESULT_GOOD, RESULT_NA) and _c not in _aware.get(vendor, set()):
-                results[_c] = mc(f"{vendor} 설정 문법 자동 판정 미지원 - 수동 확인 (IOS 기준 참고: {_v[1][:120]})")
+                results[_c] = mc(f"{_why} (IOS 기준 참고: {_v[1][:120]})")
 
     # IOS 유사 문법 D-Link(DGS-3630 등): Cisco 기본값(미설정 = 활성) 가정 항목은 수동확인, CDP 는 미지원
     if _brand == "D-LINK":
@@ -2667,7 +2670,7 @@ def _net_os_label(vendor, text, ver=None):
             return "Cisco NX-OS"
         major = (ver or "").split(".")[0]
         return "Cisco IOS-XE" if ("IOS XE" in text or "IOS-XE" in text or major in ("16", "17", "26")) else "Cisco IOS"
-    return {"ASA": "Cisco ASA", "JUNIPER": "Juniper Junos", "HUAWEI": "Huawei VRP", "DELL": "Dell OS9", "ALTEON": "Radware Alteon",
+    return {"ASA": "Cisco ASA", "FRR": "FRRouting", "JUNIPER": "Juniper Junos", "HUAWEI": "Huawei VRP", "DELL": "Dell OS9", "ALTEON": "Radware Alteon",
             "A10": "A10 ACOS", "BIGIP": "F5 BIG-IP", "CITRIX": "Citrix ADC", "BROCADE": "Brocade", "PIOLINK": "Piolink"}.get(vendor, vendor)
 
 
@@ -2682,7 +2685,7 @@ def _net_identity(text):
     ver = None
     for pat in (r'^:?\s*(?:ASA|PIX) Version\s+(\S+)', r'^\s*set version\s+(\S+)', r'^\s*version\s+([^\s;]+);',
                 r'^!\s*Version\s+([^\s,]+)', r'^/\*\s*Version\s+(\S+)',
-                r'^\s*(?:version|JUNOS|Software Version)\s+(\S+)'):
+                r'^frr version\s+(\S+)', r'^\s*(?:version|JUNOS|Software Version)\s+(\S+)'):
         m = re.search(pat, text, re.M | re.I)
         if m:
             ver = m.group(1); break
@@ -8189,7 +8192,10 @@ def run_convert(mode, category, base_dir, criteria_excel):
 
     # 기준 엑셀에서 항목 목록 로드
     kisa_mode   = mode == "MI" and category in KISA_CATEGORY_FAMILY
-    if kisa_mode:
+    if kisa_mode and not criteria_excel:   # 네트워크: 장비 config 직접 판정 결과를 가이드 항목 근거로 사용 (평가대상 열 보정 없음)
+        criteria_items = {}
+        print("[INFO] 판정 기준: 주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드(2026) - 기준 엑셀 없이 장비 config 직접 판정")
+    elif kisa_mode:
         # 주요정보: 판정 기준은 2026 상세가이드. 전자금융 점검 스크립트 결과는 가이드 항목 판정 근거 자료로만 사용
         criteria_items = load_criteria(criteria_excel, sheet_name, "EF")
         print("[INFO] 판정 기준: 주요정보통신기반시설 기술적 취약점 분석·평가 방법 상세가이드(2026)")
@@ -8286,6 +8292,8 @@ def run_convert(mode, category, base_dir, criteria_excel):
                 print(f"[INFO] {fname}: Junos 계층형 설정 → set 형식으로 변환해 판정")
             if vendor == "UNKNOWN":
                 print(f"[경고] {fname}: 제조사를 판별하지 못함 - 자동 판정 없이 전 항목 수동확인 (장비 config 파일이 맞는지 확인)")
+            elif vendor == "FRR":
+                print(f"[안내] {fname}: 라우팅 데몬(FRRouting) config - 장비 보안 설정은 호스트 OS(리눅스) 점검 대상이라 수동확인으로 나옵니다")
             elif vendor in ("HUAWEI", "A10", "DELL", "BIGIP", "CITRIX", "BROCADE", "PIOLINK"):
                 print(f"[안내] {fname}: {vendor} 장비는 전용 판정 규칙이 없어 대부분 수동확인으로 나옵니다")
             res    = build_net_checks(lines, text)
@@ -8341,9 +8349,10 @@ def run_convert(mode, category, base_dir, criteria_excel):
             continue
         all_results[_h] = (res, detected_sub)
         hosts_info.append(hinfo)
-        total = sum(1 for k in res if k in criteria_items)
-        bad   = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_BAD)
-        good  = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_GOOD)
+        _ck = criteria_items or {k: 1 for k in res if k.startswith("NET-")}   # 기준 엑셀 없이 변환(주요정보 네트워크): config 판정 항목
+        total = sum(1 for k in res if k in _ck)
+        bad   = sum(1 for k, v in res.items() if k in _ck and v[0] == RESULT_BAD)
+        good  = sum(1 for k, v in res.items() if k in _ck and v[0] == RESULT_GOOD)
         print(f"[INFO] {fname} → 총 {total}개 / 양호 {good} / 취약 {bad}")
 
     if not all_results:
@@ -8438,12 +8447,10 @@ def main():
                              if "취약점" in f and "평가기준" in f and f.endswith(".xlsx")]
     criteria_excel = next((p for p in criteria_candidates if os.path.exists(p)), None)
 
-    if not criteria_excel:
-        print("[ERROR] 기준 엑셀 파일을 찾을 수 없습니다.")
-        print("  → 이 스크립트와 같은 폴더에 '전자금융기반시설_보안_취약점_평가기준_제2026-1호.xlsx' 를 넣어주세요.")
-        sys.exit(1)
-
-    print(f"\n[기준 엑셀] {os.path.basename(criteria_excel)}")
+    if criteria_excel:
+        print(f"\n[기준 엑셀] {os.path.basename(criteria_excel)}")
+    else:   # 주요정보 네트워크 장비는 기준 엑셀 없이 변환 가능 → 분야 선택 후 판단
+        print("\n[안내] 기준 엑셀 없음 - 주요정보통신기반시설 네트워크 장비만 변환할 수 있습니다.")
 
     # ── 1단계: 평가 기반 선택 ─────────────────────────────────
     print("\n[1단계] 평가 기반 선택")
@@ -8480,6 +8487,11 @@ def main():
         if sel == "5": category = "security"; cat_name = "보안장비"; break
         if sel == "6": category = "pc";       cat_name = "PC(업무용 단말)"; break
         print("  1~7 중 하나를 입력하세요.")
+
+    if not criteria_excel and not (mode == "MI" and category == "network"):
+        print("[ERROR] 기준 엑셀 파일을 찾을 수 없습니다.")
+        print("  → 이 스크립트와 같은 폴더에 '전자금융기반시설_보안_취약점_평가기준_제2026-1호.xlsx' 를 넣어주세요.")
+        sys.exit(1)
 
     print(f"\n[실행] {mode_name} / {cat_name} 점검 컨버팅 시작")
     sub = "config" if category == "network" else "output"
