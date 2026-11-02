@@ -18,7 +18,7 @@
 # [접속 정보 환경변수]
 #   $env:MSSQL_SERVER  = "localhost"   (기본: localhost)
 #   $env:MSSQL_USER    = "sa"          (기본: sa)
-#   $env:MSSQL_PASS    = "<비밀번호>"  (기본: CHANGE_ME — 반드시 변경)
+#   $env:MSSQL_PASS    = "<비밀번호>"  (미지정 시 Windows 인증 시도 → 실패하면 숨김 입력)
 #   $env:MSSQL_WINAUTH = "1"           (Windows 인증 시 — 설정하면 USER/PASS 무시)
 #
 # [실행 방법]
@@ -45,6 +45,8 @@ $script:KMODE = switch ($script:KMODE) { '1' {'ef'} '2' {'mi'} 'kisa' {'mi'} '3'
 if (@('ef','mi','all') -notcontains $script:KMODE) { Write-Host "사용법: check_dbms_mssql.ps1 -Mode ef|mi|all"; exit 1 }
 $ErrorActionPreference = "SilentlyContinue"
 $ProgressPreference    = "SilentlyContinue"
+# 결과를 UTF-8 로 출력 (cmd '>' 리다이렉트 시 OEM 코드페이지면 비한국어 로캘에서 한글 판정값이 '?' 로 손실) — sqlcmd 출력도 -f 65001 로 맞춤
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}
 
 $MSSQL_SERVER = if ($env:MSSQL_SERVER) { $env:MSSQL_SERVER } else { "localhost" }
 $MSSQL_USER   = if ($env:MSSQL_USER)   { $env:MSSQL_USER }   else { "sa" }
@@ -83,7 +85,7 @@ $script:TrustCert = @(); if ($env:MSSQL_ENCRYPT -ne "0" -and ((& $sqlcmd -? 2>&1
 $script:QErr = $false
 function Run-Q([string]$q) {
     # -b: 오류 시 종료코드 1, -r 1: 오류 메시지를 stderr 로 분리 → 'Msg nnn …' 문장이 결과로 섞이지 않음. 오류는 증적에 기록하고 $null 반환
-    $a = @('-S',$MSSQL_SERVER,'-Q',"SET NOCOUNT ON; $q",'-h','-1','-W','-s','|','-b','-r','1') + $script:TrustCert
+    $a = @('-S',$MSSQL_SERVER,'-Q',"SET NOCOUNT ON; $q",'-h','-1','-W','-s','|','-b','-r','1','-f','65001') + $script:TrustCert
     $a += if ($USE_WIN_AUTH) { @('-E') } else { @('-U',$MSSQL_USER) }
     $err = ""
     try { $r = & $sqlcmd @a 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { $err += "$_`n" } else { $_ } } } catch { $err += "$_" }
@@ -123,13 +125,18 @@ function Test-Guide([string]$code,[string]$res,[string]$msg) {
     if ($script:GUIDE_DBM -contains $code) { return $true }
     "[참고-평가기준 외] DBM-${code}|$res|$msg`n" | Add-Content $script:EVD -Encoding UTF8; return $false
 }
-function Pass([string]$code,[string]$msg) { if (-not (Test-Guide $code "양호" $msg)) { return }; $script:cntPass++; Write-Output "DBM-${code}|양호|$msg"; "[판정] DBM-${code}|양호|$msg`n" | Add-Content $script:EVD -Encoding UTF8 }
+$script:NotAdmin = $false
+$script:SqlDepDBM = @("001","003","004","005","006","007","008","009","011","015","017","019","020","022","024","028","031","032","033","035","036")
+$script:SqlDepD   = @("D-01","D-02","D-03","D-04","D-06","D-08","D-11","D-16","D-23","D-24","D-26")
+$script:NoAdmMsg  = " (점검 계정 sysadmin 아님 - 조회 범위 제한, 수동 확인)"
+function Pass([string]$code,[string]$msg) { if ($script:NotAdmin -and $script:SqlDepDBM -contains $code) { MC $code "$msg$($script:NoAdmMsg)"; return }; if (-not (Test-Guide $code "양호" $msg)) { return }; $script:cntPass++; Write-Output "DBM-${code}|양호|$msg"; "[판정] DBM-${code}|양호|$msg`n" | Add-Content $script:EVD -Encoding UTF8 }
 function Fail([string]$code,[string]$msg) { if (-not (Test-Guide $code "취약" $msg)) { return }; $script:cntFail++; Write-Output "DBM-${code}|취약|$msg"; "[판정] DBM-${code}|취약|$msg`n" | Add-Content $script:EVD -Encoding UTF8 }
 function NA  ([string]$code,[string]$msg) { if (-not (Test-Guide $code "N-A" $msg)) { return }; $script:cntNA++;   Write-Output "DBM-${code}|N-A|$msg"; "[판정] DBM-${code}|N-A|$msg`n" | Add-Content $script:EVD -Encoding UTF8 }
 function MC  ([string]$code,[string]$msg) { if (-not (Test-Guide $code "수동확인" $msg)) { return }; $script:cntMC++;   Write-Output "DBM-${code}|수동확인|$msg"; "[판정] DBM-${code}|수동확인|$msg`n" | Add-Content $script:EVD -Encoding UTF8 }
 
 function KPut([string]$code,[string]$res,[string]$msg) {   # 가이드 D 항목 판정 출력 (전자금융 모드는 생략)
     if ($script:KMODE -eq 'ef') { return }
+    if ($res -eq '양호' -and $script:NotAdmin -and $script:SqlDepD -contains $code) { $res = '수동확인'; $msg += $script:NoAdmMsg }
     $msg = ($msg -replace "[`r`n]+", " / ") -replace '\|', '/'
     switch ($res) { '양호' { $script:cntPass++ } '취약' { $script:cntFail++ } '수동확인' { $script:cntMC++ } default { $script:cntNA++ } }
     Write-Output "$code|$res|$msg"; "[판정] $code|$res|$msg`n" | Add-Content $script:EVD -Encoding UTF8
@@ -181,6 +188,13 @@ $verNum = if ($ver -match "SQL Server (\d{4})") { $matches[1] } else { "unknown"
 $build = if ($ver -match "(\d+\.\d+\.\d+\.\d+)") { $matches[1] } else { "" }
 Write-Output "# SQL Server 버전: $verNum ($build)"
 Write-Output "# 접속: $(if ($USE_WIN_AUTH) { 'Windows 인증' } else { "SQL 인증($MSSQL_USER)" })"
+# sysadmin 이 아니면 카탈로그 뷰가 본인 관련 행만 보여 '없음 → 양호' 오판 → SQL 조회 항목 양호는 수동확인 처리
+$isAdm = Q-Int "SELECT IS_SRVROLEMEMBER('sysadmin')"
+if ($isAdm -ne 1) {
+    $script:NotAdmin = $true
+    Write-Output "# [경고] 점검 계정이 sysadmin 아님(IS_SRVROLEMEMBER=$isAdm) - 카탈로그 조회 범위 제한, SQL 조회 항목 양호는 수동확인 처리"
+    "[경고] 점검 계정 sysadmin 아님 (IS_SRVROLEMEMBER('sysadmin')=$isAdm)`n" | Add-Content $script:EVD -Encoding UTF8
+}
 
 # ── DBM-001: 취약하게 설정된 비밀번호 제거 ──────────────────────
 $cnt = Q-Int "SELECT COUNT(*) FROM sys.sql_logins WHERE is_policy_checked=0 AND is_disabled=0"
@@ -227,12 +241,13 @@ else {
         $lockSrc = "net accounts: $($lockLine.Trim())"
     }
 }
-$noPol = Run-Q "SELECT name FROM sys.sql_logins WHERE is_policy_checked=0 AND is_disabled=0 AND name NOT LIKE '##%'"
+$noPol = Run-Q "SELECT name FROM sys.sql_logins WHERE is_policy_checked=0 AND is_disabled=0 AND name NOT LIKE '##%'"; $e6 = $script:QErr
 $noPolList = @($noPol | Where-Object { $_ -and $_.Trim() })
 EvdQ "DBM-006" "잠금 임계값($lockSrc) / CHECK_POLICY=OFF 활성 SQL 로그인" "$n / $($noPolList -join ', ')"
 if ($null -eq $n) { MC "006" "계정 잠금 임계값 확인 실패 - Windows 계정 잠금 정책 수동 확인" }
 elseif ($n -eq 0) { Fail "006" "계정 잠금 임계값 없음(무제한) - 5회 이하 설정 필요" }
 elseif ($n -gt 5) { Fail "006" "계정 잠금 임계값=${n}회 (5회 이하 필요)" }
+elseif ($e6) { MC "006" "계정 잠금 임계값 ${n}회 / SQL 로그인 CHECK_POLICY 조회 실패 - 수동 확인" }
 elseif ($noPolList.Count -gt 0) { Fail "006" "잠금 임계값 ${n}회이나 CHECK_POLICY=OFF SQL 로그인 $($noPolList.Count)개(잠금 미적용): $(($noPolList | Select-Object -First 5) -join ', ') - 서비스 운영 계정은 평가 제외 가능" }
 else { Pass "006" "계정 잠금 임계값=${n}회 (5회 이하), 활성 SQL 로그인 모두 CHECK_POLICY 적용" }
 
@@ -255,10 +270,11 @@ EvdQ "DBM-008" "is_expiration_checked=0 count" ($noExp -join "`n")
 $n8 = if ("$($noExp | Select-Object -First 1)".Trim() -match '^\d+$') { [int]"$($noExp | Select-Object -First 1)".Trim() } else { $null }
 # 평가기준 평가예시: 최근 비밀번호 변경일로부터 1분기(약 90일) 이상 지난 계정 존재 시 취약
 $old8 = Run-Q "SELECT name+' ('+CONVERT(varchar(10),CAST(LOGINPROPERTY(name,'PasswordLastSetTime') AS datetime),120)+')' FROM sys.sql_logins WHERE is_disabled=0 AND name NOT LIKE '##%' AND DATEDIFF(DAY,CAST(LOGINPROPERTY(name,'PasswordLastSetTime') AS datetime),GETDATE())>=90"
+$e8 = $script:QErr
 $old8List = @($old8 | Where-Object { $_ -and $_.Trim() })
 EvdQ "DBM-008" "비밀번호 변경 후 90일 이상 활성 SQL 로그인 (PasswordLastSetTime)" ($old8List -join "`n")
 if ($old8List.Count -gt 0) { Fail "008" "비밀번호 변경 후 90일 이상 경과 계정 $($old8List.Count)개: $(($old8List | Select-Object -First 5) -join ', ') - 서비스 운영 계정은 평가 제외 가능" }
-elseif ($null -eq $n8) { MC "008" "비밀번호 만료 설정 조회 실패 - 수동 확인" }
+elseif ($null -eq $n8 -or $e8) { MC "008" "비밀번호 만료 설정·변경일 조회 실패 - 수동 확인" }
 elseif ($n8 -gt 0) { MC "008" "90일 이상 경과 계정 없음, 비밀번호 만료(CHECK_EXPIRATION) 미설정 계정 ${n8}개 - 주기적 변경 관리 여부 확인" }
 else { Pass "008" "모든 활성 SQL 계정 비밀번호 90일 이내 변경, 만료 설정됨" }
 
@@ -278,8 +294,9 @@ $n11 = if ("$($auditCnt | Select-Object -First 1)".Trim() -match '^\d+$') { [int
 # 평가기준: 감사 로그 수집 + 주기적 백업(인터뷰·증적) 모두 충족 시 양호 → 수집 중이면 백업 여부 수동확인
 $spec11 = Run-Q "SELECT s.name+': '+d.audit_action_name FROM sys.server_audit_specifications s JOIN sys.server_audit_specification_details d ON s.server_specification_id=d.server_specification_id WHERE s.is_state_enabled=1"
 EvdQ "DBM-011" "활성 서버 감사 사양 (audit_action_name)" ($spec11 -join "`n")
+$e11 = $script:QErr
 $loginAud = @($spec11 | Where-Object { $_ -match "FAILED_LOGIN_GROUP|SUCCESSFUL_LOGIN_GROUP" })
-if ($null -eq $n11) { MC "011" "서버 감사 조회 실패(권한) - 수동 확인" }
+if ($null -eq $n11 -or ($n11 -gt 0 -and $e11)) { MC "011" "서버 감사·감사 사양 조회 실패(권한) - 수동 확인" }
 elseif ($n11 -gt 0 -and $loginAud.Count -eq 0) { Fail "011" "서버 감사 ${n11}개 활성이나 로그인 성공/실패 감사 사양(FAILED_LOGIN_GROUP/SUCCESSFUL_LOGIN_GROUP) 미설정" }
 elseif ($n11 -gt 0) { MC "011" "서버 감사 ${n11}개 활성, 로그인 감사 사양 $($loginAud.Count)건 - 감사 로그 주기적 백업 여부 확인 (미백업 시 취약)" }
 else {
@@ -317,7 +334,7 @@ $pubDb = Run-Q 'SET NOCOUNT ON; DECLARE @s nvarchar(max)=N''''; SELECT @s=@s+N''
 $pubSrv = Run-Q 'SET NOCOUNT ON; SELECT ''SERVER:''+class_desc+'' ''+permission_name FROM sys.server_permissions WHERE grantee_principal_id=2 AND permission_name NOT IN (''VIEW ANY DATABASE'',''CONNECT SQL'') AND NOT (class_desc=''ENDPOINT'' AND permission_name=''CONNECT'') AND state IN (''G'',''W'')'; $e15b = $script:QErr
 $pubList = @(@($pubDb) + @($pubSrv) | Where-Object { $_ -and "$_".Trim() })
 EvdQ "DBM-015" "public 역할 비기본 권한 (전 DB: $($dbs -join ', ') + 서버 수준, 시스템 개체 기본 GRANT 제외)" ($pubList -join "`n")
-if ($e15a -and $e15b) { MC "015" "public 권한 조회 실패(권한) - 수동 확인" }
+if ($e15a -or $e15b) { MC "015" "public 권한 조회 실패(DB 수준 $(if ($e15a) {'실패'} else {'성공'}), 서버 수준 $(if ($e15b) {'실패'} else {'성공'})) - 수동 확인$(if ($pubList.Count) { ": $(($pubList | Select-Object -First 5) -join ', ')" })" }
 elseif ($pubList.Count -gt 0) { MC "015" "public 역할 비기본 권한 $($pubList.Count)건: $(($pubList | Select-Object -First 5) -join ', ') - 업무상 필요 여부 확인 (불필요 시 취약)" }
 else { Pass "015" "public 역할에 기본 외 권한 없음" }
 
@@ -349,6 +366,7 @@ $hist19 = Get-SecPol "PasswordHistorySize"
 EvdQ "DBM-019" "PasswordHistorySize / CHECK_POLICY=OFF 활성 SQL 로그인" "$hist19 / $($noPolList -join ', ')"
 if ($null -eq $hist19) { MC "019" "Enforce password history 확인 실패(관리자 권한 필요) - 수동 확인" }
 elseif ([int]$hist19 -eq 0) { Fail "019" "Enforce password history=0 (이전 비밀번호 재사용 가능)" }
+elseif ($e6) { MC "019" "PasswordHistorySize=$hist19 / SQL 로그인 CHECK_POLICY 조회 실패 - 수동 확인" }
 elseif ($noPolList.Count -gt 0) { Fail "019" "PasswordHistorySize=$hist19 이나 CHECK_POLICY=OFF 로그인 $($noPolList.Count)개(정책 미적용): $(($noPolList | Select-Object -First 5) -join ', ') - 서비스 운영 계정은 평가 제외 가능" }
 else { Pass "019" "Enforce password history=$hist19, 활성 SQL 로그인 모두 CHECK_POLICY 적용 (도메인 GPO 적용 서버는 gpresult 확인)" }
 
@@ -430,23 +448,26 @@ elseif ($saLine -match "^0") { Fail "031" "SA 계정 활성, 비밀번호 정책
 else { MC "031" "SA 계정 상태 수동 확인" }
 
 # ── DBM-034: DBMS 서비스 구동 권한 ─────────────────────────────
-Evd "DBM-034" "Get-CimInstance Win32_Service -Filter `"Name LIKE 'MSSQL%'`" -EA SilentlyContinue | Select-Object Name,StartName,State | Format-Table"
-$svcUser = (Get-CimInstance Win32_Service -Filter "Name LIKE 'MSSQL%'" -EA SilentlyContinue | Select-Object -First 1).StartName
-if (-not $svcUser) {
-    # CimInstance 실패 시 레지스트리 폴백
-    $mssqlRegKey = Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services" -EA SilentlyContinue |
-        Where-Object { $_.PSChildName -match "^MSSQL(SERVER|$)" } | Select-Object -First 1
-    $svcUser = if ($mssqlRegKey) { (Get-ItemProperty $mssqlRegKey.PSPath -EA SilentlyContinue).ObjectName } else { $null }
+# 'MSSQL%' 는 MSSQLFDLauncher·MSSQLLaunchpad 등 보조 서비스가 먼저 잡힘 → 엔진 서비스만, 전 인스턴스
+Evd "DBM-034" "Get-CimInstance Win32_Service -Filter `"Name='MSSQLSERVER' OR Name LIKE 'MSSQL`$%'`" -EA SilentlyContinue | Select-Object Name,StartName,State | Format-Table"
+$svc34 = @(Get-CimInstance Win32_Service -Filter "Name='MSSQLSERVER' OR Name LIKE 'MSSQL$%'" -EA SilentlyContinue | ForEach-Object { "$($_.Name)=$($_.StartName)" })
+if (-not $svc34.Count) {   # CimInstance 실패 시 레지스트리 폴백
+    $svc34 = @(Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Services" -EA SilentlyContinue | Where-Object { $_.PSChildName -match '^(MSSQLSERVER|MSSQL\$.+)$' } | ForEach-Object { "$($_.PSChildName)=$((Get-ItemProperty $_.PSPath -EA SilentlyContinue).ObjectName)" })
 }
-if ($svcUser) {
-    if ($svcUser -match "LocalSystem|NT AUTHORITY\\SYSTEM") {
-        Fail "034" "SQL Server 서비스 계정: $svcUser (전체 권한 - 전용 서비스 계정 권고)"
-    } elseif ($svcUser -match "NT Service\\|NetworkService|LocalService") {
-        Pass "034" "SQL Server 서비스 계정: $svcUser (관리 서비스 계정)"
-    } else {
-        Pass "034" "SQL Server 서비스 계정: $svcUser (전용 계정)"
-    }
-} else { MC "034" "SQL Server 서비스 계정 수동 확인" }
+# 로컬 Administrators(S-1-5-32-544, 로캘 무관) 구성원 — 서비스 계정이 관리자 그룹이면 LocalSystem 과 같은 위험
+$adm34 = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -EA SilentlyContinue | ForEach-Object { "$($_.Name)".ToLower() })
+EvdQ "DBM-034" "SQL Server 엔진 서비스=구동 계정 / 로컬 Administrators 구성원" "$($svc34 -join ', ') / $(if ($adm34.Count) { $adm34 -join ', ' } else { '조회 불가' })"
+$bad34 = @(); $ok34 = @()
+foreach ($e in $svc34) {
+    $nm, $acct = $e -split '=', 2
+    $norm = "$acct".ToLower() -replace '^\.\\', "$($env:COMPUTERNAME.ToLower())\"
+    if ($acct -match 'LocalSystem|NT AUTHORITY\\SYSTEM') { $bad34 += "$nm($acct, 전체 권한)" }
+    elseif ($adm34 -contains $norm) { $bad34 += "$nm($acct, 로컬 Administrators 구성원)" }
+    elseif ($acct) { $ok34 += "$nm($acct)" }
+}
+if ($bad34.Count) { Fail "034" "SQL Server 서비스 관리자 권한 구동: $($bad34 -join ', ') - 전용 최소 권한 계정 권고" }
+elseif ($ok34.Count) { Pass "034" "SQL Server 서비스 계정: $($ok34 -join ', ')$(if (-not $adm34.Count) { ' (로컬 Administrators 구성원 조회 불가 - 관리자 그룹 여부 확인)' })" }
+else { MC "034" "SQL Server 서비스 계정 수동 확인" }
 
 # ── DBM-035: xp_cmdshell 비활성화 ───────────────────────────────
 $xp2 = Run-Q "SELECT value_in_use FROM sys.configurations WHERE name='xp_cmdshell'"
@@ -459,9 +480,9 @@ else { Fail "035" "xp_cmdshell 활성화됨 (=1) - 보안 위험" }
 # ── DBM-036: Registry Procedure 접근 권한 ──────────────────────
 # 평가기준: 제한 목록 7종이 DBA 외 guest/public 에 부여되면 취약 (xp_reg* 는 sys.objects 가 아닌 sys.all_objects 에만 존재)
 $n36 = Q-Int "SELECT COUNT(*) FROM master.sys.all_objects WHERE type='X' AND name LIKE 'xp_reg%'"
-$regPub = @(Run-Q 'SET NOCOUNT ON; SELECT o.name+'':''+dp.name+'':''+p.state_desc COLLATE DATABASE_DEFAULT FROM master.sys.database_permissions p JOIN master.sys.all_objects o ON o.object_id=p.major_id JOIN master.sys.database_principals dp ON dp.principal_id=p.grantee_principal_id WHERE p.class=1 AND p.type=''EX'' AND p.state IN (''G'',''W'') AND dp.name IN (''public'',''guest'') AND o.name IN (''xp_regaddmultistring'',''xp_regdeletekey'',''xp_regdeletevalue'',''xp_regenumvalues'',''xp_regread'',''xp_regremovemultistring'',''xp_regwrite'')')
+$regPub = @(Run-Q 'SET NOCOUNT ON; SELECT o.name+'':''+dp.name+'':''+p.state_desc COLLATE DATABASE_DEFAULT FROM master.sys.database_permissions p JOIN master.sys.all_objects o ON o.object_id=p.major_id JOIN master.sys.database_principals dp ON dp.principal_id=p.grantee_principal_id WHERE p.class=1 AND p.type=''EX'' AND p.state IN (''G'',''W'') AND dp.name IN (''public'',''guest'') AND o.name IN (''xp_regaddmultistring'',''xp_regdeletekey'',''xp_regdeletevalue'',''xp_regenumvalues'',''xp_regread'',''xp_regremovemultistring'',''xp_regwrite'')' | Where-Object { $_ }); $e36 = $script:QErr
 EvdQ "DBM-036" "레지스트리 확장 프로시저 수 / public·guest 부여" "$n36 / $($regPub -join ', ')"
-if ($null -eq $n36) { MC "036" "레지스트리 확장 프로시저 조회 실패 - 수동 확인" }
+if ($null -eq $n36 -or $e36) { MC "036" "레지스트리 확장 프로시저 조회 실패 - 수동 확인" }
 elseif ($regPub.Count -gt 0) { Fail "036" "레지스트리 확장 프로시저 public/guest 부여: $($regPub -join ', ')" }
 else { Pass "036" "제한 대상 레지스트리 확장 프로시저 public/guest 부여 없음" }
 
@@ -471,8 +492,25 @@ foreach ($code in @("012","014")) {
 }
 NA "026" "MSSQL 해당 없음 (Unix umask 개념 미적용)"
 NA "030" "MSSQL 해당 없음 (Oracle/Tibero AUD$ 전용 항목)"
-NA "032" "MSSQL 해당 없음 (PostgreSQL SSL 전용 항목)"
-NA "033" "MSSQL 해당 없음 (MySQL 복제 비밀번호 전용 항목)"
+# ── DBM-032: 통신구간 암호화 (ForceEncryption + 현재 TCP 연결 암호화) ──
+$fe32 = @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server' -EA SilentlyContinue | Where-Object { $_.PSChildName -match '^MSSQL\d+\.' } | ForEach-Object { $v = (Get-ItemProperty "$($_.PSPath)\MSSQLServer\SuperSocketNetLib" -EA SilentlyContinue).ForceEncryption; if ($null -ne $v) { "$($_.PSChildName)=$v" } })
+$plain32 = Q-Int "SELECT COUNT(*) FROM sys.dm_exec_connections WHERE net_transport='TCP' AND encrypt_option='FALSE'"
+EvdQ "DBM-032" "ForceEncryption(인스턴스별 레지스트리) / 암호화되지 않은 TCP 연결 수" "$($fe32 -join ', ') / $plain32"
+$feOff = @($fe32 | Where-Object { $_ -notmatch '=1$' })
+if ($fe32.Count -and -not $feOff.Count) { Pass "032" "강제 암호화 설정 (ForceEncryption=1: $($fe32 -join ', '))" }
+elseif ($null -eq $plain32) { MC "032" "연결 암호화 상태 조회 실패 (ForceEncryption: $(if ($fe32.Count) { $fe32 -join ', ' } else { '조회 불가' })) - 수동 확인" }
+elseif ($plain32 -gt 0) { Fail "032" "강제 암호화 미설정($(if ($fe32.Count) { $fe32 -join ', ' } else { 'ForceEncryption 조회 불가' })), 암호화되지 않은 TCP 연결 ${plain32}건" }
+else { MC "032" "현재 TCP 연결은 모두 암호화되나 강제 암호화(ForceEncryption) 미설정 - 클라이언트 설정 의존, 수동 확인" }
+
+# ── DBM-033: 이중화(Always On·미러링·로그 전달) 구성 시 엔드포인트 암호화 확인 ──
+$ag33 = Q-Int "SELECT COUNT(*) FROM sys.availability_groups"
+$mir33 = Q-Int "SELECT COUNT(*) FROM sys.database_mirroring WHERE mirroring_guid IS NOT NULL"
+$ls33 = Q-Int "SELECT COUNT(*) FROM msdb.dbo.log_shipping_primary_databases"
+$ep33 = @(Run-Q "SELECT name+':'+ISNULL(encryption_algorithm_desc,'NONE') FROM sys.database_mirroring_endpoints" | Where-Object { $_ })
+EvdQ "DBM-033" "AG / 미러링 / 로그 전달 / 미러링 엔드포인트 암호화" "$ag33 / $mir33 / $ls33 / $($ep33 -join ', ')"
+if ($null -eq $ag33 -and $null -eq $mir33) { MC "033" "이중화 구성 조회 실패 - 수동 확인" }
+elseif (($ag33 + $mir33 + [int]$ls33) -gt 0) { MC "033" "이중화 구성됨 (AG=$ag33, 미러링=$mir33, 로그 전달=$(if ($null -eq $ls33) { '조회 실패' } else { $ls33 })) - 엔드포인트 암호화($(if ($ep33.Count) { $ep33 -join ', ' } else { '엔드포인트 없음' }))·연결 계정 비밀번호 평문 저장 여부 확인" }
+else { NA "033" "이중화(Always On·미러링·로그 전달) 미구성" }
 
 
 # ════════════════════════════════════════════════════════════════
@@ -483,9 +521,9 @@ if ($script:KMODE -ne 'ef') {
 function RunQA([string]$q) { Run-Q $q | Where-Object { $_ } }   # 결과 줄만 (실패 시 0건, $script:QErr=true)
 $kna = "가이드 점검 대상 제품 아님 (MSSQL)"
 foreach ($c in 'D-05','D-07','D-09','D-12','D-14','D-15','D-17','D-18','D-19','D-20','D-21','D-22') { KPut $c 'N-A' $kna }
-$lg = @(RunQA "SELECT name COLLATE DATABASE_DEFAULT + '|' + type COLLATE DATABASE_DEFAULT + '|' + CAST(is_disabled AS varchar(1)) FROM sys.server_principals WHERE type IN ('S','U','G') AND name NOT LIKE '##%' AND name NOT LIKE 'NT SERVICE\%' AND name NOT LIKE 'NT AUTHORITY\%'")
+$lg = @(RunQA "SELECT name COLLATE DATABASE_DEFAULT + '|' + type COLLATE DATABASE_DEFAULT + '|' + CAST(is_disabled AS varchar(1)) FROM sys.server_principals WHERE type IN ('S','U','G') AND name NOT LIKE '##%' AND name NOT LIKE 'NT SERVICE\%' AND name NOT LIKE 'NT AUTHORITY\%'"); $lgErr = $script:QErr
 $sl = @(RunQA "SELECT name COLLATE DATABASE_DEFAULT + '|' + CAST(is_disabled AS varchar(1)) + '|' + CAST(is_policy_checked AS varchar(1)) + '|' + CAST(is_expiration_checked AS varchar(1)) + '|' + CONVERT(varchar(6), password_hash, 1) + '|' + CAST(principal_id AS varchar(10)) FROM sys.sql_logins WHERE name NOT LIKE '##%'")
-$lgErr = $script:QErr
+$slErr = $script:QErr
 EvdQ "D-01" "로그인 (이름|유형 S=SQL U=Windows G=그룹|비활성)" ($lg -join "`n")
 EvdQ "D-01" "SQL 로그인 (이름|비활성|암호정책|만료|해시접두|principal_id)" ($sl -join "`n")
 $sa = $sl | Where-Object { ($_ -split '\|')[5] -eq '1' } | Select-Object -First 1
@@ -511,7 +549,8 @@ EvdQ "D-03" "OS 암호 정책 최대 사용 기간 / 복잡성 (SQL 로그인 CH
 $b3 = @(); if ($np.Count) { $b3 += "암호 정책·만료 강제 미적용 SQL 로그인: $($np -join ', ')" }
 if ($null -ne $mx -and ([int]$mx -le 0 -or [int]$mx -gt 90)) { $b3 += "OS 최대 암호 사용 기간 $mx(90일 이하 필요)" }
 if ($null -ne $cx -and "$cx" -ne '1') { $b3 += 'OS 암호 복잡성 사용 안 함' }
-if ($b3.Count) { KPut 'D-03' '취약' "비밀번호 정책 미흡: $($b3 -join ' / ')" }
+if ($slErr) { KPut 'D-03' '수동확인' 'SQL 로그인 조회 실패 - CHECK_POLICY·CHECK_EXPIRATION·OS 암호 정책 수동 확인' }
+elseif ($b3.Count) { KPut 'D-03' '취약' "비밀번호 정책 미흡: $($b3 -join ' / ')" }
 elseif ($null -eq $mx) { KPut 'D-03' '수동확인' "SQL 로그인 암호 정책·만료 강제 적용, OS 암호 정책(secedit) 조회 불가 - 관리자 권한으로 최대 사용 기간·복잡성 확인" }
 else { KPut 'D-03' '양호' "SQL 로그인 암호 정책·만료 강제 적용, OS 최대 사용 기간 ${mx}일·복잡성 사용" }
 
@@ -527,13 +566,15 @@ KPut 'D-06' '수동확인' "활성 로그인: $(if ($lgErr) { '조회 실패' } 
 
 # D-08 안전한 암호화 알고리즘 (SQL 2012 이상 SHA-512 = 해시 0x0200, 0x0100 = SHA-1)
 $old = @($sl | Where-Object { ($_ -split '\|')[4] -eq '0x0100' } | ForEach-Object { ($_ -split '\|')[0] })
-if (-not $sl.Count) { KPut 'D-08' '양호' 'SQL 로그인 없음 (Windows 인증만 사용)' } elseif ($old.Count) { KPut 'D-08' '취약' "SHA-1(0x0100) 해시 비밀번호 로그인: $($old -join ', ') - 비밀번호 재설정 필요" } else { KPut 'D-08' '양호' "SQL 로그인 비밀번호 SHA-512(0x0200) 해시 ($($sl.Count)개)" }
+if ($slErr) { KPut 'D-08' '수동확인' 'SQL 로그인(sys.sql_logins) 조회 실패 - 비밀번호 해시 형식 수동 확인' }
+elseif (-not $sl.Count) { KPut 'D-08' '양호' 'SQL 로그인 없음 (Windows 인증만 사용)' } elseif ($old.Count) { KPut 'D-08' '취약' "SHA-1(0x0100) 해시 비밀번호 로그인: $($old -join ', ') - 비밀번호 재설정 필요" } else { KPut 'D-08' '양호' "SQL 로그인 비밀번호 SHA-512(0x0200) 해시 ($($sl.Count)개)" }
 
 # D-10 원격 접속 제한 (Windows 방화벽에서 DB 포트 접근 IP 지정)
-$fr = @(Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow -EA SilentlyContinue | Where-Object { $pf = $_ | Get-NetFirewallPortFilter -EA SilentlyContinue; $af = $_ | Get-NetFirewallApplicationFilter -EA SilentlyContinue; "$($pf.LocalPort)" -match '(^|,)1433(,|$)' -or "$($af.Program)" -match 'sqlservr' })
+$fr = @(Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow -EA SilentlyContinue | Where-Object { $pf = $_ | Get-NetFirewallPortFilter -EA SilentlyContinue; $af = $_ | Get-NetFirewallApplicationFilter -EA SilentlyContinue; ($pf.LocalPort -contains $port13) -or "$($af.Program)" -match 'sqlservr' })   # DBM-013 에서 찾은 DB 포트
 $frAny = @($fr | Where-Object { @(($_ | Get-NetFirewallAddressFilter -EA SilentlyContinue).RemoteAddress) -contains 'Any' } | ForEach-Object { $_.DisplayName })
 EvdQ "D-10" "SQL Server 인바운드 허용 규칙 (규칙 / 원격 주소)" (($fr | ForEach-Object { "$($_.DisplayName) / $(@(($_ | Get-NetFirewallAddressFilter).RemoteAddress) -join ',')" }) -join "`n")
-if ($frAny.Count) { KPut 'D-10' '취약' "모든 IP 에서 DB 포트 접속 허용 방화벽 규칙: $($frAny -join ', ')" }
+if ($off13.Count) { KPut 'D-10' '수동확인' "Windows 방화벽 비활성 프로필: $($off13 -join ',') - 네트워크 장비·보안그룹 등에서 지정 IP 접근 제한 여부 확인 (없으면 취약)" }
+elseif ($frAny.Count) { KPut 'D-10' '취약' "모든 IP 에서 DB 포트($port13) 접속 허용 방화벽 규칙: $($frAny -join ', ')" }
 elseif ($fr.Count) { KPut 'D-10' '양호' "DB 포트 방화벽 규칙이 지정 IP 로 제한 ($($fr.Count)개)" }
 else { KPut 'D-10' '수동확인' "SQL Server 인바운드 방화벽 규칙 미발견 - 네트워크 장비·보안그룹 등에서 지정 IP 접근 제한 여부 확인" }
 
@@ -554,6 +595,7 @@ $iso = "$(Run-Q "SELECT CAST(SERVERPROPERTY('IsIntegratedSecurityOnly') AS varch
 $saPol = $sa -and ($sa -split '\|')[2] -eq '1'
 EvdQ "D-16" "IsIntegratedSecurityOnly / sa 비활성 / sa 암호 정책" "$iso / $saOff / $saPol"
 if ($iso -eq '1') { KPut 'D-16' '양호' 'Windows 인증 모드 사용' }
+elseif ($iso -ne '0' -or $slErr) { KPut 'D-16' '수동확인' "인증 모드(IsIntegratedSecurityOnly=$iso) 또는 sa 상태 조회 실패 - 수동 확인" }
 elseif ($saOff) { KPut 'D-16' '양호' "혼합 인증 모드, sa 비활성" }
 elseif ($saPol) { KPut 'D-16' '양호' "혼합 인증 모드, sa 활성 - 암호 정책(CHECK_POLICY) 적용" }
 else { KPut 'D-16' '취약' "혼합 인증 모드 사용, sa 활성이며 암호 정책(CHECK_POLICY) 미적용" }
@@ -562,7 +604,8 @@ else { KPut 'D-16' '취약' "혼합 인증 모드 사용, sa 활성이며 암호
 $xp = "$(Run-Q "SELECT CAST(value_in_use AS varchar(1)) FROM sys.configurations WHERE name = 'xp_cmdshell'" | Select-Object -First 1)".Trim()
 $xpPub = @(RunQA "SELECT dp.name FROM master.sys.database_permissions p JOIN master.sys.all_objects o ON o.object_id = p.major_id JOIN master.sys.database_principals dp ON dp.principal_id = p.grantee_principal_id WHERE o.name = 'xp_cmdshell' AND p.state IN ('G','W') AND dp.name IN ('public','guest')")
 EvdQ "D-23" "xp_cmdshell value_in_use / public·guest 실행 권한" "$xp / $($xpPub -join ',')"
-if ($xp -ne '1') { KPut 'D-23' '양호' 'xp_cmdshell 비활성' }
+if ($xp -eq '0') { KPut 'D-23' '양호' 'xp_cmdshell 비활성' }
+elseif ($xp -ne '1') { KPut 'D-23' '수동확인' "xp_cmdshell 설정 조회 실패($xp) - 수동 확인" }
 elseif ($xpPub.Count) { KPut 'D-23' '취약' "xp_cmdshell 활성 + public·guest 실행 권한: $($xpPub -join ', ')" }
 else { KPut 'D-23' '수동확인' "xp_cmdshell 활성 (public 실행 권한 없음) - 응용프로그램 연동 서비스 계정의 sysadmin 권한 여부 확인 (sysadmin: $($sy -join ', '))" }
 
@@ -580,9 +623,10 @@ else { KPut 'D-25' '수동확인' "SQL Server $verNum $pv$(if ($eosDb.ContainsKe
 
 # D-26 감사 기록 (로그인 감사 '실패한 로그인과 성공한 로그인 모두' = AuditLevel 3, 또는 서버 감사 사용)
 $al = "$(Run-Q "DECLARE @v int; EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'AuditLevel', @v OUTPUT; SELECT CAST(@v AS varchar(3))" | Select-Object -First 1)".Trim()
-$sau = @(RunQA "SELECT name FROM sys.server_audits WHERE is_state_enabled = 1")
+$sau = @(RunQA "SELECT a.name FROM sys.server_audits a JOIN sys.server_audit_specifications s ON s.audit_guid = a.audit_guid WHERE a.is_state_enabled = 1 AND s.is_state_enabled = 1"); $sauErr = $script:QErr   # 사양 없는 감사는 기록 없음
 EvdQ "D-26" "로그인 감사 AuditLevel(0 없음/1 성공/2 실패/3 모두) / 활성 서버 감사" "$al / $($sau -join ', ')"
-if ($al -eq '3' -or $sau.Count) { KPut 'D-26' '양호' "감사 설정: $(if ($al -eq '3') { '로그인 감사 성공·실패 모두 ' })$(if ($sau.Count) { "서버 감사 $($sau -join ', ')" }) - 감사 기록 정책(보관·백업) 수립 여부는 인터뷰" }
+if ($al -eq '3' -or $sau.Count) { KPut 'D-26' '양호' "감사 설정: $(if ($al -eq '3') { '로그인 감사 성공·실패 모두 ' })$(if ($sau.Count) { "서버 감사(활성 감사 사양 포함) $($sau -join ', ')" }) - 감사 기록 정책(보관·백업) 수립 여부는 인터뷰" }
+elseif ($al -notmatch '^[0-3]$' -and $sauErr) { KPut 'D-26' '수동확인' "로그인 감사 수준·서버 감사 조회 실패 - 수동 확인" }
 else { KPut 'D-26' '취약' "로그인 감사 '$(switch ($al) { '0' {'없음'} '1' {'성공한 로그인만'} '2' {'실패한 로그인만'} default {"확인 불가($al)"} })', 활성 서버 감사 없음 - 가이드: 실패·성공 모두 감사" }
 }
 
