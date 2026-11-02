@@ -7402,7 +7402,8 @@ def _eos_products_from(category, text, evd, hinfo):
         elif vendor == "JUNIPER":
             out.append(("네트워크 OS", "junos", v.group(1) if v else ""))
         else:
-            out.append(("네트워크 OS", osd or vendor or "미확인", v.group(1) if v else ""))
+            prod = re.sub(r"\s+v?\d[\w.()-]*$", "", osd).strip() if osd else ""   # 표시명 끝의 버전은 버전 열로
+            out.append(("네트워크 OS", prod or vendor or "미확인", v.group(1) if v else ""))
     return out
 
 
@@ -7495,7 +7496,8 @@ def write_eos_inventory(base_dir, categories=None, out_dir=None):
         lines += ["", "=" * 100, f"[{_EOS_CATS[cat]}] 대상 {len(rows)}대 — EoS {len(bad)}대, 임박 {len(near)}대, 확인 필요 {len(unk)}대", "=" * 100,
                   "", "■ 제품·버전별 집계", f"  {'구분':<10}{'제품':<16}{'버전':<10}{'판정':<8}{'종료일':<12}대수"]
         for (kind, prod, ver, r, e), hosts in sorted(agg.items(), key=lambda x: ({"취약": 0, "수동확인": 1, "양호": 2}.get(x[0][3], 3), x[0][1], x[0][2])):
-            lines.append(f"  {kind:<10}{prod:<16}{ver:<10}{r:<8}{e:<12}{len(hosts)}대")
+            pc = f"{prod:<16}" if len(prod) < 16 else prod + " "   # 긴 제품명은 다음 열과 붙지 않게 한 칸 띄움
+            lines.append(f"  {kind:<10}{pc}{ver:<10}{r:<8}{e:<12}{len(hosts)}대")
         lines += ["", "■ 대상별 상세", f"  {'호스트':<48}{'OS':<28}{'커널':<36}판정"]
         for host, osd, kern, judged in rows:
             worst = next((x for x in (RESULT_BAD, RESULT_MANUAL, RESULT_GOOD) if any(j[3] == x for j in judged)), "-")
