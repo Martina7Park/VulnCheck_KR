@@ -55,7 +55,7 @@ _su_sh() { case "$OS_FAMILY" in LINUX) su "$1" -s /bin/sh -c "$2" ;; *) su "$1" 
 detect_dbms() {
     [ -n "$DBMS_TYPE" ] && return
     # 실행 중인 DB 프로세스 우선 (클라이언트만 설치된 서버·환경변수 없는 root/sudo 실행 대응)
-    { _proc_has 'ora_pmon_.*' || ps -ef 2>/dev/null | grep -q '[o]ra_pmon_'; } && DBMS_TYPE="oracle" && return
+    { _proc_has 'ora_pmon_.*' || ps -ef 2>/dev/null | grep -qE '[o]ra_pmon_|[d]b_pmon_'; } && DBMS_TYPE="oracle" && return
     _proc_has 'tbsvr.*' && DBMS_TYPE="tibero" && return
     _proc_has 'mariadbd|mysqld' && DBMS_TYPE="mysql" && return
     _proc_has 'postgres|postmaster' && DBMS_TYPE="pgsql" && return
@@ -385,17 +385,18 @@ _judge_umask() {
 # ================================================================
 _ora_env() {   # root/sudo 실행 등 환경변수 없음 → ora_pmon 프로세스·oratab 으로 ORACLE_HOME·SID·구동 계정 복원
     local c pm="" pid="" sid h s2
-    for c in /proc/[0-9]*/comm; do case "$(cat "$c" 2>/dev/null)" in ora_pmon_*) pid=${c#/proc/}; pid=${pid%/comm}; pm=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | awk '{print $1}'); break ;; esac; done   # comm 은 15자에서 잘림 → cmdline
-    [ -z "$pid" ] && read -r pid pm <<< "$(ps -e -o pid= -o args= 2>/dev/null | awk '{for (i = 2; i <= NF; i++) if ($i ~ /^ora_pmon_/) {print $1, $i; exit}}')"
+    for c in /proc/[0-9]*/comm; do case "$(cat "$c" 2>/dev/null)" in ora_pmon_*) pid=${c#/proc/}; pid=${pid%/comm}; pm=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline" | awk '{print $1}'); break ;; esac; done   # comm 은 15자에서 잘림 → cmdline
+    [ -z "$pid" ] && read -r pid pm <<< "$(ps -e -o pid= -o args= 2>/dev/null | awk '{for (i = 2; i <= NF; i++) if ($i ~ /^(ora|db)_pmon_/) {print $1, $i; exit}}')"
     pm=${pm##*/}
     [ -n "$pid" ] && _ORA_OS_USER=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
     [ -n "$ORACLE_HOME" ] && [ -x "$ORACLE_HOME/bin/sqlplus" ] && [ -n "$ORACLE_SID$ORACLE_SERVICE" ] && return 0
-    sid=${ORACLE_SID:-${pm#ora_pmon_}}
+    pm=${pm#ora_pmon_}; pm=${pm#db_pmon_}   # 23ai 이상: 명령행이 db_pmon_<SID> (comm 은 ora_pmon_<sid>)
+    sid=${ORACLE_SID:-$pm}
     [ -z "$sid" ] && return 1
     s2=$(cat /etc/oratab /var/opt/oracle/oratab 2>/dev/null | awk -F: -v s="$sid" 'tolower($1)==tolower(s) && $2!="" {print $1; exit}')   # 없는 파일에서 awk 가 중단되지 않도록 cat 으로 합침
     h=${ORACLE_HOME:-$(cat /etc/oratab /var/opt/oracle/oratab 2>/dev/null | awk -F: -v s="$sid" 'tolower($1)==tolower(s) && $2!="" {print $2; exit}')}
-    [ -z "$h" ] && [ -n "$pid" ] && h=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^ORACLE_HOME=//p')
-    [ -z "$ORACLE_SID" ] && [ -n "$pid" ] && ORACLE_SID=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^ORACLE_SID=//p')
+    [ -z "$h" ] && [ -n "$pid" ] && h=$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | sed -n 's/^ORACLE_HOME=//p')
+    [ -z "$ORACLE_SID" ] && [ -n "$pid" ] && ORACLE_SID=$(tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" | sed -n 's/^ORACLE_SID=//p')
     [ -n "$h" ] || return 1
     export ORACLE_HOME="$h" ORACLE_SID="${ORACLE_SID:-${s2:-$sid}}" PATH="$h/bin:$PATH"
 }
@@ -711,8 +712,8 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
     mc "025" "Oracle ${DB_VER} EoS 여부 수동 확인 (위 버전 참조)"
 
     # DBM-026: 구동 계정 umask
-    evd "DBM-026" "ps -ef 2>/dev/null | grep ora_pmon | grep -v grep | head -3"
-    _ora_user=$(ps -ef 2>/dev/null | grep ora_pmon | grep -v grep | awk '{print $1}' | head -1)
+    evd "DBM-026" "ps -ef 2>/dev/null | grep -E '(ora|db)_pmon_' | grep -v grep | head -3"
+    _ora_user=$(ps -ef 2>/dev/null | grep -E '(ora|db)_pmon_' | grep -v grep | awk '{print $1}' | head -1)
     [ -z "$_ora_user" ] && _ora_user="oracle"
     _ora_umask=$(_get_umask "$_ora_user" "ora_pmon")
     _judge_umask "$_ora_umask" "Oracle" "026" "$_ora_user"
@@ -775,8 +776,8 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
     fi
 
     # DBM-034: DBMS 서비스 구동 권한
-    evd "DBM-034" "ps -ef 2>/dev/null | grep -E 'ora_pmon|tnslsnr' | grep -v grep"
-    oracle_proc=$(ps -e -o user= -o args= 2>/dev/null | awk '{for (i = 2; i <= NF; i++) if ($i ~ /^ora_pmon_/ || $i ~ /tnslsnr$/) {print $1; break}}' | sort -u | tr '\n' ' ')
+    evd "DBM-034" "ps -ef 2>/dev/null | grep -E '(ora|db)_pmon_|tnslsnr' | grep -v grep"
+    oracle_proc=$(ps -e -o user= -o args= 2>/dev/null | awk '{for (i = 2; i <= NF; i++) if ($i ~ /^(ora|db)_pmon_/ || $i ~ /tnslsnr$/) {print $1; break}}' | sort -u | tr '\n' ' ')
     if [ -z "$oracle_proc" ]; then mc "034" "Oracle 구동 계정 수동 확인"
     elif echo " $oracle_proc " | grep -qw root; then ng "034" "Oracle 프로세스(pmon·리스너) root 계정으로 실행: ${oracle_proc% }"
     else ok "034" "Oracle 구동 계정(pmon·리스너): ${oracle_proc% }"; fi
@@ -1473,8 +1474,8 @@ check_tibero() {
     # root/sudo 실행 시 tbsvr 프로세스 환경에서 TB_HOME·TB_SID 복원
     local _tbp; _tbp=$(for c in /proc/[0-9]*/comm; do case "$(cat "$c" 2>/dev/null)" in tbsvr*) c=${c#/proc/}; echo "${c%/comm}"; break ;; esac; done)
     if [ -n "$_tbp" ]; then
-        [ -z "$TB_HOME" ] && TB_HOME=$(tr '\0' '\n' < "/proc/$_tbp/environ" 2>/dev/null | sed -n 's/^TB_HOME=//p')
-        [ -z "$TB_SID" ] && TB_SID=$(tr '\0' '\n' < "/proc/$_tbp/environ" 2>/dev/null | sed -n 's/^TB_SID=//p')
+        [ -z "$TB_HOME" ] && TB_HOME=$(tr '\0' '\n' 2>/dev/null < "/proc/$_tbp/environ" | sed -n 's/^TB_HOME=//p')
+        [ -z "$TB_SID" ] && TB_SID=$(tr '\0' '\n' 2>/dev/null < "/proc/$_tbp/environ" | sed -n 's/^TB_SID=//p')
         [ -n "$TB_HOME" ] && export TB_HOME TB_SID PATH="$TB_HOME/bin:$TB_HOME/client/bin:$PATH"
     fi
     TB_HOME="${TB_HOME:-/opt/tibero}"
@@ -2126,7 +2127,7 @@ _kisa_perm_w() {   # 파일 목록 중 그룹·일반 사용자 수정(쓰기) �
 }
 _kisa_d25() {   # D-25: EoS(보안 패치 미제공) = 취약, 그 외 최신 패치 여부 확인
     local e="${_RES[DBM-025]:-}"
-    evd_q "D-25" "DBMS 버전 / EoS 판정(DBM-025)" "${DB_VER:-미확인} / ${e:-없음}"
+    evd_q "D-25" "DBMS 버전" "${DB_VER:-미확인}"   # 지원 종료(EoS) 판정은 컨버터가 버전으로 수행
     case "$e" in 취약*) _kput "D-25" "취약" "보안 패치가 제공되지 않는 버전(EoS): ${e#*|}" ;;
     *) _kput "D-25" "수동확인" "${_KDB} $(echo "${DB_VER:-}" | _rx1 '[0-9]+(\.[0-9]+)+' | grep . || echo '버전 미확인') - 벤더 최신 보안 패치 적용 여부 확인 (지원 종료(EoS) 여부는 컨버터가 자동 판정)" ;; esac
 }
@@ -2146,8 +2147,8 @@ kisa_mysql() {
     local _u=""
     [ "${IS_MARIADB:-0}" = 1 ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'|',CONCAT_WS(',',NULLIF(JSON_VALUE(Priv,'\$.plugin'),''),JSON_VALUE(Priv,'\$.auth_or[0].plugin'),JSON_VALUE(Priv,'\$.auth_or[1].plugin'),JSON_VALUE(Priv,'\$.auth_or[2].plugin')),'|',CASE WHEN CONCAT(IFNULL(NULLIF(JSON_VALUE(Priv,'\$.authentication_string'),'invalid'),''),IFNULL(NULLIF(JSON_VALUE(Priv,'\$.auth_or[1].authentication_string'),'invalid'),''),IFNULL(NULLIF(JSON_VALUE(Priv,'\$.auth_or[2].authentication_string'),'invalid'),''))<>'' THEN 'SET' WHEN JSON_VALUE(Priv,'\$.authentication_string')='invalid' THEN 'INVALID' ELSE 'EMPTY' END,'|',IF(JSON_VALUE(Priv,'\$.account_locked') IN ('true','1'),'Y','N')) FROM mysql.global_priv WHERE User NOT IN (${_sys});")
     [ -z "$_u" ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'|',IFNULL(plugin,''),'|',IF(IFNULL(authentication_string,'')='','EMPTY','SET'),'|',IFNULL(account_locked,'N')) FROM mysql.user WHERE User NOT IN (${_sys});")
-    [ -z "$_u" ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'|',IFNULL(plugin,''),'|',CASE WHEN IFNULL(authentication_string,'')='invalid' THEN 'INVALID' WHEN IFNULL(authentication_string,'')='' AND IFNULL(Password,'')='' THEN 'EMPTY' ELSE 'SET' END,'|N') FROM mysql.user WHERE User NOT IN (${_sys});")
-    [ -z "$_u" ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'||',IF(IFNULL(Password,'')='','EMPTY','SET'),'|N') FROM mysql.user;")
+    [ -z "$_u" ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'|',IF(IFNULL(plugin,'')<>'',plugin,CASE LENGTH(IFNULL(Password,'')) WHEN 41 THEN 'mysql_native_password' WHEN 16 THEN 'mysql_old_password' ELSE '' END),'|',CASE WHEN IFNULL(authentication_string,'')='invalid' THEN 'INVALID' WHEN IFNULL(authentication_string,'')='' AND IFNULL(Password,'')='' THEN 'EMPTY' ELSE 'SET' END,'|N') FROM mysql.user WHERE User NOT IN (${_sys});")
+    [ -z "$_u" ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'|',CASE LENGTH(IFNULL(Password,'')) WHEN 41 THEN 'mysql_native_password' WHEN 16 THEN 'mysql_old_password' ELSE '' END,'|',IF(IFNULL(Password,'')='','EMPTY','SET'),'|N') FROM mysql.user;")
     evd_q "D-01" "계정@호스트|인증 플러그인|비밀번호(SET/EMPTY/INVALID=비밀번호 로그인 불가)|잠금" "${_u:-조회 불가}"
     local _nou="mysql.user 조회 불가(점검 계정 권한 부족) - 수동 확인"
     # 배포판 기본 관리 계정: MariaDB 10.4+ 'mysql'@'localhost' (비밀번호 로그인 불가 + unix_socket, OS mysql 계정 전용) → root 와 같은 DBA 로 취급
@@ -2187,9 +2188,10 @@ kisa_mysql() {
     _blt=$(echo "$_plt" | awk -F= -v D="${_lt:-x}" -v A="$(echo "$_u" | awk -F'|' '$3=="SET" && $4!="Y"{printf "%s ", $1}')" '
         BEGIN { n = split(A, a, " "); for (i = 1; i <= n; i++) act[a[i]] = 1 }
         ($1 in act) { v = ($2 == "-1") ? D : $2; if (v == "x" || v + 0 == 0 || v + 0 > 90) print $1 "=" (v == "x" ? "미지원" : v) }' | tr '\n' ' ')
-    evd_q "D-03" "계정별 비밀번호 사용 기간(일, -1=기본값 ${_lt:-미지원}, 0=만료 없음)" "${_plt:-조회 불가(기본값만 판단)}"
+    if [ -n "$_lt" ]; then evd_q "D-03" "계정별 비밀번호 사용 기간(일, -1=기본값 ${_lt}, 0=만료 없음)" "${_plt:-조회 불가(기본값만 판단)}"
+    else evd_q "D-03" "계정별 비밀번호 사용 기간" "비밀번호 만료 미지원 버전 - 조회 대상 없음"; fi
     if [ -n "$_plt" ]; then [ -n "$_blt" ] && _bad3="${_bad3} 사용 기간 90일 초과/만료 없음 계정: ${_blt% }"
-    else { [ -z "$_lt" ] || [ "$_lt" -eq 0 ] || [ "$_lt" -gt 90 ]; } 2>/dev/null && _bad3="${_bad3} 사용 기간 default_password_lifetime=${_lt:-미지원}(0=무제한, 90일 이하 필요)"; fi
+    else { [ -z "$_lt" ] || [ "$_lt" -eq 0 ] || [ "$_lt" -gt 90 ]; } 2>/dev/null && _bad3="${_bad3} 사용 기간 $( [ -z "$_lt" ] && echo "설정 불가(비밀번호 만료 미지원 버전: MySQL 5.7·MariaDB 10.4 미만)" || echo "default_password_lifetime=${_lt}(0=무제한, 90일 이하 필요)")"; fi
     [ -n "$_bad3" ] && _kput "D-03" "취약" "비밀번호 정책 미적용:${_bad3}" || _kput "D-03" "양호" "복잡도(${_cx}, 최소 ${_ln}자)·사용 기간(기본 ${_lt}일, 계정별 90일 이하) 설정"
 
     # D-04 관리자 권한(SUPER 등)은 필요한 계정에만
@@ -2207,7 +2209,7 @@ kisa_mysql() {
 
     # D-07 root 권한으로 서비스 구동 제한
     local _pu _cu="" _c
-    _pu=$(ps -eo user=,comm= 2>/dev/null | awk '$2 ~ /^(mysqld|mariadbd|mysqld_safe)$/ && $2!="mysqld_safe" {print $1}' | sort -u | tr '\n' ' ')
+    _pu=$(ps -eo user=,comm= 2>/dev/null | awk '$2 ~ /^(mysqld|mariadbd|mysqld_safe)$/ && $2!="mysqld_safe" {print $1}' | sort -u | _csv)
     for _c in /etc/my.cnf /etc/mysql/my.cnf /etc/my.cnf.d/*.cnf /etc/mysql/mysql.conf.d/*.cnf /etc/mysql/mariadb.conf.d/*.cnf; do
         [ -f "$_c" ] && _cu=$(awk '/^[[:space:]]*\[/{s=$0} tolower(s)~/\[(mysqld|server|mariadb)\]/ && /^[[:space:]]*user[[:space:]]*=/{sub(/.*=[[:space:]]*/,"");print;exit}' "$_c") && [ -n "$_cu" ] && break
     done
@@ -2217,7 +2219,7 @@ kisa_mysql() {
     else _kput "D-07" "수동확인" "구동 계정 확인 불가"; fi
 
     # D-08 안전한 암호화 알고리즘 (SHA-256 이상)
-    local _wk; _wk=$(echo "$_u" | awk -F'|' '$3=="SET" && ($2=="" || $2 ~ /mysql_native_password|mysql_old_password/) {print $1"("($2==""?"구형 해시":$2)")"}' | tr '\n' ' ')
+    local _wk; _wk=$(echo "$_u" | awk -F'|' '$3=="SET" && ($2=="" || $2 ~ /mysql_native_password|mysql_old_password/) {print $1"("($2==""?"인증 방식 미확인":$2)")"}' | tr '\n' ' ')
     evd_q "D-08" "비밀번호 계정별 인증 플러그인" "$(echo "$_u" | awk -F'|' '$3=="SET"{print $1" "$2}')"
     if [ -z "$_u" ]; then _kput "D-08" "수동확인" "계정 인증 플러그인 조회 불가"
     elif [ -n "$_wk" ]; then _kput "D-08" "취약" "SHA-256 미만 해시 알고리즘 계정 (mysql_native_password=SHA-1): ${_wk% }"
@@ -2225,8 +2227,8 @@ kisa_mysql() {
 
     _KNA D-09
     # D-10 원격 접속 제한 (Host='%' 계정)
-    local _any; _any=$(echo "$_u" | awk -F'|' '$1 ~ /@%$/ && $4!="Y" {print $1}' | tr '\n' ' ')
-    evd_q "D-10" "모든 호스트(%) 허용 계정 / bind_address" "${_any:-없음} / $(get_var bind_address)"
+    local _any; _any=$(echo "$_u" | awk -F'|' '$1 ~ /@%$/ && $4!="Y" {print $1}' | tr '\n' ' ' | sed 's/ $//')
+    evd_q "D-10" "모든 호스트(%) 허용 계정 / bind_address" "${_any:-없음} / $(get_var bind_address | grep . || echo '미설정(전체 인터페이스)')"
     if [ -z "$_u" ]; then _kput "D-10" "수동확인" "$_nou"
     elif [ -n "$_any" ]; then _kput "D-10" "취약" "모든 클라이언트(%)에서 접속 가능한 계정: ${_any% } - 지정 IP 로 제한 필요"
     else _kput "D-10" "양호" "모든 계정이 지정 호스트에서만 접속 가능 (Host='%' 없음)"; fi
@@ -2274,7 +2276,12 @@ kisa_pgsql() {
         return
     fi
     local _hba _roles
-    _hba=$(run_q "SELECT type||' '||array_to_string(database,',')||' '||array_to_string(user_name,',')||' '||COALESCE(address,'')||COALESCE('/'||netmask,'')||' '||auth_method FROM pg_hba_file_rules WHERE error IS NULL;")
+    _hba=$(run_q "SELECT type||' '||array_to_string(database,',')||' '||array_to_string(user_name,',')||' '||COALESCE(address,'')||COALESCE('/'||netmask,'')||' '||auth_method FROM pg_hba_file_rules WHERE error IS NULL;" | awk '
+        function mbits(m,  n, a, i, j, d, b, h) { b = 0; n = split(m, a, /[.:]/)
+            for (i = 1; i <= n; i++) { h = tolower(a[i]); if (m ~ /\./) { d = h + 0; while (d > 0) { b += d % 2; d = int(d / 2) } }
+                else for (j = 1; j <= length(h); j++) { d = index("0123456789abcdef", substr(h, j, 1)) - 1; while (d > 0) { b += d % 2; d = int(d / 2) } } }
+            return b }
+        $1 != "local" && match($4, /\/[0-9a-fA-F.:]+$/) { $4 = substr($4, 1, RSTART) mbits(substr($4, RSTART + 1)) } { $1 = $1; print }')   # 넷마스크 → CIDR 접두 길이
     _roles=$(run_q "SELECT rolname||'|'||CASE WHEN rolcanlogin THEN 't' ELSE 'f' END||'|'||CASE WHEN rolsuper THEN 't' ELSE 'f' END||'|'||COALESCE(NULLIF(concat_ws('/',CASE WHEN rolcreaterole THEN 'CREATEROLE' END,CASE WHEN rolcreatedb THEN 'CREATEDB' END,CASE WHEN rolreplication THEN 'REPLICATION' END,CASE WHEN rolbypassrls THEN 'BYPASSRLS' END),''),'f')||'|'||CASE WHEN rolpassword IS NULL THEN 'NULL' WHEN rolpassword LIKE 'SCRAM-SHA-256%' THEN 'SCRAM' WHEN rolpassword LIKE 'md5%' THEN 'MD5' ELSE 'OTHER' END||'|'||COALESCE(rolvaliduntil::text,'') FROM pg_authid WHERE rolname NOT LIKE 'pg\\_%';")
     evd_q "D-01" "역할|로그인|슈퍼유저|관리권한|비밀번호 해시|유효기간 (pg_authid)" "${_roles:-조회 불가(슈퍼유저 권한 필요)}"
     evd_q "D-01" "pg_hba_file_rules" "${_hba:-조회 불가}"
@@ -2287,8 +2294,8 @@ kisa_pgsql() {
     _ltpg=$(echo "$_hba" | awk '$NF=="trust" && ($1=="local" || $4 ~ /^(127\.0\.0\.1|::1)\//) && $3 ~ /(^|,)(all|postgres)(,|$)/')   # postgres 에 적용되는 로컬 trust
     local _nor="pg_authid 조회 불가(슈퍼유저 권한 필요) - 수동 확인"
     if [ -z "$_roles" ]; then _kput "D-01" "수동확인" "pg_authid 조회 불가 - postgres 비밀번호 설정 여부 확인"
-    elif [ -n "$_trust" ]; then _kput "D-01" "취약" "비밀번호 없이 접속 가능한 원격 trust 인증: $(echo "$_trust" | tr '\n' ',' | sed 's/,$//')"
-    elif [ -n "$_ltpg" ]; then _kput "D-01" "취약" "로컬 trust 인증으로 서버의 모든 OS 사용자가 비밀번호 없이 postgres 접속 가능: $(echo "$_ltpg" | tr '\n' ',' | sed 's/,$//')"
+    elif [ -n "$_trust" ]; then _kput "D-01" "취약" "비밀번호 없이 접속 가능한 원격 trust 인증 (pg_hba.conf: $(echo "$_trust" | sed 's/ trust$//' | _csv | sed 's/,/, /g') → trust)"
+    elif [ -n "$_ltpg" ]; then _kput "D-01" "취약" "로컬 trust 인증으로 서버의 모든 OS 사용자가 비밀번호 없이 postgres 접속 가능 (pg_hba.conf: $(echo "$_ltpg" | sed 's/ trust$//' | _csv | sed 's/,/, /g') → trust)"
     elif echo "$_pg" | awk -F'|' '$5=="NULL"' | grep -q .; then _kput "D-01" "양호" "기본 계정 postgres 비밀번호 미설정 - 비밀번호 인증 불가(peer 등 OS 인증만 허용, 잠금과 동일)"
     else _kput "D-01" "양호" "기본 계정 postgres 비밀번호 설정 ($(echo "$_pg" | cut -d'|' -f5))$( [ "${_ltrust:-0}" -gt 0 ] && echo " - 참고: 로컬(소켓·루프백) trust 규칙 ${_ltrust}개는 비밀번호 없이 접속 가능하므로 필요성 확인")"; fi
 
@@ -2336,7 +2343,7 @@ kisa_pgsql() {
     _KNA D-09
     # D-10 원격 접속 제한 (listen_addresses + pg_hba 전체 허용 규칙)
     local _la _open; _la=$(run_q "SHOW listen_addresses;")
-    _open=$(echo "$_hba" | awk '$1 ~ /^host/ && $NF!="reject" && ($4 ~ /^(0\.0\.0\.0\/0|::\/0|::\/::|::0\/::0|0\.0\.0\.0\/0\.0\.0\.0|all)$/ || $4 ~ /^0\.0\.0\.0\/0/)')   # pg_hba_file_rules 는 ::/0 을 '::' + netmask '::' 로 표시
+    _open=$(echo "$_hba" | awk '$1 ~ /^host/ && $NF!="reject" && ($4 ~ /^(0\.0\.0\.0\/0|::\/0|::0\/0|::\/::|::0\/::0|0\.0\.0\.0\/0\.0\.0\.0|all)$/ || $4 ~ /^0\.0\.0\.0\/0/)')   # 넷마스크는 위에서 접두 길이로 변환 (::/:: → ::/0)
     evd_q "D-10" "listen_addresses / 전체 대역 허용 pg_hba 규칙" "${_la} / ${_open:-없음}"
     if [ -z "$_hba" ] && ! _pg_local_listen "$_la"; then _kput "D-10" "수동확인" "pg_hba_file_rules 조회 불가(슈퍼유저 권한 필요) - listen_addresses=${_la}, pg_hba.conf 접속 허용 대역 수동 확인"
     elif [ -n "$_open" ] && ! _pg_local_listen "$_la"; then _kput "D-10" "취약" "모든 IP 에서 접속 허용 (listen_addresses=${_la}, pg_hba: $(echo "$_open" | tr '\n' ',' | sed 's/,$//'))"
@@ -2447,9 +2454,10 @@ kisa_oracle() {
     local _rm _rt _b5
     _rm=$(_prof PASSWORD_REUSE_MAX); _rt=$(_prof PASSWORD_REUSE_TIME)
     evd_q "D-05" "OPEN 계정별 PASSWORD_REUSE_MAX / PASSWORD_REUSE_TIME" "$(echo "$_rm" | _csv) / $(echo "$_rt" | _csv)"
-    _b5=$(join -t= <(echo "$_rm" | sort -t= -k1,1) <(echo "$_rt" | sort -t= -k1,1) 2>/dev/null | awk -F= '($2=="UNLIMITED" && $3=="UNLIMITED") || ($2 ~ /^[0-9.]+$/ && $3 ~ /^[0-9.]+$/ && ($2+0<10 || $3+0<365)) {print $1"(MAX="$2",TIME="$3")"}' | head -8)
+    _b5=$(join -t= <(echo "$_rm" | sort -t= -k1,1) <(echo "$_rt" | sort -t= -k1,1) 2>/dev/null | awk -F= '($2=="UNLIMITED" && $3=="UNLIMITED") || ($2 ~ /^[0-9.]+$/ && $3 ~ /^[0-9.]+$/ && ($2+0<10 || $3+0<365)) {k = "REUSE_MAX=" $2 "·REUSE_TIME=" $3; if (!(k in g)) {o[++n] = k; g[k] = $1} else g[k] = g[k] ", " $1}
+        END {for (i = 1; i <= n; i++) printf "%s%s (%s)", (i > 1 ? " / " : ""), g[o[i]], o[i]}')   # 같은 설정 계정끼리 묶음
     if [ -z "$_rm" ]; then _kput "D-05" "수동확인" "PASSWORD_REUSE_MAX/TIME 조회 실패 - 수동 확인"
-    elif [ -n "$_b5" ]; then _kput "D-05" "취약" "비밀번호 재사용 제한 미흡 계정: $(echo "$_b5" | _csv) - 가이드 권고 PASSWORD_REUSE_TIME 365, PASSWORD_REUSE_MAX 10"
+    elif [ -n "$_b5" ]; then _kput "D-05" "취약" "비밀번호 재사용 제한 미흡 계정: ${_b5} - 가이드 권고 PASSWORD_REUSE_TIME 365, PASSWORD_REUSE_MAX 10"
     else _kput "D-05" "양호" "OPEN 계정 비밀번호 재사용 제한 적용 (REUSE_MAX 10회·REUSE_TIME 365일 이상 또는 한쪽 UNLIMITED=재사용 불가)"; fi
 
     # D-06 사용자별 계정 (공용 계정 여부)
@@ -2457,8 +2465,8 @@ kisa_oracle() {
     _kput "D-06" "수동확인" "활성 사용자 계정: $(echo "$_ou" | grep -v 'ORA-' | head -15 | _csv) - 사용자·응용프로그램별 개별 계정 사용 여부(공용 계정 사용 시 취약) 확인"
 
     # D-07 root 권한 구동 제한 (ora_pmon·tnslsnr 구동 계정)
-    local _pu; _pu=$(ps -eo user=,args= 2>/dev/null | awk '$2 ~ /^ora_pmon_/ || $2 ~ /tnslsnr$/ {print $1}' | sort -u | tr '\n' ' ')
-    evd "D-07" "ps -eo user,args 2>/dev/null | grep -E 'ora_pmon_|tnslsnr' | grep -v grep"
+    local _pu; _pu=$(ps -eo user=,args= 2>/dev/null | awk '$2 ~ /^(ora|db)_pmon_/ || $2 ~ /tnslsnr$/ {print $1}' | sort -u | tr '\n' ' ')
+    evd "D-07" "ps -eo user,args 2>/dev/null | grep -E '(ora|db)_pmon_|tnslsnr' | grep -v grep"
     if echo " $_pu " | grep -qw root; then _kput "D-07" "취약" "Oracle 프로세스가 root 로 구동: ${_pu% }"
     elif [ -n "$_pu" ]; then _kput "D-07" "양호" "Oracle(ora_pmon·tnslsnr) 구동 계정: ${_pu% }"
     else _kput "D-07" "수동확인" "Oracle 프로세스 구동 계정 확인 불가"; fi
@@ -2521,7 +2529,8 @@ kisa_oracle() {
     for _n in $(_ora_net); do _fl14="$_fl14 $_n $_n/listener.ora $_n/sqlnet.ora $_n/tnsnames.ora"; done
     for _n in $(_ora_dbs); do _fl14="$_fl14 $(ls -d "$_n"/init*.ora "$_n"/spfile*.ora "$_n"/orapw* 2>/dev/null | tr '\n' ' ')"; done
     _dbf=$(run_q "SELECT NAME FROM V\$CONTROLFILE UNION ALL SELECT MEMBER FROM V\$LOGFILE UNION ALL SELECT NAME FROM V\$DATAFILE;" | grep '^/' | head -100 | tr '\n' ' ')
-    evd_ls "D-14" $_fl14 $(echo "$_dbf" | tr ' ' '\n' | head -20)
+    evd_ls "D-14" $_fl14                                         # 설정·비밀번호·파라미터 파일 먼저 (보고서 증적 요약 앞부분에 표시)
+    [ -n "$_dbf" ] && evd_ls "D-14" $(echo "$_dbf" | tr ' ' '\n' | head -20)   # 제어·redo·데이터 파일
     _w14=$(_kisa_perm_w $_fl14 $_dbf)
     if [ -z "${_fl14// /}" ]; then _kput "D-14" "수동확인" "Oracle 설정 파일 미발견 (ORACLE_HOME·TNS_ADMIN 확인)"
     elif [ -n "$_w14" ]; then _kput "D-14" "취약" "주요 파일·디렉터리에 그룹·일반 사용자 수정 권한: ${_w14}"
