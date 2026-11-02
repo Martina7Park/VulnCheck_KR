@@ -9,7 +9,7 @@
 #   Windows MSSQL은 check_dbms_mssql.ps1, Linux MSSQL은 이 스크립트 사용.
 #
 # [대상 DBMS]
-#   Oracle 10g~21c / MySQL 5.6~8.0 / MariaDB 10.x
+#   Oracle 10g~23ai(26ai) / MySQL 5.6~8.0 / MariaDB 10.x
 #   PostgreSQL 10~16 / Tibero 5~7
 #   MSSQL(Linux) — SQL Server 2017~2022 on Linux (sqlcmd 기반)
 #   (DBMS가 없으면 자동 탐지 후 미설치 안내)
@@ -447,7 +447,7 @@ check_oracle() {
     }
     run_q() {   # SQL 오류 시 원문(SQL 에코·'*'·ERROR at line) 대신 첫 ORA-/SP2- 줄만 반환, 전체 오류는 증적에 기록
         local _o
-        _o=$(printf 'CONNECT %s\nSET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 200 TRIMSPOOL ON\nPROMPT __Q_BEGIN__\n%s\nEXIT\n' "$CONN" "$1" | _ora_exec 2>&1)
+        _o=$(printf 'CONNECT %s\nSET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 200 TRIMSPOOL ON TAB OFF\nPROMPT __Q_BEGIN__\n%s\nEXIT\n' "$CONN" "$1" | _ora_exec 2>&1)   # TAB OFF: 숫자 열 앞 공백이 탭으로 출력되면 값 비교 실패
         printf '%s\n' "$_o" | grep -q '^__Q_BEGIN__$' && _o=$(printf '%s\n' "$_o" | awk 'f {print} /^__Q_BEGIN__$/ {f = 1}')   # 표지가 첫 줄이어도 동작 (sed '1,/re/' 는 2행부터 찾음)
         if printf '%s\n' "$_o" | grep -qE '^(ORA|SP2)-[0-9]+'; then
             printf '[SQL오류] %s\n%s\n\n' "$(printf '%s' "$1" | head -c 200)" "$(printf '%s\n' "$_o" | grep -E '^(ORA|SP2)-')" >> "$_EVD"
@@ -465,12 +465,13 @@ check_oracle() {
     echo "# Oracle 접속: $( [ "$CONN" = "/ as sysdba" ] && echo "OS 인증(/ as sysdba)${_ORA_SU:+ - ${_ORA_SU} 계정}" || echo "${CONN%%/*}@${ORACLE_SERVICE:-${ORACLE_SID:-local}}")"
 
     _conn_ok "$(run_q "SELECT 'CONN_'||'OK' FROM DUAL;")" "Oracle" || return
-    DB_VER=$(run_q "SELECT VERSION FROM V\$INSTANCE;" | _rx1 '[0-9]+\.[0-9]+')
+    DB_VER=$(run_q "SELECT VERSION_FULL FROM V\$INSTANCE;" | _rx1 '[0-9]+(\.[0-9]+)+')   # 18c 이상: RU 반영 버전 (예: 19.24.0.0.0)
+    [ -z "$DB_VER" ] && DB_VER=$(run_q "SELECT VERSION FROM V\$INSTANCE;" | _rx1 '[0-9]+(\.[0-9]+)+')
     DB_MAJ=$(echo "$DB_VER" | cut -d. -f1)
     echo "# Oracle 버전: ${DB_VER}"
     # 12c+ 멀티테넌트: CDB$ROOT 접속 시 열린 PDB 전체를 순회 (DBA_* 뷰는 현재 컨테이너만 조회)
     _ORA_CONS=""; _ORA_CONS_FAIL=""
-    if [ "$(run_q "SELECT SYS_CONTEXT('USERENV','CON_NAME') FROM DUAL;" | tr -d ' \n')" = 'CDB$ROOT' ]; then
+    if [ "$(run_q "SELECT SYS_CONTEXT('USERENV','CON_NAME') FROM DUAL;" | tr -d '[:space:]')" = 'CDB$ROOT' ]; then
         _ORA_CONS=$(run_q "SELECT NAME FROM V\$PDBS WHERE OPEN_MODE LIKE 'READ%' AND NAME<>'PDB\$SEED' ORDER BY CON_ID;" | grep -v "ORA-" | tr -d ' ' | grep -v '^$' | tr '\n' ' ')
         local _c _ok=""; _ORA_CONS_FAIL=""
         for _c in $_ORA_CONS; do
@@ -528,7 +529,7 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
         run_qa "SELECT u.USERNAME||'='||DECODE(p.LIMIT,'DEFAULT',d.LIMIT,p.LIMIT) FROM DBA_USERS u JOIN DBA_PROFILES p ON p.PROFILE=u.PROFILE AND p.RESOURCE_NAME='$1' JOIN DBA_PROFILES d ON d.PROFILE='DEFAULT' AND d.RESOURCE_NAME='$1' WHERE u.ACCOUNT_STATUS='OPEN' ORDER BY 1;" | grep "=" | grep -v "ORA-"
     }
     # DBM-006: 로그인 실패 횟수 제한 (평가기준: 계정별 적용 프로파일 FAILED_LOGIN_ATTEMPTS UNLIMITED 또는 5 초과 → 취약)
-    _p6=$(_prof FAILED_LOGIN_ATTEMPTS); _lock=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_LOCK_TIME';" | tr -d ' \n')
+    _p6=$(_prof FAILED_LOGIN_ATTEMPTS); _lock=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_LOCK_TIME';" | tr -d '[:space:]')
     evd_q "DBM-006" "OPEN 계정별 FAILED_LOGIN_ATTEMPTS / DEFAULT PASSWORD_LOCK_TIME" "$(echo "$_p6" | _csv) / LOCK_TIME=${_lock}"
     _b6=$(echo "$_p6" | awk -F= '$2=="UNLIMITED" || $2+0>5 || $2=="" {print}' | head -8)
     if [ -z "$_p6" ]; then mc "006" "계정별 FAILED_LOGIN_ATTEMPTS 조회 실패 - 수동 확인"
@@ -565,7 +566,7 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
     fi
 
     # DBM-009: 미사용 세션 종료 (resource_limit=TRUE + 계정별 IDLE_TIME 15분 이하)
-    _res_lim=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='resource_limit';" | tr -d ' \n')
+    _res_lim=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='resource_limit';" | tr -d '[:space:]')
     _p9=$(_prof IDLE_TIME)
     evd_q "DBM-009" "resource_limit=${_res_lim}, OPEN 계정별 IDLE_TIME" "$(echo "$_p9" | _csv)"
     _b9=$(echo "$_p9" | awk -F= '$2=="UNLIMITED" || $2+0>15 {print}' | head -8)
@@ -577,9 +578,9 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
 
     # DBM-011: 감사 로그
     if [ "${DB_MAJ:-0}" -ge 12 ] 2>/dev/null; then
-        ua=$(run_q "SELECT VALUE FROM V\$OPTION WHERE PARAMETER='Unified Auditing';" | tr -d ' \n')
+        ua=$(run_q "SELECT VALUE FROM V\$OPTION WHERE PARAMETER='Unified Auditing';" | tr -d '[:space:]')
         if [ "$ua" = "TRUE" ]; then
-            cnt=$(run_q "SELECT COUNT(DISTINCT POLICY_NAME) FROM AUDIT_UNIFIED_ENABLED_POLICIES;" 2>/dev/null | tr -d ' \n')
+            cnt=$(run_q "SELECT COUNT(DISTINCT POLICY_NAME) FROM AUDIT_UNIFIED_ENABLED_POLICIES;" 2>/dev/null | tr -d '[:space:]')
             evd_q "DBM-011" "Unified Auditing=TRUE, 활성 정책 수" "${cnt:-조회 불가}"
             case "$cnt" in
             ''|*[!0-9]*) mc "011" "통합 감사 활성 정책 조회 실패(${cnt:-빈 값}) - AUDIT_UNIFIED_ENABLED_POLICIES 수동 확인" ;;
@@ -587,12 +588,12 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
             *) mc "011" "통합 감사 수집 중 (정책 ${cnt}개) - 주기적 백업 여부 인터뷰/증적 확인" ;;
             esac
         else
-            at=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='audit_trail';" | tr -d ' \n')
+            at=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='audit_trail';" | tr -d '[:space:]')
             evd_q "DBM-011" "audit_trail" "$at"
             case "$at" in *ORA-*|*SP2-*|'') mc "011" "audit_trail 조회 실패(${at:-빈 값}) - 감사 설정 수동 확인" ;; NONE) ng "011" "audit_trail=NONE" ;; *) mc "011" "audit_trail=${at} 수집 중 - 주기적 백업 여부 인터뷰/증적 확인" ;; esac
         fi
     else
-        at=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='audit_trail';" | tr -d ' \n')
+        at=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='audit_trail';" | tr -d '[:space:]')
         evd_q "DBM-011" "audit_trail" "$at"
         case "$at" in *ORA-*|*SP2-*|'') mc "011" "audit_trail 조회 실패(${at:-빈 값}) - 감사 설정 수동 확인" ;; NONE) ng "011" "audit_trail=NONE" ;; *) mc "011" "audit_trail=${at} 수집 중 - 주기적 백업 여부 인터뷰/증적 확인" ;; esac
     fi
@@ -723,7 +724,7 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
 
     # DBM-029: 자원 사용 제한 (프로파일)
     # 평가기준: 자원 사용 제한 설정(RESOURCE_LIMIT) FALSE 이면 취약
-    sess=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='SESSIONS_PER_USER';" | tr -d ' \n')
+    sess=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='SESSIONS_PER_USER';" | tr -d '[:space:]')
     evd_q "DBM-029" "resource_limit / (참고) DEFAULT SESSIONS_PER_USER" "${_res_lim} / ${sess}"
     case "${_res_lim^^}" in
     TRUE)  ok "029" "RESOURCE_LIMIT=TRUE (자원 사용 제한 활성)" ;;
@@ -864,7 +865,7 @@ check_mysql() {
         mc "001" "(참고) caching_sha2_password 미사용 계정: $(echo "$_weak_auth" | _csv) - 계정 비밀번호 복잡도·취약 비밀번호 여부는 해시 크랙으로 확인 필요"
     else
         _def_auth=$(get_var "default_authentication_plugin")
-        mc "001" "전 계정 안전한 인증 플러그인 사용${_def_auth:+ (default=${_def_auth})} - 계정 비밀번호 복잡도·취약 비밀번호 여부는 해시 크랙으로 확인 필요"
+        mc "001" "구형·비표준 인증 플러그인 계정 없음${_def_auth:+ (default=${_def_auth})} - 계정 비밀번호 복잡도·취약 비밀번호 여부는 해시 크랙으로 확인 필요"
     fi
 
     # DBM-003: 불필요 계정
@@ -1338,7 +1339,10 @@ SELECT '#ok';")
     evd_q "DBM-015" "PUBLIC CREATE 권한 (public 스키마)" "${_pg_pub_create:-없음}"
     evd_q "DBM-015" "PUBLIC 테이블(Object) 권한 (비시스템)" "${_pg_pub_tbl:-없음}"
     if [ -n "$_pg_pub_tbl" ] || [ -n "$_pg_pub_exec" ] || [ -n "$_pg_pub_create" ]; then
-        mc "015" "PUBLIC Object 권한: $(echo "${_pg_pub_tbl}${_pg_pub_exec:+ $_pg_pub_exec}${_pg_pub_create:+ $_pg_pub_create}" | _csv | head -c 150) - 업무상 필요 여부 확인${_pg_fail15:+ / 접속·조회 실패 DB: $_pg_fail15}"
+        # 객체별 권한 묶음 (예: ansdb:public.t1(SELECT,INSERT)) - 최대 5개 객체 표시 후 '외 N개'
+        local _g15; _g15=$(echo "$_p15" | grep -v '^#FAIL:' | awk 'NF >= 2 {o = $1; p = $NF; gsub(/[()]/, "", p); if (!(o in a)) {k[++n] = o; a[o] = p} else a[o] = a[o] "," p}
+            END {for (i = 1; i <= n && i <= 5; i++) printf "%s%s(%s)", (i > 1 ? ", " : ""), k[i], a[k[i]]; if (n > 5) printf " 외 %d개", n - 5}')
+        mc "015" "PUBLIC 권한: ${_g15} - 업무상 필요 여부 확인${_pg_fail15:+ / 접속·조회 실패 DB: $_pg_fail15}"
     elif [ -n "$_pg_fail15" ]; then
         mc "015" "접속·조회 실패 DB(${_pg_fail15}) - 해당 DB 의 PUBLIC Object 권한 수동 확인 (나머지 DB 는 없음)"
     elif [ "$_PG_SU" != "on" ]; then
@@ -2271,7 +2275,7 @@ kisa_pgsql() {
     fi
     local _hba _roles
     _hba=$(run_q "SELECT type||' '||array_to_string(database,',')||' '||array_to_string(user_name,',')||' '||COALESCE(address,'')||COALESCE('/'||netmask,'')||' '||auth_method FROM pg_hba_file_rules WHERE error IS NULL;")
-    _roles=$(run_q "SELECT rolname||'|'||CASE WHEN rolcanlogin THEN 't' ELSE 'f' END||'|'||CASE WHEN rolsuper THEN 't' ELSE 'f' END||'|'||CASE WHEN (rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls) THEN 't' ELSE 'f' END||'|'||CASE WHEN rolpassword IS NULL THEN 'NULL' WHEN rolpassword LIKE 'SCRAM-SHA-256%' THEN 'SCRAM' WHEN rolpassword LIKE 'md5%' THEN 'MD5' ELSE 'OTHER' END||'|'||COALESCE(rolvaliduntil::text,'') FROM pg_authid WHERE rolname NOT LIKE 'pg\\_%';")
+    _roles=$(run_q "SELECT rolname||'|'||CASE WHEN rolcanlogin THEN 't' ELSE 'f' END||'|'||CASE WHEN rolsuper THEN 't' ELSE 'f' END||'|'||COALESCE(NULLIF(concat_ws('/',CASE WHEN rolcreaterole THEN 'CREATEROLE' END,CASE WHEN rolcreatedb THEN 'CREATEDB' END,CASE WHEN rolreplication THEN 'REPLICATION' END,CASE WHEN rolbypassrls THEN 'BYPASSRLS' END),''),'f')||'|'||CASE WHEN rolpassword IS NULL THEN 'NULL' WHEN rolpassword LIKE 'SCRAM-SHA-256%' THEN 'SCRAM' WHEN rolpassword LIKE 'md5%' THEN 'MD5' ELSE 'OTHER' END||'|'||COALESCE(rolvaliduntil::text,'') FROM pg_authid WHERE rolname NOT LIKE 'pg\\_%';")
     evd_q "D-01" "역할|로그인|슈퍼유저|관리권한|비밀번호 해시|유효기간 (pg_authid)" "${_roles:-조회 불가(슈퍼유저 권한 필요)}"
     evd_q "D-01" "pg_hba_file_rules" "${_hba:-조회 불가}"
 
@@ -2310,7 +2314,7 @@ kisa_pgsql() {
     else _kput "D-03" "양호" "복잡도 모듈(${_spl}) 적용, 비밀번호 역할 전부 사용 기간 설정"; fi
 
     # D-04 관리자 권한
-    local _adm; _adm=$(echo "$_roles" | awk -F'|' '$1!="postgres" && ($3=="t" || $4=="t") {print $1"("($3=="t"?"SUPERUSER":"CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS")")"}' | tr '\n' ' ')
+    local _adm; _adm=$(echo "$_roles" | awk -F'|' '$1!="postgres" && ($3=="t" || $4!="f") {print $1"("($3=="t"?"SUPERUSER":$4)")"}' | tr '\n' ' ')
     evd_q "D-04" "postgres 외 관리 권한 역할" "${_adm:-없음}"
     if [ -z "$_roles" ]; then _kput "D-04" "수동확인" "$_nor"
     elif [ -n "$_adm" ]; then _kput "D-04" "수동확인" "postgres 외 관리자 권한 역할: ${_adm}- 필요성 확인 (불필요 시 취약)"
@@ -2571,7 +2575,7 @@ kisa_oracle() {
     else _kput "D-21" "양호" "WITH GRANT OPTION 이 ROLE 로만 부여 (사용자 직접 부여 없음)"; fi
 
     # D-22 RESOURCE_LIMIT = TRUE
-    local _rl; _rl=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='resource_limit';" | tr -d ' \n')
+    local _rl; _rl=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='resource_limit';" | tr -d '[:space:]')
     evd_q "D-22" "resource_limit" "${_rl:-조회 불가}"
     case "${_rl^^}" in
     TRUE)  _kput "D-22" "양호" "RESOURCE_LIMIT=TRUE" ;;
@@ -2588,9 +2592,9 @@ kisa_oracle() {
 
     # D-26 감사 기록 (audit_trail 또는 통합 감사 정책 적용)
     local _ua _at _pc=""
-    _ua=$(run_q "SELECT VALUE FROM V\$OPTION WHERE PARAMETER='Unified Auditing';" | tr -d ' \n')
-    _at=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='audit_trail';" | tr -d ' \n')
-    [ "${DB_MAJ:-0}" -ge 12 ] 2>/dev/null && _pc=$(run_q "SELECT COUNT(DISTINCT POLICY_NAME) FROM AUDIT_UNIFIED_ENABLED_POLICIES;" | tr -d ' \n' | grep -E '^[0-9]+$')
+    _ua=$(run_q "SELECT VALUE FROM V\$OPTION WHERE PARAMETER='Unified Auditing';" | tr -d '[:space:]')
+    _at=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='audit_trail';" | tr -d '[:space:]')
+    [ "${DB_MAJ:-0}" -ge 12 ] 2>/dev/null && _pc=$(run_q "SELECT COUNT(DISTINCT POLICY_NAME) FROM AUDIT_UNIFIED_ENABLED_POLICIES;" | tr -d '[:space:]' | grep -E '^[0-9]+$')
     evd_q "D-26" "audit_trail / Unified Auditing / 활성 통합 감사 정책 수" "${_at:-?} / ${_ua:-?} / ${_pc:-해당 없음}"
     local _atx=""; case "$_at" in *ORA-*|*SP2-*) _atx="audit_trail 조회 실패"; _at="" ;; esac   # 조회 실패 문자열은 값이 아님
     [ "${_ua^^}" = "TRUE" ] && _at=""                                  # 순수 통합 감사 모드: audit_trail 은 무시됨 → 통합 감사 정책만 판정
