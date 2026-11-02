@@ -12,4 +12,4 @@ DB 서버에서 실행합니다. 접속 정보는 환경변수로 넘깁니다 (
 DBMS_TYPE=mysql bash ./check_dbms.sh all > ./$(hostname)_mysql.txt
 ```
 
-결과와 증적을 `converter/dbms/output/` 에 넣습니다.
+결과와 증적(`/tmp/<호스트>_<DBMS종류>_dbms_evidence.txt`)을 `converter/dbms/output/` 에 넣습니다. 한 서버에 DBMS 가 여럿이면 종류별로 각각 실행합니다.

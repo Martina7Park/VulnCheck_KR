@@ -420,6 +420,37 @@ def find_evidence_file(result_path):
                 return c
     except Exception:
         pass
+    return _evidence_by_content(result_path)
+
+
+def _evidence_by_content(result_path):
+    """파일명으로 못 찾은 증적을 내용으로 탐색 — 증적 머리말 '대상' 호스트, 항목코드 계열(SRV/U/DBM…),
+    DBMS 종류(결과에 있으면)가 모두 결과와 같은 증적 (예: WEB01_srv.txt ↔ WEB01_server_evidence.txt,
+    WEB01_mysql.txt ↔ 구버전 DBMS 스크립트의 WEB01_dbms_evidence.txt)"""
+    d = os.path.dirname(result_path)
+    try:
+        rtext = read_text(result_path)
+    except Exception:
+        return None
+    host = _parse_header_info(rtext).get("hostname")
+    pfx = {c.split("-")[0] for c in parse_pipe(rtext)}
+    dbms = re.search(r"^#\s*DBMS 종류\s*:\s*(\S+)", "\n".join(rtext.splitlines()[:16]), re.M)
+    if not host or not pfx:
+        return None
+    for f in sorted(os.listdir(d)):
+        if "evidence" not in f.lower() or not f.endswith(".txt"):
+            continue
+        p = os.path.join(d, f)
+        et = read_text(p)
+        eh = "\n".join(et.splitlines()[:6])
+        m = re.search(r"대상:\s*([^/\n]+?)\s*(?:/|$)", eh, re.M)
+        if not m or m.group(1).strip() != host:
+            continue
+        g = re.search(r"DBMS:\s*(\S+)", eh)
+        if dbms and g and g.group(1).lower() != dbms.group(1).lower():
+            continue
+        if pfx & set(re.findall(r"^\[(?:판정\]\s*)?([A-Z]+)-\d+", et, re.M)):
+            return p
     return None
 
 
@@ -4983,6 +5014,10 @@ CAT_LABEL = {
 # ================================================================
 # 헤더 파싱 헬퍼
 # ================================================================
+_DBMS_DISPLAY = {"pgsql": "PostgreSQL", "postgresql": "PostgreSQL", "postgres": "PostgreSQL", "mysql": "MySQL",
+                 "mariadb": "MariaDB", "oracle": "Oracle", "mssql": "MSSQL", "tibero": "Tibero"}
+
+
 def _parse_header_info(text):
     """결과 파일 헤더에서 호스트명, OS, 점검일시 등 추출"""
     info = {"hostname": "", "os": "", "date": "", "standard": ""}
@@ -5012,8 +5047,11 @@ def _parse_header_info(text):
             info["dbms"] = v
         elif "버전" in k and not info.get("version"):
             info["version"] = v
-    if info.get("dbms") and info.get("version"):
-        info["dbms"] = f"{info['dbms']} {info['version']}"
+    if info.get("dbms"):   # 표시용 '제품 버전' (PostgreSQL SELECT version() 전체 문자열 등은 버전 번호만)
+        ver = info.get("version", "")
+        name = "MariaDB" if re.search(r"mariadb", ver, re.I) else _DBMS_DISPLAY.get(info["dbms"].lower(), info["dbms"])
+        num = re.search(r"\d+(?:\.\d+)+", ver)
+        info["dbms"] = f"{name} {num.group(0) if num else ver}".strip()
     if info.get("os_detail"):   # 점검대상 시트 O/S: 배포판 이름·버전 (+커널)
         info["os"] = info["os_detail"] + (f" (커널 {info['kernel']})" if info.get("kernel") else "")
     return info
@@ -5736,7 +5774,7 @@ def _create_target_sheet(wb, hosts_info, all_results):
     ws.row_dimensions[2].height = 22
 
     headers = ["No", "HostName", "O/S", "IP", "용도", "비고"]
-    widths = [6, 20, 25, 18, 18, 18]
+    widths = [6, 20, 40, 18, 18, 18]
     r = 4
     for ci, (hdr, w) in enumerate(zip(headers, widths), 1):
         c = ws.cell(r, ci)
@@ -5781,8 +5819,8 @@ def _create_target_sheet(wb, hosts_info, all_results):
             c.fill = fill
             if ci != 2:
                 c.font = FONT_DATA
-            c.alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[r].height = 20
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=(ci == 3))
+        ws.row_dimensions[r].height = max(20, 13 * _vis_lines(os_info, int(CELL_CPL * 40 / 43.5)) + 6)   # O/S(OS 상세·커널·제품) 줄바꿈
     _apply_border(ws, 5, 4 + len(hosts_info), 1, 6)
     ws.print_area = f"A1:F{4 + max(len(hosts_info), 1)}"
     ws.print_title_rows = "4:4"
@@ -6344,7 +6382,7 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
                            if target_row else os_val)
     ws.cell(6, 9).font = FONT_DATA; ws.cell(6, 9).alignment = ctr
     _apply_border(ws, 6, 6, 1, 12)
-    ws.row_dimensions[6].height = 18
+    ws.row_dimensions[6].height = max(18, 13 * _vis_lines(os_val, int(CELL_CPL * 52 / 43.5)) + 4)   # O/S(I:L 병합) 줄바꿈
 
     # R7: IP / 용도
     ws.merge_cells("A7:B7"); ws.merge_cells("C7:F7")
@@ -7132,7 +7170,7 @@ def _eos_scan_category(category, base_dir):
     res_files = [f for f in files if "evidence" not in f.lower()] if category != "network" else files
     use_evd_only = category != "network" and not res_files
     targets = files if use_evd_only else res_files
-    rows = []
+    rows, keys = [], []
     for f in targets:
         path = os.path.join(d, f)
         text = read_text(path)
@@ -7171,13 +7209,17 @@ def _eos_scan_category(category, base_dir):
         if kern and kern[:1].isdigit() and mod:
             kr, ke, kd = mod.kernel_status(kern, os.environ.get("EOS_OFFLINE") != "1")
             judged.append(("커널(참고)", "linux", kern, "참고", ke, kd + " - 배포판 커널은 배포판 지원 정책을 따르므로 판정에 미반영"))
-        prev = next((x for x in rows if x[0] == host), None)
-        if prev:   # 같은 호스트의 다른 결과 파일(전자금융 + 주요정보 등) → 1대로 병합, 제품 중복 제거
-            seen = {(j[0], j[1], j[2]) for j in prev[3]}
-            prev[3].extend(j for j in judged if (j[0], j[1], j[2]) not in seen)
-            rows[rows.index(prev)] = (host, prev[1] or os_disp, prev[2] or kern, prev[3])
+        key = (host, detect_dbms_vendor(text) if category == "dbms" else None)
+        if key in keys:   # 같은 대상의 다른 결과 파일(전자금융 + 주요정보 등) → 1대로 병합, 제품 중복 제거
+            i = keys.index(key)
+            seen = {(j[0], j[1], j[2]) for j in rows[i][3]}
+            rows[i][3].extend(j for j in judged if (j[0], j[1], j[2]) not in seen)
+            rows[i] = (host, rows[i][1] or os_disp, rows[i][2] or kern, rows[i][3])
             continue
         rows.append((host, os_disp, kern, judged))
+        keys.append(key)
+    multi = {h for h, v in keys if v and sum(1 for k in keys if k[0] == h) > 1}   # 한 서버의 서로 다른 DBMS → 보고서와 같이 'host (DBMS)'
+    rows = [((f"{r[0]} ({k[1]})" if k[0] in multi else r[0]),) + tuple(r[1:]) for r, k in zip(rows, keys)]
     return rows, mod
 
 
@@ -7839,6 +7881,7 @@ def run_convert(mode, category, base_dir, criteria_excel):
     all_results = {}
     evidences   = {}
     hosts_info  = []
+    dbms_split  = set()   # 서로 다른 DBMS 결과가 있는 서버 → 'host (DBMS)' 별도 점검 대상
     for fname in sorted(input_files):
         path  = os.path.join(input_dir, fname)
         pure  = os.path.splitext(fname)[0]
@@ -7948,6 +7991,19 @@ def run_convert(mode, category, base_dir, criteria_excel):
         if not kisa_mode:   # 주요정보는 가이드 항목 변환 후 현황 구성
             res = compose_status(res, evidence, criteria_items, detected_sub)
         _h = hinfo["hostname"]
+        if category == "dbms" and detected_sub:   # 한 서버의 서로 다른 DBMS(MySQL·PostgreSQL 등) → 판정을 섞지 않고 'host (DBMS)' 로 분리
+            _prev = all_results.get(_h, (None, None))[1]
+            if _prev and _prev != detected_sub:
+                _old = f"{_h} ({_prev})"
+                all_results = {(_old if k == _h else k): v for k, v in all_results.items()}
+                evidences = {(_old if k == _h else k): v for k, v in evidences.items()}
+                for _hi in hosts_info:
+                    if _hi.get("hostname") == _h:
+                        _hi["hostname"] = _old
+                dbms_split.add(_h)
+                print(f"[INFO] {fname}: {_h} 에 DBMS 가 여럿({_prev}, {detected_sub}) → DBMS 별 점검 대상으로 분리")
+            if _h in dbms_split:
+                _h = hinfo["hostname"] = f"{_h} ({detected_sub})"
         if _h in all_results:   # 같은 호스트 결과 파일이 여럿(전자금융 + 주요정보 전용 스크립트 등) → 판정·증적 병합, 대상 1대 (파일 순서 무관)
             _old_res, _old_sub = all_results[_h]
             res = {**_old_res, **res}

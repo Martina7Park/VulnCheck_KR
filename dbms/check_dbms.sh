@@ -38,7 +38,9 @@
 #   1) 표준출력 — 파이프 구분자 결과 (파일로 리다이렉트)
 #      형식: DBM-항목코드|결과|근거설명
 #      결과: 양호 / 취약 / 수동확인 / N-A
-#   2) 증적 파일 — /tmp/<호스트명>_dbms_evidence.txt
+#   2) 증적 파일 — /tmp/<호스트명>_<DBMS종류>_dbms_evidence.txt (예: DB01_mysql_dbms_evidence.txt)
+#      DBMS 종류별로 따로 저장 → 한 서버에서 여러 DBMS 를 점검해도 덮어쓰지 않으며,
+#      결과를 <호스트명>_<DBMS종류>.txt 로 저장하면 컨버터가 증적을 자동으로 짝지음
 #      점검 중 실행한 쿼리·명령어·출력·판정 근거가 타임스탬프와 함께 기록됨
 #
 # ================================================================
@@ -139,7 +141,7 @@ case "$(echo "$_KMODE" | tr 'A-Z' 'a-z')" in
 3|all) _KMODE="all" ;;
 *) echo "사용법: $0 [ef|mi|all]  (ef=전자금융, mi=주요정보 2026 상세가이드, all=둘 다)" >&2; exit 1 ;;
 esac
-_RESF="/tmp/${HN}_dbms.txt"
+_RESF="/tmp/${HN}_${DBMS_TYPE}.txt"   # DBMS 종류별 사본 (한 서버 여러 DBMS 점검 시 덮어쓰기 방지)
 if [ -z "$NO_RESULT_COPY" ] && ! [ /dev/fd/1 -ef "$_RESF" ] 2>/dev/null && ( : > "$_RESF" ) 2>/dev/null; then
     exec > >(tee "$_RESF"); _TEEPID=$!
 else
@@ -167,10 +169,10 @@ echo "# ================================================================"
 
 _CP=0; _CF=0; _CM=0; _CN=0
 
-_EVD="/tmp/${HN}_dbms_evidence.txt"
+_EVD="/tmp/${HN}_${DBMS_TYPE}_dbms_evidence.txt"
 # 증적 파일 쓰기 불가(다른 사용자 소유 기존 파일 — /tmp sticky·protected_regular 등) → 대체 경로
 if ! ( : >> "$_EVD" ) 2>/dev/null; then
-    _EVD=$(mktemp "${TMPDIR:-/tmp}/${HN}_dbms_evidence.XXXXXX" 2>/dev/null || echo "./${HN}_dbms_evidence_$$.txt")
+    _EVD=$(mktemp "${TMPDIR:-/tmp}/${HN}_${DBMS_TYPE}_dbms_evidence.XXXXXX" 2>/dev/null || echo "./${HN}_${DBMS_TYPE}_dbms_evidence_$$.txt")
     echo "# [경고] 기본 증적 파일에 쓸 수 없어 대체 경로 사용: $_EVD"
 fi
 echo "# ================================================================" > "$_EVD"
@@ -748,7 +750,9 @@ check_mysql() {
     else
         [ -z "$MYSQL_PASS" ] && [ -t 0 ] && { read -rs -p "MySQL ${MYSQL_USER} 비밀번호: " MYSQL_PASS </dev/tty; echo >&2; }
         _MYSQL_CNF=$(mktemp /tmp/.dbm_check_XXXXXX.cnf 2>/dev/null || echo "/tmp/.dbm_check_$$.cnf")
-        (umask 077; printf '[client]\nuser=%s\n%s\n' "$MYSQL_USER" "${MYSQL_PASS:+password=$MYSQL_PASS}" > "$_MYSQL_CNF")
+        # 옵션 파일에서 '#'·';' 뒤는 주석 → 비밀번호를 큰따옴표로 감싸고 \ 와 " 만 이스케이프
+        _pw_q=$(printf '%s' "$MYSQL_PASS" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        (umask 077; printf '[client]\nuser=%s\n%s\n' "$MYSQL_USER" "${MYSQL_PASS:+password=\"$_pw_q\"}" > "$_MYSQL_CNF")
         chmod 600 "$_MYSQL_CNF" 2>/dev/null
         trap "rm -f '$_MYSQL_CNF'" EXIT
         OPTS="--defaults-extra-file=${_MYSQL_CNF} $_base -N --batch"
