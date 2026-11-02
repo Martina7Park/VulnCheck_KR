@@ -424,6 +424,11 @@ _qo_err() {
 _sel_cols() {   # SQL 의 최상위 SELECT 절(열 목록) 추출 — 0행이어서 열 이름 줄이 없을 때 증적에 열 정의를 남김
     local c
     c=$(printf '%s' "$1" | tr '\n\r' '  ' | awk '{s=$0; u=toupper(s); d=0; for(i=1;i<=length(s);i++){c=substr(s,i,1); if(c=="(")d++; else if(c==")")d--; else if(d==0 && substr(u,i,6)==" FROM ") {print substr(s,1,i-1); exit}}}' | sed 's/^[[:space:]]*[Ss][Ee][Ll][Ee][Cc][Tt][[:space:]]*\(DISTINCT \)\{0,1\}//')
+    if [ -z "$c" ]; then   # SHOW VARIABLES/STATUS 는 SELECT 절이 없음 → 고정 열 이름
+        case "$(printf '%s' "$1" | tr 'a-z' 'A-Z' | tr '\n\r' '  ' | sed 's/^[[:space:]]*//')" in
+        "SHOW VARIABLES"*|"SHOW SESSION STATUS"*|"SHOW GLOBAL STATUS"*|"SHOW STATUS"*) c="Variable_name, Value" ;;
+        esac
+    fi
     [ -n "$c" ] && printf ' - 조회한 열: %s' "$c"
 }
 _qrecord() {   # $1=SQL $2=원본 출력(열 이름 포함) $3=stderr $4=종료코드 $5=선택 여부
@@ -494,6 +499,7 @@ _conn_ok() {
     local i why
     printf '%s' "$1" | grep -q "CONN_OK" && { _DB_CONN=1; return 0; }
     why=$(_qerr_first); [ -z "$why" ] && why="응답 없음/예상 외 출력"
+    _CONN_WHY="$why"   # D-항목(kisa_*)이 _it 로 오류 기록을 지운 뒤에도 사유를 쓰도록 보존
     for i in $_DBM_CODES; do nc "$i" "DB 접속 실패($2): ${why} - 접속 정보(계정/권한/호스트·방화벽·SSL) 확인 후 재점검 (증적의 접속 시도 SQL·오류 원문 참조)"; done
     _hnote "# [경고] $2 접속 실패 - 전 항목 점검불가 처리: ${why}"
     echo "# [경고] $2 접속 실패: ${why}" >&2
@@ -548,7 +554,9 @@ evd_file() {
     fi
 }
 evd_q() {   # 판정에 쓴 값 요약 (실제 SQL·열 이름·결과 행은 run_q 가 이미 'SQL:' 블록으로 기록). $2=설명, $3=값
-    local item="$1" desc="$2" output="$3"
+    local item="$1" desc="$2" output="$3" qe
+    qe=$(_qerr_first)   # 이 항목에서 조회 오류가 있었으면 '없음/0건' 이 실제 결과가 아님을 명시
+    [ -n "$qe" ] && output="[조회 오류 있음 - 아래 값은 실제 0건/없음이 아닐 수 있음] ${qe}"$'\n'"${output}"
     printf '[%s] %s 판정값: %s\n%s\n\n' "$item" "$(date '+%H:%M:%S')" "$desc" "${output:-(없음)}" >> "$_EVD"
 }
 
@@ -1181,6 +1189,7 @@ check_mysql() {
     MYSQL_CMD=$(command -v mysql 2>/dev/null || command -v mariadb 2>/dev/null)
     if [ -z "$MYSQL_CMD" ]; then
         printf '[FALLBACK] %s mysql 클라이언트 미탐지 - MySQL 전 항목 점검불가 처리\n\n' "$(date '+%H:%M:%S')" >> "$_EVD"
+        _CONN_WHY="mysql/mariadb 클라이언트 명령을 찾지 못함 (client 패키지 설치 또는 PATH 확인)"
         for i in 001 003 004 005 006 007 008 009 011 013 016 017 019 020 022 \
                  024 025 026 028 032 033 034; do nc "$i" "mysql/mariadb 클라이언트 명령을 찾지 못해 점검 불가 (client 패키지 설치 또는 PATH 확인)"; done
         na "012" "Oracle 전용 항목"
@@ -1266,6 +1275,10 @@ check_mysql() {
     else _E_HASH="''"; fi
     _E_LOCK="'N'"; echo "$_cols" | grep -qx account_locked && _E_LOCK="IFNULL(account_locked,'N')"
     _MY_COLS_ERR=$(_qerr_first)
+    # 권한 프로브: mysql.user 를 못 읽는 계정은 information_schema(USER_PRIVILEGES·SCHEMATA 등)도 자기에게 보이는 행만 돌려줘
+    #   '0건/없음' 이 실제 0건이 아님 → 해당 항목은 양호/없음 대신 점검불가 (오류 원문은 증적)
+    _MY_LIMITED=""; _lim=$(run_qo "SELECT COUNT(*) FROM mysql.user")
+    if printf '%s\n' "$_lim" | grep -qE '^ERROR'; then _MY_LIMITED=$(printf '%s\n' "$_lim" | sed -n '1p'); fi
 
     # DBM-001: 취약 패스워드 + 인증 플러그인 검증
     # 익명 계정 / 빈 비밀번호 / 자주 쓰는 약한 비밀번호(root·password·mysql·admin·123456·계정명 등, mysql_native_password SHA1 해시 비교 — 해시 값은 출력하지 않음)
@@ -1500,7 +1513,11 @@ check_mysql() {
     _gx=""; [ -n "$_MANAGED" ] && _gx=",'rdsadmin','rdsrepladmin','rds_superuser_role','azure_superuser','azuresu'"
     _grant_users=$(run_q "SELECT CONCAT(GRANTEE,' ',PRIVILEGE_TYPE,' ON *.*') FROM information_schema.USER_PRIVILEGES WHERE IS_GRANTABLE='YES' AND SUBSTRING_INDEX(REPLACE(GRANTEE,CHAR(39),''),'@',1) NOT IN ('root','mariadb.sys'${_gx}) AND REPLACE(GRANTEE,CHAR(39),'') NOT LIKE 'mysql.%' UNION ALL SELECT CONCAT(GRANTEE,' ',PRIVILEGE_TYPE,' ON ',TABLE_SCHEMA,'.*') FROM information_schema.SCHEMA_PRIVILEGES WHERE IS_GRANTABLE='YES' UNION ALL SELECT CONCAT(GRANTEE,' ',PRIVILEGE_TYPE,' ON ',TABLE_SCHEMA,'.',TABLE_NAME) FROM information_schema.TABLE_PRIVILEGES WHERE IS_GRANTABLE='YES'")
     evd_q "DBM-024" "IS_GRANTABLE=YES 권한 (전역·DB·테이블, root·시스템 계정 제외)" "${_grant_users:-해당 없음}"
-    mc "024" "GRANT OPTION 부여 현황 수동 확인 ($(printf '%s\n' "$_grant_users" | grep -c .)건, 증적 참조)${_MYXN}"
+    if [ -n "$_MY_LIMITED" ]; then
+        _qerr_add "$_MY_LIMITED"; nc "024" "접속 계정이 mysql.user 를 조회할 수 없어 다른 계정의 GRANT OPTION 보유 여부를 확인하지 못함 (information_schema 는 본인에게 보이는 권한만 반환하므로 ${_grant_users:+조회된 $(printf '%s\n' "$_grant_users" | grep -c .)건은 일부, }0건이어도 실제 0건 아님) - ${_MY_LIMITED}"
+    else
+        mc "024" "GRANT OPTION 부여 현황 수동 확인 ($(printf '%s\n' "$_grant_users" | grep -c .)건, 증적 참조)${_MYXN}"
+    fi
 
     # DBM-025: EoS
     _it 025
@@ -1520,6 +1537,7 @@ check_mysql() {
     _schemas=$(run_q "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('mysql','information_schema','performance_schema','sys')")
     evd_q "DBM-028" "test DB 존재 여부 / 사용자 스키마 목록" "test=${test_db:-?} / ${_schemas:-없음}"
     if [ "${test_db:-0}" -gt 0 ] 2>/dev/null; then ng "028" "test 데이터베이스 존재 (제거 권고)"
+    elif [ -n "$_MY_LIMITED" ]; then _qerr_add "$_MY_LIMITED"; nc "028" "접속 계정 권한 부족으로 일부 스키마만 보여 test DB 존재 여부를 확인하지 못함 (보이는 스키마: $(_brief "${_schemas:-없음}" 20)) - ${_MY_LIMITED}"
     else mc "028" "test DB 없음 - 인가되지 않은 Object 존재 여부 인터뷰 확인 (스키마: $(_brief "${_schemas:-없음}" 20))"; fi
 
     _it 012; na "012" "Oracle 전용 항목 (Listener Control Utility)"
@@ -1561,6 +1579,8 @@ check_mysql() {
         ng "033" "복제 연결 비밀번호 평문 저장: $(echo "$_repl_info" | _csv)${_mi_file:+ / $_mi_file}"
     elif [ -n "$_repl_info" ]; then
         ok "033" "복제 구성, 비밀번호 미저장(동적 입력): $(echo "$_repl_info" | _csv)"
+    elif [ -n "$(_qerr_first)" ]; then
+        nc "033" "복제 설정(mysql.slave_master_info) 조회 불가로 이중화 구성 여부 확인 못함 - $(_qerr_first) (증적의 SQL·오류 원문 참조)"
     else
         na "033" "이중화(복제) 미구성"
     fi
@@ -1607,6 +1627,7 @@ check_pgsql() {
     PSQL=$(command -v psql 2>/dev/null)
     if [ -z "$PSQL" ]; then
         printf '[FALLBACK] %s psql 미탐지 - PostgreSQL 전 항목 점검불가 처리\n\n' "$(date '+%H:%M:%S')" >> "$_EVD"
+        _CONN_WHY="psql 명령을 찾지 못함 (postgresql-client 설치 또는 PATH 확인)"
         for i in 001 003 004 005 006 007 008 009 011 013 015 016 017 019 020 022 \
                  024 025 026 028 032 033 034; do nc "$i" "psql 명령을 찾지 못해 점검 불가 (postgresql-client 설치 또는 PATH 확인)"; done
         na "012" "Oracle 전용 항목"; na "014" "Oracle 전용 항목"
@@ -1762,8 +1783,12 @@ check_pgsql() {
     _it 011
     _log_col=$(get_conf "logging_collector"); log_conn=$(get_conf "log_connections"); log_disco=$(get_conf "log_disconnections")
     _pga=$(_pg_guc "pgaudit.log")
-    evd_q "DBM-011" "shared_preload_libraries / pgaudit.log / (참고) logging_collector·log_connections·log_disconnections" "${_pg_spl:-없음} / ${_pga:-N/A} / ${_log_col}·${log_conn}·${log_disco}"
-    if echo "$_pg_spl" | grep -qi "pgaudit" && [ -n "$_pga" ] && [ "$(_low "$_pga")" != "none" ]; then
+    _pg_spl=$(run_qo "SHOW shared_preload_libraries"); _spl_err=""   # 일반 계정은 PG15+ 에서 읽기 거부 → 빈 값을 '미로드'로 오판하지 않고 점검불가
+    if printf '%s\n' "$_pg_spl" | grep -qE '^(ERROR|FATAL)'; then _spl_err="$_pg_spl"; _pg_spl=""; fi
+    evd_q "DBM-011" "shared_preload_libraries / pgaudit.log / (참고) logging_collector·log_connections·log_disconnections" "${_pg_spl:-${_spl_err:-없음}} / ${_pga:-N/A} / ${_log_col}·${log_conn}·${log_disco}"
+    if [ -n "$_spl_err" ] && ! { [ -n "$_pga" ] && [ "$(_low "$_pga")" != "none" ]; }; then
+        _qerr_add "$_spl_err"; nc "011" "shared_preload_libraries 를 조회하지 못해 pgaudit 로드 여부 확인 불가 (권한 부족: superuser 또는 pg_read_all_settings 필요) - ${_spl_err}"
+    elif echo "$_pg_spl" | grep -qi "pgaudit" && [ -n "$_pga" ] && [ "$(_low "$_pga")" != "none" ]; then
         mc "011" "pgaudit 감사 로그 수집 중 (pgaudit.log=${_pga})${_MANAGED:+, 관리형: 로그 게시·보관 기간(rds.log_retention_period 등) 콘솔 확인} - 주기적 백업 여부 인터뷰/증적 확인"
     else
         ng "011" "pgaudit 미로드/미설정 - 감사 로그 미수집 (접속 로그 logging_collector=${_log_col})${_MANAGED:+ - 관리형은 파라미터 그룹 shared_preload_libraries 에 pgaudit 추가 후 pgaudit.log 설정} - 써드파티 솔루션 사용 시 수동 확인"
@@ -1807,14 +1832,14 @@ check_pgsql() {
 
     # DBM-015: PUBLIC 불필요 권한
     _it 015
-    _pg_pub_exec=$(run_q "SELECT routine_schema||'.'||routine_name FROM information_schema.role_routine_grants WHERE grantee='PUBLIC' AND routine_schema NOT IN ('pg_catalog','information_schema') ORDER BY 1")
+    _pg_pub_exec=$(run_q "SELECT n.nspname||'.'||p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace CROSS JOIN LATERAL aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a WHERE a.grantee=0 AND a.privilege_type='EXECUTE' AND n.nspname NOT IN ('pg_catalog','information_schema') ORDER BY 1")
     _pg_dbs=$(run_q "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND has_database_privilege(datname,'CONNECT') AND datname NOT IN ('rdsadmin','azure_maintenance','azure_sys') ORDER BY 1")
     evd_q "DBM-015" "점검 대상 DB (접속 가능·템플릿 제외)" "$(echo "$_pg_dbs" | _csv)"
     _pg_pub_create=""; _pg_pub_tbl=""
     for _d in $_pg_dbs; do   # PUBLIC 권한은 DB 별 카탈로그 — 전 DB 순회 (has_schema_privilege 의 PUBLIC 은 소문자 'public')
         _pg_pub_create="${_pg_pub_create}$(OPTS="${OPTS/-d ${PGSQL_DB}/-d $_d}" run_q "SELECT '$_d:'||nspname||' (CREATE)' FROM pg_namespace WHERE nspname='public' AND has_schema_privilege('public',nspname,'CREATE')")
 "
-        _pg_pub_tbl="${_pg_pub_tbl}$(OPTS="${OPTS/-d ${PGSQL_DB}/-d $_d}" run_q "SELECT '$_d:'||table_schema||'.'||table_name||' ('||privilege_type||')' FROM information_schema.role_table_grants WHERE grantee='PUBLIC' AND table_schema NOT IN ('pg_catalog','information_schema') ORDER BY 1")
+        _pg_pub_tbl="${_pg_pub_tbl}$(OPTS="${OPTS/-d ${PGSQL_DB}/-d $_d}" run_q "SELECT '$_d:'||n.nspname||'.'||c.relname||' ('||a.privilege_type||')' FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE a.grantee=0 AND c.relkind IN ('r','v','m','p','f') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg\\_toast%' ORDER BY 1")
 "
     done
     _pg_pub_create=$(echo "$_pg_pub_create" | grep -v "^$"); _pg_pub_tbl=$(echo "$_pg_pub_tbl" | grep -v "^$")
@@ -1875,7 +1900,7 @@ check_pgsql() {
     _it 024
     _pg_grants=""
     for _d in ${_pg_dbs:-$PGSQL_DB}; do
-        _pg_grants="${_pg_grants}$(OPTS="${OPTS/-d ${PGSQL_DB}/-d $_d}" run_q "SELECT '$_d:table:'||grantee||' '||table_schema||'.'||table_name||' '||privilege_type FROM information_schema.role_table_grants WHERE is_grantable='YES' AND grantee<>(SELECT rolname FROM pg_roles WHERE oid=10) AND grantee NOT IN (${_PGX}) UNION ALL SELECT '$_d:routine:'||grantee||' '||routine_schema||'.'||routine_name FROM information_schema.role_routine_grants WHERE is_grantable='YES' AND routine_schema NOT IN ('pg_catalog','information_schema') AND grantee<>(SELECT rolname FROM pg_roles WHERE oid=10) AND grantee NOT IN (${_PGX}) UNION ALL SELECT '$_d:schema:'||pg_get_userbyid(a.grantee)||' '||n.nspname||' '||a.privilege_type FROM pg_namespace n CROSS JOIN LATERAL aclexplode(n.nspacl) a WHERE a.is_grantable AND a.grantee<>n.nspowner AND pg_get_userbyid(a.grantee) NOT IN (${_PGX})")
+        _pg_grants="${_pg_grants}$(OPTS="${OPTS/-d ${PGSQL_DB}/-d $_d}" run_q "SELECT '$_d:table:'||pg_get_userbyid(a.grantee)||' '||n.nspname||'.'||c.relname||' '||a.privilege_type FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) a WHERE a.is_grantable AND a.grantee NOT IN (0,10,c.relowner) AND c.relkind IN ('r','v','m','p','f') AND n.nspname NOT IN ('pg_catalog','information_schema') AND pg_get_userbyid(a.grantee) NOT IN (${_PGX}) UNION ALL SELECT '$_d:routine:'||pg_get_userbyid(a.grantee)||' '||n.nspname||'.'||p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace CROSS JOIN LATERAL aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a WHERE a.is_grantable AND a.grantee NOT IN (0,10,p.proowner) AND n.nspname NOT IN ('pg_catalog','information_schema') AND pg_get_userbyid(a.grantee) NOT IN (${_PGX}) UNION ALL SELECT '$_d:schema:'||pg_get_userbyid(a.grantee)||' '||n.nspname||' '||a.privilege_type FROM pg_namespace n CROSS JOIN LATERAL aclexplode(n.nspacl) a WHERE a.is_grantable AND a.grantee<>n.nspowner AND pg_get_userbyid(a.grantee) NOT IN (${_PGX})")
 "
     done
     _pg_rolegrants=$(run_q "SELECT 'role:'||pg_get_userbyid(m.member)||' ADMIN '||pg_get_userbyid(m.roleid) FROM pg_auth_members m WHERE m.admin_option AND pg_get_userbyid(m.roleid) NOT LIKE 'pg\\_%' AND pg_get_userbyid(m.member) NOT IN (${_PGX})")
@@ -1897,7 +1922,7 @@ check_pgsql() {
 
     # DBM-028: 불필요 Object
     _it 028
-    _pg_schemas=$(run_q "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog','information_schema','pg_toast','public') ORDER BY 1")
+    _pg_schemas=$(run_q "SELECT nspname FROM pg_namespace WHERE nspname NOT IN ('pg_catalog','information_schema','pg_toast','public') AND nspname NOT LIKE 'pg\\_toast%' AND nspname NOT LIKE 'pg\\_temp%' ORDER BY 1")
     evd_q "DBM-028" "사용자 정의 스키마 목록" "${_pg_schemas:-기본 스키마만 존재}"
     mc "028" "불필요 스키마/테이블 수동 확인 (사용자 스키마 $(printf '%s\n' "$_pg_schemas" | grep -c .)개, 증적 참조)"
 
@@ -1952,6 +1977,8 @@ check_pgsql() {
         fi
     elif [ -n "$_pg_stdby" ] || [ -n "$_pg_repl_slots" ]; then
         mc "033" "주(Primary) 서버 - 복제 구성됨(${_pg_stdby:-슬롯 $(echo "$_pg_repl_slots" | _csv)}) - 대기 서버의 primary_conninfo 에 비밀번호 평문 저장 여부를 대기 서버에서 확인"
+    elif [ -n "$(_qerr_first)" ]; then
+        nc "033" "복제 구성 여부를 조회하지 못함(권한 부족) - $(_qerr_first) (증적의 SQL·오류 원문 참조)"
     else
         na "033" "복제 미구성"
     fi
@@ -2694,7 +2721,7 @@ kisa_mysql() {
     _KDB="$([ "${IS_MARIADB:-0}" = 1 ] && echo MariaDB || echo MySQL)"
     if [ "${_DB_CONN:-0}" != 1 ]; then
         _KNA D-05 D-09 D-12 D-13 D-15 D-16 D-17 D-18 D-19 D-20 D-22 D-23 D-24 D-26
-        _kisa_fail "DB 접속 실패/클라이언트 미탐지로 점검 불가: $(_qerr_first) - 접속 정보 확인 후 재점검 (오류 원문은 증적)" "D-01 D-02 D-03 D-04 D-06 D-07 D-08 D-10 D-11 D-14 D-21 D-25"
+        _kisa_fail "DB 접속 실패/클라이언트 미탐지로 점검 불가: ${_CONN_WHY:-$(_qerr_first)} - 접속 정보 확인 후 재점검 (오류 원문은 증적)" "D-01 D-02 D-03 D-04 D-06 D-07 D-08 D-10 D-11 D-14 D-21 D-25"
         return
     fi
     local _sys="${_MYX}"
@@ -2712,7 +2739,7 @@ kisa_mysql() {
     if [ -z "$_u" ]; then _kput "D-01" "점검불가" "mysql.user 조회 결과 없음 - root 비밀번호 변경 여부 확인"
     elif [ -n "$_r" ]; then _kput "D-01" "취약" "기본 계정 비밀번호 미설정(초기값): ${_r% }"
     elif [ -n "$_rootweak" ]; then _kput "D-01" "취약" "기본 계정 root 비밀번호가 흔한 약한 값(root/password/mysql/admin/123456 등)과 일치: ${_rootweak% }"
-    else _kput "D-01" "양호" "기본 계정(root) 비밀번호 설정 또는 OS 인증(socket)·잠금: $(echo "$_u" | awk -F'|' '$1~/^root@/{print $1"("($3=="SET"?"비밀번호":"")($2~/socket/?" socket":"")($4=="Y"?" 잠금":"")")"}' | tr '\n' ' ')"; fi
+    else _kput "D-01" "양호" "기본 계정(root) 비밀번호 설정 또는 OS 인증(socket)·잠금: $(echo "$_u" | awk -F'|' '$1~/^root@/{t=""; if($3=="SET")t="비밀번호"; if($2~/socket/)t=t (t==""?"":" ") "socket"; if($4=="Y")t=t (t==""?"":" ") "잠금"; print $1"("t")"}' | tr '\n' ' ')"; fi
 
     # D-02 불필요 계정 (익명·테스트 계정 = 취약, 그 외 인가 여부 확인)
     _it D-02; _qerr_carry "$_u_err"
@@ -2827,7 +2854,7 @@ kisa_pgsql() {
     _KDB="PostgreSQL"
     if [ "${_DB_CONN:-0}" != 1 ]; then
         _KNA D-05 D-07 D-09 D-12 D-13 D-15 D-16 D-17 D-18 D-19 D-21 D-22 D-23 D-24
-        _kisa_fail "DB 접속 실패/psql 미탐지로 점검 불가: $(_qerr_first) - 접속 정보 확인 후 재점검 (오류 원문은 증적)" "D-01 D-02 D-03 D-04 D-06 D-08 D-10 D-11 D-14 D-20 D-25 D-26"
+        _kisa_fail "DB 접속 실패/psql 미탐지로 점검 불가: ${_CONN_WHY:-$(_qerr_first)} - 접속 정보 확인 후 재점검 (오류 원문은 증적)" "D-01 D-02 D-03 D-04 D-06 D-08 D-10 D-11 D-14 D-20 D-25 D-26"
         return
     fi
     local _hba _roles _hba_o _hba_err="" _roles_err
@@ -2904,7 +2931,7 @@ kisa_pgsql() {
 
     # D-11 시스템 테이블 접근 (pg_catalog·information_schema 테이블에 개별 역할 권한 부여)
     _it D-11
-    local _st; _st=$(run_q "SELECT DISTINCT grantee||'('||table_schema||'.'||table_name||':'||privilege_type||')' FROM information_schema.role_table_grants WHERE table_schema IN ('pg_catalog','information_schema') AND grantee NOT IN ('PUBLIC','postgres') AND grantee NOT LIKE 'pg\\_%' AND grantee NOT IN (${_PGX}) AND grantee NOT IN (SELECT rolname FROM pg_roles WHERE rolsuper) ORDER BY 1" | tr '\n' ' ')
+    local _st; _st=$(run_q "SELECT DISTINCT pg_get_userbyid(a.grantee)||'('||n.nspname||'.'||c.relname||':'||a.privilege_type||')' FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE n.nspname IN ('pg_catalog','information_schema') AND a.grantee<>0 AND c.relkind IN ('r','v','m','p','f') AND pg_get_userbyid(a.grantee) NOT IN ('postgres') AND pg_get_userbyid(a.grantee) NOT LIKE 'pg\\_%' AND pg_get_userbyid(a.grantee) NOT IN (${_PGX}) AND a.grantee<>c.relowner AND a.grantee NOT IN (SELECT oid FROM pg_roles WHERE rolsuper) ORDER BY 1" | tr '\n' ' ')
     evd_q "D-11" "시스템 스키마 테이블 권한 (PUBLIC·슈퍼유저 제외)" "${_st:-없음}"
     if [ -n "$_st" ]; then _kput "D-11" "취약" "DBA 외 역할에 시스템 테이블 권한 부여: ${_st% }"; else _kput "D-11" "양호" "시스템 테이블 권한이 DBA 에만 부여 (PUBLIC 기본 카탈로그 조회 권한 제외)"; fi
 
@@ -2948,10 +2975,13 @@ kisa_pgsql() {
     _kisa_d25 pgsql "$DB_VER"
     # D-26 감사 기록 (logging_collector / pgaudit)
     _it D-26
-    local _lc _ls _pga26; _lc=$(get_conf "logging_collector"); _ls=$(get_conf "log_statement"); _pga26=$(_pg_guc "pgaudit.log")
+    local _lc _ls _pga26 _spl26e=""; _lc=$(get_conf "logging_collector"); _ls=$(get_conf "log_statement"); _pga26=$(_pg_guc "pgaudit.log")
+    _spl=$(run_qo "SHOW shared_preload_libraries")
+    if printf '%s\n' "$_spl" | grep -qE '^(ERROR|FATAL)'; then _spl26e="$_spl"; _spl=""; fi
     evd_q "D-26" "logging_collector / log_statement / shared_preload_libraries / pgaudit.log" "${_lc} / ${_ls} / ${_spl} / ${_pga26:-N/A}"
     if [ "$_lc" = "on" ] || { echo "$_spl" | grep -qi pgaudit && [ -n "$_pga26" ] && [ "$(_low "$_pga26")" != "none" ]; }; then
         _kput "D-26" "양호" "logging_collector=${_lc} (log_statement=${_ls}$(echo "$_spl" | grep -qi pgaudit && echo ", pgaudit.log=${_pga26}")) - 기관 감사 기록 정책 수립 여부는 인터뷰 확인"
+    elif [ -n "$_spl26e" ] && [ -z "$_pga26" ]; then _qerr_add "$_spl26e"; _kput "D-26" "점검불가" "logging_collector=${_lc:-확인 불가} 이고 shared_preload_libraries 를 조회하지 못해 pgaudit 로드 여부 확인 불가 (권한 부족) - ${_spl26e}"
     else _kput "D-26" "취약" "logging_collector=${_lc:-확인 불가}, pgaudit 미설정 - 감사 로그 저장 미설정${_MANAGED:+ (관리형은 파라미터 그룹에서 pgaudit/로그 설정)}"; fi
 }
 
@@ -2959,7 +2989,7 @@ kisa_mssql() {
     _KDB="MSSQL"
     if [ "${_DB_CONN:-0}" != 1 ]; then
         _KNA D-05 D-07 D-09 D-12 D-14 D-15 D-17 D-18 D-19 D-20 D-21 D-22
-        _kisa_fail "DB 접속 실패/sqlcmd 미탐지로 점검 불가: $(_qerr_first) - 접속 정보 확인 후 재점검 (오류 원문은 증적)" "D-01 D-02 D-03 D-04 D-06 D-08 D-10 D-11 D-13 D-16 D-23 D-24 D-25 D-26"
+        _kisa_fail "DB 접속 실패/sqlcmd 미탐지로 점검 불가: ${_CONN_WHY:-$(_qerr_first)} - 접속 정보 확인 후 재점검 (오류 원문은 증적)" "D-01 D-02 D-03 D-04 D-06 D-08 D-10 D-11 D-13 D-16 D-23 D-24 D-25 D-26"
         return
     fi
     _KNA D-05 D-07 D-09 D-12 D-14 D-15 D-17 D-18 D-19 D-20 D-21 D-22

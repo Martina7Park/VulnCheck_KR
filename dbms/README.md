@@ -57,6 +57,7 @@ run_dbms_mssql.bat
 ## 판정값 · 증적
 
 판정은 `양호` / `취약` / `수동확인` / `점검불가` / `N-A` 입니다. 쿼리 오류(ORA-/ERROR/TBR-/권한 부족/접속 끊김)는 값으로 쓰지 않고 해당 항목을 `점검불가` 로 내며, 오류 원문은 증적에 남습니다 ("0건" 과 "조회 실패" 를 구분).
+권한이 부족한 계정(예: MySQL USAGE 만, PostgreSQL 일반 롤)으로 접속하면 `mysql.user`·`pg_authid`·`pg_hba_file_rules`·`shared_preload_libraries` 등을 읽지 못하는 항목은 `양호`/`없음` 이 아니라 `점검불가` 로 나옵니다. `information_schema` 처럼 "본인에게 보이는 행만" 반환하는 조회가 0건이어도 실제 0건으로 판단하지 않고(MySQL DBM-024·028), PostgreSQL 은 `pg_catalog` ACL 로 전체를 조회합니다.
 증적에는 실행한 SQL 전문, 열 이름, 결과 행 전체(잘림 없음), 오류 원문이 기록됩니다.
 
 비밀번호는 명령 인자로 넘기지 않습니다 (sqlplus·tbsql 은 표준입력, mysql 은 600 임시 옵션 파일, psql 은 `PGPASSWORD`, sqlcmd 는 `SQLCMDPASSWORD`).
