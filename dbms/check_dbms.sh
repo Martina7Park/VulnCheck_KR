@@ -1627,7 +1627,7 @@ check_tibero() {
     else mc "011" "AUDIT_TRAIL=${_tb_audit} 수집 중 - 주기적 백업 여부 인터뷰/증적 확인"; fi
 
     # DBM-012: Tibero 리스너 보안 (tbnetmgr 기반)
-    evd "DBM-012" "cat ${TB_HOME}/config/tbdsn.tbr 2>/dev/null | head -20 || echo '(tbdsn.tbr 미존재)'"
+    { printf '[DBM-012] %s $ head -20 %s\n' "$(date '+%H:%M:%S')" "${TB_HOME}/config/tbdsn.tbr"; head -20 "${TB_HOME}/config/tbdsn.tbr" 2>/dev/null || echo '(tbdsn.tbr 미존재)'; printf '\n'; } >> "$_EVD"   # TB_HOME 은 tbsvr 환경에서 온 값 → eval 하지 않음
     if [ -f "${TB_HOME}/config/tbdsn.tbr" ]; then
         mc "012" "Tibero 리스너 설정 수동 확인 (${TB_HOME}/config/tbdsn.tbr)"
     else
@@ -1636,7 +1636,7 @@ check_tibero() {
 
     # DBM-013: 원격 접속 제어
     # 평가기준: $TB_SID.tip 의 LSNR_INVITED_IP / LSNR_DENIED_IP (_FILE 포함) 설정 여부
-    evd "DBM-013" "grep -hiE '^[[:space:]]*LSNR_(INVITED|DENIED)_IP' ${TB_HOME}/config/*.tip 2>/dev/null"
+    evd_grep "DBM-013" '^[[:space:]]*LSNR_(INVITED|DENIED)_IP' "${TB_HOME}"/config/*.tip
     _tb_acl=$(grep -hiE '^[[:space:]]*LSNR_(INVITED|DENIED)_IP(_FILE)?[[:space:]]*=' "$TB_HOME"/config/*.tip 2>/dev/null | head -3 | tr '\n' ' ')
     if [ -n "$_tb_acl" ]; then ok "013" "리스너 IP 접근제어 설정: ${_tb_acl}"
     elif ls "$TB_HOME"/config/*.tip >/dev/null 2>&1; then ng "013" "LSNR_INVITED_IP/LSNR_DENIED_IP 미설정 - 네트워크 장비·솔루션 접근제어 적용 시 수동 확인"
@@ -1691,7 +1691,7 @@ check_tibero() {
     na "021" "Windows MSSQL 전용 항목 (Tibero 해당 없음)"
 
     # DBM-022: 설정 파일 접근 권한
-    evd "DBM-022" "ls -la ${TB_HOME}/config/*.tip ${TB_HOME}/config/tbdsn.tbr ${TB_HOME}/bin/tbsql ${TB_HOME}/bin/tbsvr 2>/dev/null"
+    evd_ls "DBM-022" "${TB_HOME}"/config/*.tip "${TB_HOME}/config/tbdsn.tbr" "${TB_HOME}/bin/tbsql" "${TB_HOME}/bin/tbsvr"
     # 평가기준 700: /bin/tbboot·tbsvr·tblistener·tbctl·tbdown 의 group·others 권한 금지
     _perm_check 077 "$TB_HOME"/bin/tbboot "$TB_HOME"/bin/tbsvr "$TB_HOME"/bin/tblistener "$TB_HOME"/bin/tbctl "$TB_HOME"/bin/tbdown; _b22=$_PC_BAD
     if [ "$_PC_FOUND" -eq 0 ]; then
@@ -2240,7 +2240,7 @@ kisa_mysql() {
     _KNA D-12 D-13
     # D-14 주요 설정 파일 권한 (가이드 MySQL 절차: my.cnf 600/640, 판단: 일반 사용자 수정 권한 제거)
     local _cf; _cf=$(ls /etc/my.cnf /etc/mysql/my.cnf /etc/mysql/debian.cnf /etc/my.cnf.d/*.cnf /etc/mysql/conf.d/*.cnf /etc/mysql/mysql.conf.d/*.cnf /etc/mysql/mariadb.conf.d/*.cnf /root/.my.cnf 2>/dev/null | tr '\n' ' ')
-    evd "D-14" "ls -lL $_cf 2>/dev/null"
+    evd_ls "D-14" $_cf   # 경로는 DB 설정값 → eval 하지 않음
     local _w; _w=$(_kisa_perm_w $_cf)
     if [ -z "$_cf" ]; then _kput "D-14" "수동확인" "설정 파일(my.cnf) 미발견"
     elif [ -n "$_w" ]; then _kput "D-14" "취약" "설정 파일에 그룹·일반 사용자 수정 권한: ${_w}"
@@ -2351,7 +2351,7 @@ kisa_pgsql() {
     # D-14 주요 설정 파일 권한 (postgresql.conf·pg_hba.conf·pg_ident.conf·.psql_history: 일반 사용자 수정 권한 제거)
     local _cf _w _hf; _cf=$(run_q "SELECT setting FROM pg_settings WHERE name IN ('config_file','hba_file','ident_file');" | tr '\n' ' ')
     for _hf in /root/.psql_history /var/lib/pgsql/.psql_history /var/lib/postgresql/.psql_history; do [ -f "$_hf" ] && _cf="${_cf} ${_hf}"; done
-    evd "D-14" "ls -lL $_cf 2>/dev/null"
+    evd_ls "D-14" $_cf   # 경로는 DB 설정값 → eval 하지 않음
     _w=$(_kisa_perm_w $_cf)
     if [ -n "$_w" ]; then _kput "D-14" "취약" "설정 파일에 그룹·일반 사용자 수정 권한: ${_w}"
     elif ! echo "$_cf" | grep -q 'postgresql\.conf\|\.conf'; then _kput "D-14" "수동확인" "설정 파일 경로 조회 불가(슈퍼유저·pg_read_all_settings 필요) - postgresql.conf·pg_hba.conf·pg_ident.conf 권한 수동 확인"
