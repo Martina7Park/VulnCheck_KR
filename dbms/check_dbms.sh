@@ -45,6 +45,8 @@
 
 # ── DBMS 자동 탐지 ──────────────────────────────────────────────
 _proc_has() { { ps -e -o comm= 2>/dev/null || cat /proc/[0-9]*/comm 2>/dev/null; } | sed 's#.*/##' | grep -qE "^($1)\$"; }
+# 프로세스 이름(경로 제외)이 정확히 일치하는 첫 프로세스의 소유 계정 — 래퍼(mysqld_safe·mariadbd-safe)·'logger -t mysqld'·sudo/su 부모(root) 오인 방지
+_proc_user() { UNIX95=1 ps -e -o user= -o comm= 2>/dev/null | awk -v P="^($1)\$" '{n=$2; sub(/.*\//,"",n)} n ~ P {print $1; exit}'; }
 detect_dbms() {
     [ -n "$DBMS_TYPE" ] && return
     # 실행 중인 DB 프로세스 우선 (클라이언트만 설치된 서버·환경변수 없는 root/sudo 실행 대응)
@@ -755,10 +757,17 @@ check_mysql() {
         OPTS="$_base -N --batch"
     else
         [ -z "$MYSQL_PASS" ] && [ -t 0 ] && { read -rs -p "MySQL ${MYSQL_USER} 비밀번호: " MYSQL_PASS </dev/tty; echo >&2; }
-        _MYSQL_CNF=$(mktemp /tmp/.dbm_check_XXXXXX.cnf 2>/dev/null || echo "/tmp/.dbm_check_$$.cnf")
-        (umask 077; printf '[client]\nuser=%s\n%s\n' "$MYSQL_USER" "${MYSQL_PASS:+password=$MYSQL_PASS}" > "$_MYSQL_CNF")
+        _MYSQL_CNF=$(mktemp /tmp/.dbm_check_XXXXXX.cnf 2>/dev/null); _MYSQL_TD=""
+        if [ -z "$_MYSQL_CNF" ]; then   # mktemp 없는 AIX·HP-UX: 고정 경로는 일반 사용자가 미리 만들어 비밀번호를 가로챌 수 있음 → 새 700 디렉터리 안에 생성
+            _MYSQL_TD="/tmp/.dbm_check_$$_${RANDOM}${RANDOM}"
+            if mkdir -m 700 "$_MYSQL_TD" 2>/dev/null; then _MYSQL_CNF="$_MYSQL_TD/client.cnf"
+            else _conn_ok "" "MySQL/MariaDB (임시 인증 파일 디렉터리 생성 실패)"; return; fi
+        fi
+        # 옵션 파일 값은 큰따옴표로 감싸고 \ " 이스케이프 — 그대로 쓰면 '#' 이후가 주석, '\n' 등이 해석되어 접속 실패
+        local _mp; _mp=$(printf '%s' "$MYSQL_PASS" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        (umask 077; printf '[client]\nuser=%s\n%s\n' "$MYSQL_USER" "${MYSQL_PASS:+password=\"$_mp\"}" > "$_MYSQL_CNF")
         chmod 600 "$_MYSQL_CNF" 2>/dev/null
-        trap "rm -f '$_MYSQL_CNF'" EXIT
+        trap "rm -f '$_MYSQL_CNF'; ${_MYSQL_TD:+rmdir '$_MYSQL_TD';} :" EXIT
         OPTS="--defaults-extra-file=${_MYSQL_CNF} $_base -N --batch"
     fi
 
@@ -770,6 +779,9 @@ check_mysql() {
     IS_MARIADB=0; echo "$DB_VER" | grep -qi "mariadb" && IS_MARIADB=1
     [ $IS_MARIADB -eq 1 ] && echo "# DBMS 종류(판별): mariadb"
     echo "# MySQL/MariaDB 버전: ${DB_VER}"
+    # 점검 계정이 mysql.* 를 읽지 못하면(권한 부족·MariaDB mariadb.sys 정의자 삭제 등) 계정·권한 조회가 빈 값 → 양호로 오판되므로 표시
+    _MY_NOACL=""; _myu=$($MYSQL_CMD $OPTS -e "SELECT COUNT(*) FROM mysql.user;" 2>&1 | tail -1)
+    case "$_myu" in ''|*[!0-9]*) _MY_NOACL=1; echo "# [경고] mysql.user 조회 불가(${_myu}) - 계정·권한 항목은 수동확인 처리"; evd_q "DBM-001" "mysql.user 조회 권한" "조회 불가: ${_myu}" ;; esac
 
     # DBM-001: 취약 패스워드 + 인증 플러그인 검증
     anon=$(run_q "SELECT COUNT(*) FROM mysql.user WHERE User='';" | tail -1)
@@ -838,7 +850,7 @@ check_mysql() {
         sp_l=$(get_var "simple_password_check_letters_same_case"); sp_o=$(get_var "simple_password_check_other_characters")
         evd_q "DBM-007" "simple_password_check minimal_length/digits/letters_same_case/other_characters" "${sp_len:-미로드}/${sp_d}/${sp_l}/${sp_o}"
         # 요구 종류: 영문(대소문자 각 N 이상=letters_same_case) / 숫자 / 특수문자
-        _cls=0; [ "${sp_d:-0}" -ge 1 ] 2>/dev/null && _cls=$((_cls+1)); [ "${sp_l:-0}" -ge 1 ] 2>/dev/null && _cls=$((_cls+1)); [ "${sp_o:-0}" -ge 1 ] 2>/dev/null && _cls=$((_cls+1))
+        _cls=0; [ "${sp_d:-0}" -ge 1 ] 2>/dev/null && _cls=$((_cls+1)); [ "${sp_l:-0}" -ge 1 ] 2>/dev/null && _cls=$((_cls+2)); [ "${sp_o:-0}" -ge 1 ] 2>/dev/null && _cls=$((_cls+1))   # letters_same_case = 대·소문자 각각 → 2종
         if [ -z "$sp_len" ]; then ng "007" "MariaDB simple_password_check 플러그인 미로드 - cracklib·솔루션 사용 시 수동 확인"
         elif { [ "$_cls" -ge 3 ] && [ "$sp_len" -ge 8 ]; } || { [ "$_cls" -ge 2 ] && [ "$sp_len" -ge 10 ]; }; then ok "007" "simple_password_check 최소 ${sp_len}자, 숫자 ${sp_d}·대소문자 ${sp_l}·특수 ${sp_o}"
         else ng "007" "simple_password_check 기준 미달 (최소 ${sp_len}자, 숫자 ${sp_d}·대소문자 ${sp_l}·특수 ${sp_o})"; fi
@@ -852,8 +864,8 @@ check_mysql() {
             case "${policy^^}" in
             STRONG|2|MEDIUM|1)   # MEDIUM 이상: mixed_case/number/special_char_count 로 요구 문자 종류 산정 → 3종 8자 / 2종 10자
                 local _mc _nc _sc _k=0
-                _mc=$(get_var "validate_password.mixed_case_count"); _nc=$(get_var "validate_password.number_count"); _sc=$(get_var "validate_password.special_char_count")
-                [ "${_mc:-1}" -ge 1 ] 2>/dev/null && _k=$((_k+1)); [ "${_nc:-1}" -ge 1 ] 2>/dev/null && _k=$((_k+1)); [ "${_sc:-1}" -ge 1 ] 2>/dev/null && _k=$((_k+1))
+                _mc=$(get_var "validate_password_mixed_case_count"); _nc=$(get_var "validate_password_number_count"); _sc=$(get_var "validate_password_special_char_count")   # '_' 패턴이 validate_password.* 컴포넌트 이름과도 일치
+                [ "${_mc:-0}" -ge 1 ] 2>/dev/null && _k=$((_k+2)); [ "${_nc:-0}" -ge 1 ] 2>/dev/null && _k=$((_k+1)); [ "${_sc:-0}" -ge 1 ] 2>/dev/null && _k=$((_k+1))   # 대소문자 혼합 = 영대문자·영소문자 2종
                 if { [ "$_k" -ge 3 ] && [ "${vlen:-0}" -ge 8 ]; } || { [ "$_k" -ge 2 ] && [ "${vlen:-0}" -ge 10 ]; } 2>/dev/null; then
                     ok "007" "validate_password.policy=${policy}, length=${vlen}, 대소문자·숫자·특수 ${_mc}/${_nc}/${_sc}"
                 else ng "007" "validate_password 기준 미달 (length=${vlen}, 대소문자·숫자·특수 ${_mc}/${_nc}/${_sc} - 3종 8자/2종 10자)"; fi ;;
@@ -868,7 +880,7 @@ check_mysql() {
     expire=$(get_var "default_password_lifetime")
     _plc=""; _plc_err=""
     if [ $IS_MARIADB -eq 0 ]; then   # password_last_changed 는 5.7.4+ — 조회 오류는 '변경일 미제공'(가이드: 만료 정책 → 인터뷰)
-        _plc=$($MYSQL_CMD $OPTS -e "SELECT CONCAT(User,'@',Host,'=',DATE(password_last_changed)) FROM mysql.user WHERE account_locked='N' AND User NOT IN ('mysql.session','mysql.sys','mysql.infoschema','') AND password_last_changed < NOW()-INTERVAL 90 DAY;" 2>&1 | grep -v "^$" | head -10)
+        _plc=$($MYSQL_CMD $OPTS -e "SELECT CONCAT(User,'@',Host,'=',DATE(password_last_changed)) FROM mysql.user WHERE account_locked='N' AND User NOT IN ('mysql.session','mysql.sys','mysql.infoschema','') AND plugin NOT IN ('auth_socket','unix_socket','mysql_no_login') AND password_last_changed < NOW()-INTERVAL 90 DAY;" 2>&1 | grep -v "^$" | head -10)
         echo "$_plc" | grep -q '^ERROR' && { _plc_err="$_plc"; _plc=""; }
     fi
     evd_q "DBM-008" "default_password_lifetime / password_last_changed 90일 경과 계정" "${expire:-미지원} / ${_plc:-없음}${_plc_err:+ ($_plc_err)}"
@@ -904,8 +916,15 @@ check_mysql() {
     _apl=$(run_q "SELECT PLUGIN_NAME,PLUGIN_STATUS FROM information_schema.PLUGINS WHERE PLUGIN_NAME IN ('audit_log','SERVER_AUDIT') OR PLUGIN_NAME LIKE '%audit%';" 2>/dev/null | grep -v "^$")
     evd_q "DBM-011" "audit 플러그인 / audit_log_policy / server_audit_logging / general_log(참고)" "plugin: ${_apl:-미로드} / policy=${alog:-N/A} / server_audit=${_sa_log:-OFF} / general_log=${glog}"
     # 평가기준: 감사 로그(audit_log 플러그인 등) 수집 + 주기적 백업(인터뷰). general_log 는 감사 로그가 아님
-    if echo "$_apl" | grep -qi "ACTIVE" || echo "${alog^^}" | grep -qE "ALL|LOGINS|QUERIES" || [ "${_sa_log^^}" = "ON" ]; then
-        mc "011" "감사 로그 수집 중 (plugin=$(echo "$_apl" | head -1 | _csv), server_audit=${_sa_log:-N/A}) - 주기적 백업 여부 인터뷰/증적 확인"
+    local _aact; _aact=$(echo "$_apl" | awk 'toupper($2)=="ACTIVE"{print toupper($1)}')   # 'INACTIVE'·'DISABLED' 제외
+    if [ "${_sa_log^^}" = "ON" ] || { echo "$_aact" | grep -qx 'AUDIT_LOG' && [ "${alog^^}" != "NONE" ]; }; then
+        mc "011" "감사 로그 수집 중 (plugin=$(echo "$_aact" | _csv), audit_log_policy=${alog:-N/A}, server_audit_logging=${_sa_log:-N/A}) - 주기적 백업 여부 인터뷰/증적 확인"
+    elif echo "$_aact" | grep -qx 'SERVER_AUDIT'; then
+        ng "011" "server_audit 플러그인 로드되었으나 기록 비활성 (server_audit_logging=${_sa_log:-OFF})"
+    elif echo "$_aact" | grep -qx 'AUDIT_LOG'; then
+        ng "011" "audit_log 플러그인 로드되었으나 audit_log_policy=NONE (기록 안 함)"
+    elif [ -n "$_aact" ]; then
+        mc "011" "감사 관련 플러그인 활성: $(echo "$_aact" | _csv) - 기록 설정·주기적 백업 여부 확인"
     else
         ng "011" "감사 로그 플러그인 미로드 (general_log=${glog:-OFF}는 감사 로그 아님) - 써드파티 솔루션 사용 시 수동 확인"
     fi
@@ -915,11 +934,10 @@ check_mysql() {
     bind=$(get_var "bind_address")
     _wild_host=$(run_q "SELECT CONCAT(User,'@',Host) FROM mysql.user WHERE Host='%' AND User NOT IN ('');" 2>/dev/null | head -5)
     evd_q "DBM-013" "host='%' 계정 / bind_address(참고)" "${_wild_host:-없음} / bind_address=${bind:-미설정}"
-    case "$bind" in
-    "127.0.0.1"|"localhost"|"::1") ok "013" "bind_address=${bind} (로컬 접속만 허용)" ;;
-    *) if [ -n "$_wild_host" ]; then ng "013" "Host='%' 원격 접속 허용 계정: $(echo "$_wild_host" | _csv)"
-       else ok "013" "Host='%' 계정 없음 (계정별 접속 호스트 제한, bind_address=${bind:-기본})"; fi ;;
-    esac
+    if [ -n "$_MY_NOACL" ]; then mc "013" "mysql.user 조회 불가 - Host='%' 계정 수동 확인 (bind_address=${bind:-기본})"
+    elif [ -n "$_wild_host" ]; then
+        ng "013" "Host='%' 원격 접속 허용 계정: $(echo "$_wild_host" | _csv)$(case "$bind" in 127.0.0.1|localhost|::1) echo " (현재 bind_address=${bind} 로컬 수신 - 설정 변경 시 즉시 원격 노출)";; esac)"
+    else ok "013" "Host='%' 계정 없음 (계정별 접속 호스트 제한, bind_address=${bind:-기본})"; fi
 
     # DBM-016: 보안패치
     evd_q "DBM-016" "MySQL/MariaDB 버전 (패치 판단용)" "${DB_VER}"
@@ -982,8 +1000,8 @@ check_mysql() {
     mc "025" "MySQL/MariaDB ${DB_VER} EoS 여부 수동 확인"
 
     # DBM-026: 구동 계정 umask
-    evd "DBM-026" "ps -ef 2>/dev/null | grep -E 'mysqld|mariadbd' | grep -v grep | head -3"
-    mysql_user=$(ps -ef 2>/dev/null | grep -E "mysqld|mariadbd" | grep -v "mysqld_safe" | grep -v grep | awk '{print $1}' | head -1)
+    evd "DBM-026" "ps -e -o user=,comm=,args= 2>/dev/null | grep -E 'mysqld|mariadbd' | grep -v grep"
+    mysql_user=$(_proc_user "mysqld|mariadbd")
     _my_umask=$(_get_umask "$mysql_user" mysqld mariadbd)
     _judge_umask "$_my_umask" "MySQL" "026" "${mysql_user:-mysql}"
 
@@ -1010,9 +1028,12 @@ check_mysql() {
     # DBM-032: 통신구간 암호화 (SSL/TLS)
     _have_ssl=$(get_var "have_ssl")
     _require_ssl=$(get_var "require_secure_transport")
-    evd_q "DBM-032" "have_ssl=${_have_ssl}, require_secure_transport=${_require_ssl:-미설정}" ""
+    _ssl_cert=$(get_var "ssl_cert")
+    evd_q "DBM-032" "have_ssl=${_have_ssl:-변수 없음}, ssl_cert=${_ssl_cert:-없음}, require_secure_transport=${_require_ssl:-미설정}" ""
     if [ "${_require_ssl}" = "ON" ]; then
         ok "032" "SSL 필수 (require_secure_transport=ON)"
+    elif [ -z "$_have_ssl" ] && [ -n "$_ssl_cert" ]; then   # MySQL 8.4+: have_ssl 삭제, 인증서 있으면 TLS 사용 가능
+        mc "032" "SSL 가능하나 필수 아님 (ssl_cert=${_ssl_cert}, require_secure_transport=${_require_ssl:-OFF})"
     elif [ "${_have_ssl}" = "YES" ]; then
         mc "032" "SSL 가능하나 필수 아님 (have_ssl=YES, require_secure_transport=${_require_ssl:-OFF})"
     else
@@ -1022,19 +1043,21 @@ check_mysql() {
     # DBM-033: 이중화 비밀번호 평문 노출
     # 평가기준: slave_master_info(테이블/파일)에 비밀번호 평문 저장 시 취약, 동적 입력(START REPLICA ... PASSWORD) 시 양호
     _repl_info=$(run_q "SELECT CONCAT(Host,' user=',User_name,' pw=',IF(IFNULL(User_password,'')='','없음','저장됨')) FROM mysql.slave_master_info;" 2>/dev/null | head -3)
-    _mi_file=$(ls "$(get_var datadir)"/master.info 2>/dev/null)
+    _mi_file=$(ls "$(get_var datadir)"/master.info "$(get_var datadir)"/master-*.info 2>/dev/null | head -1)
     evd_q "DBM-033" "slave_master_info 비밀번호 저장 여부 / master.info 파일" "${_repl_info:-행 없음} / ${_mi_file:-없음}"
     if echo "$_repl_info" | grep -q "pw=저장됨" || { [ -n "$_mi_file" ] && [ "$(sed -n 6p "$_mi_file" 2>/dev/null)" != "" ]; }; then
         ng "033" "복제 연결 비밀번호 평문 저장: $(echo "$_repl_info" | _csv)${_mi_file:+ / $_mi_file}"
     elif [ -n "$_repl_info" ]; then
         ok "033" "복제 구성, 비밀번호 미저장(동적 입력): $(echo "$_repl_info" | _csv)"
+    elif [ -n "$_MY_NOACL" ]; then
+        mc "033" "mysql.slave_master_info 조회 불가 - 복제 구성·비밀번호 저장 여부 수동 확인"
     else
         na "033" "이중화(복제) 미구성"
     fi
 
     # DBM-034: DBMS 서비스 구동 권한 (프로세스 UID + 설정파일 user 지시자 교차검증)
-    evd "DBM-034" "ps -ef 2>/dev/null | grep -E 'mysqld|mariadbd' | grep -v grep"
-    mysql_proc=$(ps -ef 2>/dev/null | grep -E "mysqld|mariadbd" | grep -v "mysqld_safe" | grep -v grep | awk '{print $1}' | head -1)
+    evd "DBM-034" "ps -e -o user=,comm=,args= 2>/dev/null | grep -E 'mysqld|mariadbd' | grep -v grep"
+    mysql_proc=$(_proc_user "mysqld|mariadbd")
     _mycnf_user=""
     for _mc in /etc/my.cnf /etc/my.ini /etc/my.cnf.d/mysql-server.cnf \
                /etc/mysql/my.cnf /etc/mysql/mysql.conf.d/mysqld.cnf \
@@ -1096,6 +1119,16 @@ check_pgsql() {
     _pg_exec() { if [ -n "$_PG_OS" ] && [ "$_PGH" = "@sock" ]; then su "$_PG_OS" -s /bin/sh -c "\"$PSQL\" $OPTS -f -"; else "$PSQL" $OPTS -f -; fi; }
     run_q() { printf '%s\n' "$1" | _pg_exec 2>/dev/null | grep -v "^$"; }
     get_conf() { run_q "SHOW $1;"; }
+    _pg_each() {   # 접속 가능한 전 DB 에서 SQL 실행 → '<DB>:<행>' / 실패 DB → '#FAIL:<DB>' (오류 시 중단 후 끝 표지 미출력으로 판별)
+        local _d _o
+        for _d in ${_pg_dbs:-$PGSQL_DB}; do
+            _o=$(OPTS="${OPTS/-d ${PGSQL_DB}/-d $_d}" run_q "\\set ON_ERROR_STOP on
+$1
+SELECT '#ok';")
+            if echo "$_o" | grep -qx '#ok'; then echo "$_o" | grep -vx '#ok' | sed "s/^/$_d:/"; else echo "#FAIL:$_d"; fi
+        done
+    }
+    _pg_local_listen() { case ",$(echo "$1" | tr -d ' ')," in ,,) return 0 ;; esac; echo "$1" | tr ',' '\n' | tr -d ' ' | grep -vqxE 'localhost|127\.0\.0\.1|::1' && return 1; return 0; }   # 빈 값(소켓만)·루프백만 → 원격 수신 없음
     local _pgc=""
     for _PGH in $_PG_HOSTS; do
         OPTS="-X -w -U ${PGSQL_USER} $( [ "$_PGH" != "@sock" ] && echo "-h $_PGH") -p ${PGSQL_PORT} -d ${PGSQL_DB} -tA"
@@ -1110,6 +1143,9 @@ check_pgsql() {
     _conn_ok "$_pgc" "PostgreSQL" || return
     DB_VER=$(run_q "SELECT version();" | head -1)
     echo "# PostgreSQL 버전: ${DB_VER}"
+    # 슈퍼유저가 아니면 pg_authid·pg_hba_file_rules 를 못 읽고 information_schema 권한 뷰는 본인 관련 권한만 보임 → 해당 항목은 '없음'을 양호로 판정하지 않음
+    _PG_SU=$(run_q "SHOW is_superuser;" | head -1)
+    [ "$_PG_SU" != "on" ] && echo "# [경고] 점검 계정(${PGSQL_USER})이 슈퍼유저 아님 - 계정·권한 항목 일부 수동확인 처리"
 
     # DBM-001: 취약 패스워드
     # 빈 비밀번호(md5(''||계정명)) 는 취약, 비밀번호 NULL 역할은 비밀번호 인증 불가 → trust 규칙 적용 시에만 취약
@@ -1149,6 +1185,7 @@ check_pgsql() {
     # 평가기준: passwordcheck.so 로드 + 설정이 복잡도(2종 10자/3종 8자) 충족. 기본 passwordcheck 는 8자·문자+비문자(2종 8자)라 미달
     _pw_enc=$(get_conf "password_encryption")
     _pc_len=$(get_conf "passwordcheck.min_password_length" 2>/dev/null)
+    [ "$(run_q "SHOW server_version_num;" | head -1)" -lt 180000 ] 2>/dev/null && _pc_len=""   # PG17 이하 passwordcheck 는 고정 8자 — 설정 줄이 있어도 적용 안 됨
     evd_q "DBM-007" "passwordcheck.min_password_length / (참고) password_encryption" "${_pc_len:-N/A} / ${_pw_enc}"
     if echo "$_pg_spl" | grep -qi "passwordcheck" && [ "${_pc_len:-0}" -ge 10 ] 2>/dev/null; then
         ok "007" "passwordcheck 로드, min_password_length=${_pc_len} (문자+비문자 2종 10자 이상)"
@@ -1223,22 +1260,23 @@ check_pgsql() {
     fi
 
     # DBM-015: PUBLIC 불필요 권한
-    _pg_pub_exec=$(run_q "SELECT routine_schema||'.'||routine_name FROM information_schema.role_routine_grants WHERE grantee='PUBLIC' AND routine_schema NOT IN ('pg_catalog','information_schema') ORDER BY 1;" 2>/dev/null | head -10)
     _pg_dbs=$(run_q "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1;")
     evd_q "DBM-015" "점검 대상 DB (접속 가능·템플릿 제외)" "$(echo "$_pg_dbs" | _csv)"
-    _pg_pub_create=""; _pg_pub_tbl=""
-    for _d in $_pg_dbs; do   # PUBLIC 권한은 DB 별 카탈로그 — 전 DB 순회 (has_schema_privilege 의 PUBLIC 은 소문자 'public')
-        _pg_pub_create="${_pg_pub_create}$(OPTS="${OPTS/-d ${PGSQL_DB}/-d $_d}" run_q "SELECT '$_d:'||nspname||' (CREATE)' FROM pg_namespace WHERE nspname='public' AND has_schema_privilege('public',nspname,'CREATE');")
-"
-        _pg_pub_tbl="${_pg_pub_tbl}$(OPTS="${OPTS/-d ${PGSQL_DB}/-d $_d}" run_q "SELECT '$_d:'||table_schema||'.'||table_name||' ('||privilege_type||')' FROM information_schema.role_table_grants WHERE grantee='PUBLIC' AND table_schema NOT IN ('pg_catalog','information_schema') ORDER BY 1;")
-"
-    done
-    _pg_pub_create=$(echo "$_pg_pub_create" | grep -v "^$" | head -5); _pg_pub_tbl=$(echo "$_pg_pub_tbl" | grep -v "^$" | head -10)
+    # PUBLIC 권한은 DB 별 카탈로그 — 전 DB 순회 (has_schema_privilege 의 PUBLIC 은 소문자 'public')
+    local _p15; _p15=$(_pg_each "SELECT nspname||' (CREATE)' FROM pg_namespace WHERE nspname='public' AND has_schema_privilege('public',nspname,'CREATE') UNION ALL SELECT table_schema||'.'||table_name||' ('||privilege_type||')' FROM information_schema.role_table_grants WHERE grantee='PUBLIC' AND table_schema NOT IN ('pg_catalog','information_schema') UNION ALL SELECT routine_schema||'.'||routine_name||' (EXECUTE)' FROM information_schema.role_routine_grants WHERE grantee='PUBLIC' AND routine_schema NOT IN ('pg_catalog','information_schema');")
+    _pg_fail15=$(echo "$_p15" | sed -n 's/^#FAIL://p' | _csv)
+    _pg_pub_create=$(echo "$_p15" | grep -v '^#FAIL:' | grep ' (CREATE)$' | head -5)
+    _pg_pub_exec=$(echo "$_p15" | grep -v '^#FAIL:' | grep ' (EXECUTE)$' | head -10)
+    _pg_pub_tbl=$(echo "$_p15" | grep -v '^#FAIL:' | grep -vE ' \((CREATE|EXECUTE)\)$' | grep . | head -10)
     evd_q "DBM-015" "PUBLIC EXECUTE 권한 (비시스템)" "${_pg_pub_exec:-없음}"
     evd_q "DBM-015" "PUBLIC CREATE 권한 (public 스키마)" "${_pg_pub_create:-없음}"
     evd_q "DBM-015" "PUBLIC 테이블(Object) 권한 (비시스템)" "${_pg_pub_tbl:-없음}"
     if [ -n "$_pg_pub_tbl" ] || [ -n "$_pg_pub_exec" ] || [ -n "$_pg_pub_create" ]; then
-        mc "015" "PUBLIC Object 권한: $(echo "${_pg_pub_tbl}${_pg_pub_exec:+ $_pg_pub_exec}${_pg_pub_create:+ $_pg_pub_create}" | _csv | head -c 150) - 업무상 필요 여부 확인"
+        mc "015" "PUBLIC Object 권한: $(echo "${_pg_pub_tbl}${_pg_pub_exec:+ $_pg_pub_exec}${_pg_pub_create:+ $_pg_pub_create}" | _csv | head -c 150) - 업무상 필요 여부 확인${_pg_fail15:+ / 접속·조회 실패 DB: $_pg_fail15}"
+    elif [ -n "$_pg_fail15" ]; then
+        mc "015" "접속·조회 실패 DB(${_pg_fail15}) - 해당 DB 의 PUBLIC Object 권한 수동 확인 (나머지 DB 는 없음)"
+    elif [ "$_PG_SU" != "on" ]; then
+        mc "015" "점검 계정 슈퍼유저 아님 - information_schema 권한 뷰가 본인 관련 권한만 표시하므로 PUBLIC Object 권한 수동 확인"
     else
         ok "015" "PUBLIC 에 사용자 Object 권한 없음"
     fi
@@ -1278,6 +1316,8 @@ check_pgsql() {
         mc "022" "PostgreSQL 설정 파일 미발견 - 수동 확인"
     elif [ -n "$_b22" ]; then
         ng "022" "설정 파일 권한 기준(640) 위반: ${_b22}"
+    elif [ -z "$_pg_hba" ] || [ -z "$_pg_ident" ]; then
+        mc "022" "확인한 파일(${_pg_config})은 640 충족, pg_hba.conf·pg_ident.conf 경로 조회 불가(슈퍼유저·pg_read_all_settings 필요) - 수동 확인"
     else
         ok "022" "postgresql.conf·pg_hba.conf·pg_ident.conf 권한 640 기준 충족"
     fi
@@ -1300,8 +1340,7 @@ $(run_q "SELECT 'role:'||pg_get_userbyid(m.member)||' ADMIN '||pg_get_userbyid(m
 
     # DBM-026: 구동 계정 umask
     evd "DBM-026" "ps -ef 2>/dev/null | grep 'postgres' | grep -v grep | head -3"
-    pg_user=$(ps -ef 2>/dev/null | grep -E "postgres: (postmaster|checkpointer)|postgres -D|/usr/lib/postgresql/.*/bin/postgres|bin/postgres " | grep -v grep | awk '{print $1}' | head -1)
-    [ -z "$pg_user" ] && pg_user=$(ps -ef 2>/dev/null | awk '$NF=="postgres" || $NF~/\/postgres$/{print $1; exit}')
+    pg_user=$(_proc_user "postgres|postmaster")
     _pg_umask=$(_get_umask "$pg_user" "postgres")
     _judge_umask "$_pg_umask" "PostgreSQL" "026" "${pg_user:-postgres}"
 
@@ -1346,8 +1385,7 @@ $(run_q "SELECT 'role:'||pg_get_userbyid(m.member)||' ADMIN '||pg_get_userbyid(m
 
     # DBM-034: DBMS 구동 권한
     evd "DBM-034" "ps -ef 2>/dev/null | grep 'postgres' | grep -v grep | head -3"
-    pg_proc=$(ps -ef 2>/dev/null | grep -E "postgres: (postmaster|checkpointer)|postgres -D|/usr/lib/postgresql/.*/bin/postgres|bin/postgres " | grep -v grep | awk '{print $1}' | head -1)
-    [ -z "$pg_proc" ] && pg_proc=$(ps -ef 2>/dev/null | awk '$NF=="postgres" || $NF~/\/postgres$/{print $1; exit}')
+    pg_proc=$(_proc_user "postgres|postmaster")
     [ -n "$pg_proc" ] && {
         [ "$pg_proc" = "root" ] && ng "034" "PostgreSQL root 실행" || ok "034" "구동 계정: ${pg_proc}"
     } || mc "034" "PostgreSQL 구동 계정 수동 확인"
@@ -1953,7 +1991,7 @@ _kisa_d25() {   # D-25: EoS(보안 패치 미제공) = 취약, 그 외 최신 �
     local e="${_RES[DBM-025]:-}"
     evd_q "D-25" "DBMS 버전 / EoS 판정(DBM-025)" "${DB_VER:-미확인} / ${e:-없음}"
     case "$e" in 취약*) _kput "D-25" "취약" "보안 패치가 제공되지 않는 버전(EoS): ${e#*|}" ;;
-    *) _kput "D-25" "수동확인" "${DB_VER:-버전 미확인}${e:+ (${e#*|})} - 벤더 최신 보안 패치 적용 여부 확인" ;; esac
+    *) _kput "D-25" "수동확인" "${_KDB} $(echo "${DB_VER:-}" | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 | grep . || echo '버전 미확인') - 벤더 최신 보안 패치 적용 여부 확인 (지원 종료(EoS) 여부는 컨버터가 자동 판정)" ;; esac
 }
 _kisa_fail() { local c; for c in $2; do _kput "$c" "수동확인" "$1"; done; }
 _D_ALL="D-01 D-02 D-03 D-04 D-05 D-06 D-07 D-08 D-09 D-10 D-11 D-12 D-13 D-14 D-15 D-16 D-17 D-18 D-19 D-20 D-21 D-22 D-23 D-24 D-25 D-26"
@@ -1967,16 +2005,22 @@ kisa_mysql() {
         return
     fi
     # 계정 현황 (MySQL 5.7+/MariaDB 10.4+: authentication_string·account_locked, 구버전: Password)
-    local _u; _u=$(run_q "SELECT CONCAT(User,'@',Host,'|',IFNULL(plugin,''),'|',IF(IFNULL(authentication_string,'')='','EMPTY','SET'),'|',IFNULL(account_locked,'N')) FROM mysql.user WHERE User NOT IN (${_sys});")
-    [ -z "$_u" ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'|',IFNULL(plugin,''),'|',IF(IFNULL(authentication_string,'')='','EMPTY','SET'),'|N') FROM mysql.user WHERE User NOT IN (${_sys});")
+    #   비밀번호: SET=해시 저장 / EMPTY=빈 비밀번호 / INVALID=비밀번호 로그인 불가('invalid', MariaDB 기본 root·mysql 계정)
+    local _u=""
+    [ "${IS_MARIADB:-0}" = 1 ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'|',CONCAT_WS(',',NULLIF(JSON_VALUE(Priv,'\$.plugin'),''),JSON_VALUE(Priv,'\$.auth_or[0].plugin'),JSON_VALUE(Priv,'\$.auth_or[1].plugin'),JSON_VALUE(Priv,'\$.auth_or[2].plugin')),'|',CASE WHEN CONCAT(IFNULL(NULLIF(JSON_VALUE(Priv,'\$.authentication_string'),'invalid'),''),IFNULL(NULLIF(JSON_VALUE(Priv,'\$.auth_or[1].authentication_string'),'invalid'),''),IFNULL(NULLIF(JSON_VALUE(Priv,'\$.auth_or[2].authentication_string'),'invalid'),''))<>'' THEN 'SET' WHEN JSON_VALUE(Priv,'\$.authentication_string')='invalid' THEN 'INVALID' ELSE 'EMPTY' END,'|',IF(JSON_VALUE(Priv,'\$.account_locked') IN ('true','1'),'Y','N')) FROM mysql.global_priv WHERE User NOT IN (${_sys});")
+    [ -z "$_u" ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'|',IFNULL(plugin,''),'|',IF(IFNULL(authentication_string,'')='','EMPTY','SET'),'|',IFNULL(account_locked,'N')) FROM mysql.user WHERE User NOT IN (${_sys});")
+    [ -z "$_u" ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'|',IFNULL(plugin,''),'|',CASE WHEN IFNULL(authentication_string,'')='invalid' THEN 'INVALID' WHEN IFNULL(authentication_string,'')='' AND IFNULL(Password,'')='' THEN 'EMPTY' ELSE 'SET' END,'|N') FROM mysql.user WHERE User NOT IN (${_sys});")
     [ -z "$_u" ] && _u=$(run_q "SELECT CONCAT(User,'@',Host,'||',IF(IFNULL(Password,'')='','EMPTY','SET'),'|N') FROM mysql.user;")
-    evd_q "D-01" "계정@호스트|인증 플러그인|비밀번호 설정|잠금 (mysql.user)" "${_u:-조회 불가}"
+    evd_q "D-01" "계정@호스트|인증 플러그인|비밀번호(SET/EMPTY/INVALID=비밀번호 로그인 불가)|잠금" "${_u:-조회 불가}"
+    local _nou="mysql.user 조회 불가(점검 계정 권한 부족) - 수동 확인"
+    # 배포판 기본 관리 계정: MariaDB 10.4+ 'mysql'@'localhost' (비밀번호 로그인 불가 + unix_socket, OS mysql 계정 전용) → root 와 같은 DBA 로 취급
+    local _sysadm; _sysadm=$(echo "$_u" | awk -F'|' '$1=="mysql@localhost" && $3=="INVALID" && $2 ~ /unix_socket/ {print $1}')
 
     # D-01 기본 계정(root) 초기 비밀번호 변경 또는 잠금
     local _r; _r=$(echo "$_u" | awk -F'|' '$1 ~ /^root@/ && $3=="EMPTY" && $4!="Y" && $2!~/(auth_socket|unix_socket)/ {print $1}' | tr '\n' ' ')
     if [ -z "$_u" ]; then _kput "D-01" "수동확인" "mysql.user 조회 불가 - root 비밀번호 변경 여부 확인"
     elif [ -n "$_r" ]; then _kput "D-01" "취약" "기본 계정 비밀번호 미설정(초기값): ${_r% }"
-    else _kput "D-01" "양호" "기본 계정(root) 비밀번호 설정 또는 OS 인증(socket)·잠금: $(echo "$_u" | awk -F'|' '$1~/^root@/{print $1"("($3=="SET"?"비밀번호":"")($2~/socket/?" socket":"")($4=="Y"?" 잠금":"")")"}' | tr '\n' ' ')"; fi
+    else _kput "D-01" "양호" "기본 계정(root) 비밀번호 설정 또는 OS 인증(socket)·잠금: $(echo "$_u" | awk -F'|' '$1~/^root@/{print $1"("($3=="SET"?"비밀번호":"")($3=="INVALID"?"비밀번호 로그인 불가":"")($2~/socket/?" socket":"")($4=="Y"?" 잠금":"")")"}' | tr '\n' ' ')"; fi
 
     # D-02 불필요 계정 (익명·테스트 계정 = 취약, 그 외 인가 여부 확인)
     local _anon _test _act
@@ -1984,7 +2028,8 @@ kisa_mysql() {
     _test=$(echo "$_u" | awk -F'|' '$4!="Y"{print $1}' | grep -iE '^(test|guest|demo|temp|tmp|sample|user[0-9]*)[0-9_]*@' | tr '\n' ' ')
     _act=$(echo "$_u" | awk -F'|' '$4!="Y"{print $1}' | tr '\n' ' ')
     evd_q "D-02" "활성(잠금 아님) 계정" "${_act:-없음}"
-    if [ -n "$_anon$_test" ]; then _kput "D-02" "취약" "불필요 계정 존재:${_anon:+ 익명 계정 ${_anon}}${_test:+ 테스트성 계정 ${_test}}"
+    if [ -z "$_u" ]; then _kput "D-02" "수동확인" "$_nou"
+    elif [ -n "$_anon$_test" ]; then _kput "D-02" "취약" "불필요 계정 존재:${_anon:+ 익명 계정 ${_anon}}${_test:+ 테스트성 계정 ${_test}}"
     else _kput "D-02" "수동확인" "활성 계정: ${_act:-없음}- 인가되지 않은 계정·퇴직자·미사용 계정 여부 확인 (없으면 양호)"; fi
 
     # D-03 비밀번호 사용 기간 및 복잡도
@@ -1998,15 +2043,25 @@ kisa_mysql() {
     elif echo "$_vp" | grep -q 'cracklib_password_check'; then _cx="cracklib_password_check"; fi
     local _bad3=""
     { [ -z "$_cx" ] || [ "${_ln:-0}" -lt 8 ]; } && _bad3="${_bad3} 복잡도 정책 미흡(${_cx:-미설치}, 최소 길이 ${_ln:-미설정})"
-    { [ -z "$_lt" ] || [ "$_lt" -eq 0 ] || [ "$_lt" -gt 90 ]; } 2>/dev/null && _bad3="${_bad3} 사용 기간 default_password_lifetime=${_lt:-미지원}(0=무제한, 90일 이하 필요)"
-    [ -n "$_bad3" ] && _kput "D-03" "취약" "비밀번호 정책 미적용:${_bad3}" || _kput "D-03" "양호" "복잡도(${_cx}, 최소 ${_ln}자)·사용 기간(${_lt}일) 설정"
+    # 계정별 사용 기간: NULL/-1 = 전역 기본값, 0 = 만료 없음 (비밀번호 로그인 가능·잠금 아닌 계정만)
+    local _plt _blt
+    if [ "${IS_MARIADB:-0}" = 1 ]; then _plt=$(run_q "SELECT CONCAT(User,'@',Host,'=',IFNULL(JSON_VALUE(Priv,'\$.password_lifetime'),-1)) FROM mysql.global_priv WHERE User NOT IN (${_sys});")
+    else _plt=$(run_q "SELECT CONCAT(User,'@',Host,'=',IFNULL(password_lifetime,-1)) FROM mysql.user WHERE User NOT IN (${_sys});"); fi
+    _blt=$(echo "$_plt" | awk -F= -v D="${_lt:-x}" -v A="$(echo "$_u" | awk -F'|' '$3=="SET" && $4!="Y"{printf "%s ", $1}')" '
+        BEGIN { n = split(A, a, " "); for (i = 1; i <= n; i++) act[a[i]] = 1 }
+        ($1 in act) { v = ($2 == "-1") ? D : $2; if (v == "x" || v + 0 == 0 || v + 0 > 90) print $1 "=" (v == "x" ? "미지원" : v) }' | tr '\n' ' ')
+    evd_q "D-03" "계정별 비밀번호 사용 기간(일, -1=기본값 ${_lt:-미지원}, 0=만료 없음)" "${_plt:-조회 불가(기본값만 판단)}"
+    if [ -n "$_plt" ]; then [ -n "$_blt" ] && _bad3="${_bad3} 사용 기간 90일 초과/만료 없음 계정: ${_blt% }"
+    else { [ -z "$_lt" ] || [ "$_lt" -eq 0 ] || [ "$_lt" -gt 90 ]; } 2>/dev/null && _bad3="${_bad3} 사용 기간 default_password_lifetime=${_lt:-미지원}(0=무제한, 90일 이하 필요)"; fi
+    [ -n "$_bad3" ] && _kput "D-03" "취약" "비밀번호 정책 미적용:${_bad3}" || _kput "D-03" "양호" "복잡도(${_cx}, 최소 ${_ln}자)·사용 기간(기본 ${_lt}일, 계정별 90일 이하) 설정"
 
     # D-04 관리자 권한(SUPER 등)은 필요한 계정에만
     local _su; _su=$(run_q "SELECT CONCAT(User,'@',Host) FROM mysql.user WHERE Super_priv='Y' AND User NOT IN (${_sys}) ORDER BY 1;" | tr '\n' ' ')
     evd_q "D-04" "SUPER 권한 보유 계정 (mysql.user Super_priv / INFORMATION_SCHEMA.USER_PRIVILEGES)" "${_su:-없음}"
-    local _sun; _sun=$(echo "$_su" | tr ' ' '\n' | grep -v '^root@' | grep . | tr '\n' ' ')
-    [ -n "$_sun" ] && _kput "D-04" "수동확인" "root 외 SUPER(관리자) 권한 계정: ${_sun}- 관리자 권한 필요성 확인 (불필요 시 취약, 필요한 권한만 부여)" \
-                   || _kput "D-04" "양호" "관리자(SUPER) 권한이 root 에만 부여: ${_su:-없음}"
+    local _sun; _sun=$(echo "$_su" | tr ' ' '\n' | grep -v '^root@' | grep -vxF "${_sysadm:-#}" | grep . | tr '\n' ' ')
+    if [ -z "$_u" ]; then _kput "D-04" "수동확인" "$_nou"
+    else [ -n "$_sun" ] && _kput "D-04" "수동확인" "root 외 SUPER(관리자) 권한 계정: ${_sun}- 관리자 권한 필요성 확인 (불필요 시 취약, 필요한 권한만 부여)" \
+                   || _kput "D-04" "양호" "관리자(SUPER) 권한이 root${_sysadm:+·배포판 기본 관리 계정($_sysadm)} 에만 부여: ${_su:-없음}"; fi
 
     _KNA D-05
     # D-06 사용자별 계정 사용 (공용 계정 여부)
@@ -2025,7 +2080,7 @@ kisa_mysql() {
     else _kput "D-07" "수동확인" "구동 계정 확인 불가"; fi
 
     # D-08 안전한 암호화 알고리즘 (SHA-256 이상)
-    local _wk; _wk=$(echo "$_u" | awk -F'|' '$3=="SET" && $2!~/(caching_sha2_password|sha256_password|ed25519|auth_socket|unix_socket|pam|gssapi|ldap)/ {print $1"("($2==""?"구형 해시":$2)")"}' | tr '\n' ' ')
+    local _wk; _wk=$(echo "$_u" | awk -F'|' '$3=="SET" && ($2=="" || $2 ~ /mysql_native_password|mysql_old_password/) {print $1"("($2==""?"구형 해시":$2)")"}' | tr '\n' ' ')
     evd_q "D-08" "비밀번호 계정별 인증 플러그인" "$(echo "$_u" | awk -F'|' '$3=="SET"{print $1" "$2}')"
     if [ -z "$_u" ]; then _kput "D-08" "수동확인" "계정 인증 플러그인 조회 불가"
     elif [ -n "$_wk" ]; then _kput "D-08" "취약" "SHA-256 미만 해시 알고리즘 계정 (mysql_native_password=SHA-1): ${_wk% }"
@@ -2033,18 +2088,21 @@ kisa_mysql() {
 
     _KNA D-09
     # D-10 원격 접속 제한 (Host='%' 계정)
-    local _any; _any=$(echo "$_u" | awk -F'|' '$1 ~ /@%$/ {print $1}' | tr '\n' ' ')
+    local _any; _any=$(echo "$_u" | awk -F'|' '$1 ~ /@%$/ && $4!="Y" {print $1}' | tr '\n' ' ')
     evd_q "D-10" "모든 호스트(%) 허용 계정 / bind_address" "${_any:-없음} / $(get_var bind_address)"
-    [ -n "$_any" ] && _kput "D-10" "취약" "모든 클라이언트(%)에서 접속 가능한 계정: ${_any% } - 지정 IP 로 제한 필요" \
-                   || _kput "D-10" "양호" "모든 계정이 지정 호스트에서만 접속 가능 (Host='%' 없음)"
+    if [ -z "$_u" ]; then _kput "D-10" "수동확인" "$_nou"
+    elif [ -n "$_any" ]; then _kput "D-10" "취약" "모든 클라이언트(%)에서 접속 가능한 계정: ${_any% } - 지정 IP 로 제한 필요"
+    else _kput "D-10" "양호" "모든 계정이 지정 호스트에서만 접속 가능 (Host='%' 없음)"; fi
 
     # D-11 시스템 테이블(mysql 스키마) 접근 제한
     local _st
     _st=$( { run_q "SELECT CONCAT(User,'@',Host,'(전역 SELECT)') FROM mysql.user WHERE Select_priv='Y' AND Super_priv<>'Y' AND User NOT IN (${_sys},'root');"
-             run_q "SELECT CONCAT(User,'@',Host,'(mysql DB)') FROM mysql.db WHERE Db IN ('mysql','sys','performance_schema') AND User NOT IN (${_sys},'root');"
+             run_q "SELECT CONCAT(User,'@',Host,'(',Db,' DB)') FROM mysql.db WHERE ('mysql' LIKE Db OR 'sys' LIKE Db OR 'performance_schema' LIKE Db) AND User NOT IN (${_sys},'root');"
              run_q "SELECT CONCAT(User,'@',Host,'(',Table_name,')') FROM mysql.tables_priv WHERE Db='mysql' AND User NOT IN (${_sys},'root');"; } | sort -u | tr '\n' ' ')
     evd_q "D-11" "DBA 외 시스템 스키마(mysql/sys) 접근 권한 계정" "${_st:-없음}"
-    [ -n "$_st" ] && _kput "D-11" "취약" "DBA 외 계정의 시스템 테이블 접근 권한: ${_st% }" || _kput "D-11" "양호" "시스템 테이블(mysql 스키마) 접근 권한이 DBA 에만 부여"
+    if [ -z "$_u" ]; then _kput "D-11" "수동확인" "$_nou"
+    elif [ -n "$_st" ]; then _kput "D-11" "취약" "DBA 외 계정의 시스템 테이블 접근 권한: ${_st% }"
+    else _kput "D-11" "양호" "시스템 테이블(mysql 스키마) 접근 권한이 DBA 에만 부여"; fi
 
     _KNA D-12 D-13
     # D-14 주요 설정 파일 권한 (가이드 MySQL 절차: my.cnf 600/640, 판단: 일반 사용자 수정 권한 제거)
@@ -2057,9 +2115,14 @@ kisa_mysql() {
 
     _KNA D-15 D-16 D-17 D-18 D-19 D-20
     # D-21 GRANT OPTION 제한 (Grant_priv 계정 = 취약, root 제외)
-    local _gp; _gp=$( { run_q "SELECT CONCAT(User,'@',Host) FROM mysql.user WHERE Grant_priv='Y' AND User NOT IN (${_sys},'root');"; run_q "SELECT CONCAT(User,'@',Host,'(',Db,')') FROM mysql.db WHERE Grant_priv='Y' AND User NOT IN (${_sys},'root');"; } | sort -u | tr '\n' ' ')
-    evd_q "D-21" "SELECT user, grant_priv FROM mysql.user/mysql.db (root 제외)" "${_gp:-없음}"
-    [ -n "$_gp" ] && _kput "D-21" "취약" "GRANT OPTION 보유 계정: ${_gp% }" || _kput "D-21" "양호" "root 외 GRANT OPTION 보유 계정 없음"
+    local _gp; _gp=$( { run_q "SELECT CONCAT(User,'@',Host) FROM mysql.user WHERE Grant_priv='Y' AND User NOT IN (${_sys},'root');"
+                        run_q "SELECT CONCAT(User,'@',Host,'(',Db,')') FROM mysql.db WHERE Grant_priv='Y' AND User NOT IN (${_sys},'root');"
+                        run_q "SELECT CONCAT(User,'@',Host,'(',Db,'.',Table_name,')') FROM mysql.tables_priv WHERE FIND_IN_SET('Grant',Table_priv) AND User NOT IN (${_sys},'root');"
+                        run_q "SELECT CONCAT(USER,'@',HOST,'(',PRIV,')') FROM mysql.global_grants WHERE WITH_GRANT_OPTION='Y' AND USER NOT IN (${_sys},'root');"; } | grep -vxF "${_sysadm:-#}" | sort -u | tr '\n' ' ')   # global_grants: MySQL 8 동적 권한(없으면 무시)
+    evd_q "D-21" "GRANT OPTION 보유 계정 (mysql.user/db/tables_priv·global_grants, root·배포판 기본 관리 계정 제외)" "${_gp:-없음}"
+    if [ -z "$_u" ]; then _kput "D-21" "수동확인" "$_nou"
+    elif [ -n "$_gp" ]; then _kput "D-21" "취약" "GRANT OPTION 보유 계정: ${_gp% }"
+    else _kput "D-21" "양호" "root${_sysadm:+·배포판 기본 관리 계정($_sysadm)} 외 GRANT OPTION 보유 계정 없음"; fi
 
     _KNA D-22 D-23 D-24
     _kisa_d25
@@ -2081,11 +2144,14 @@ kisa_pgsql() {
 
     # D-01 기본 계정(postgres) 초기 비밀번호 변경 또는 잠금
     local _pg; _pg=$(echo "$_roles" | awk -F'|' '$1=="postgres"')
-    local _trust _ltrust
+    local _trust _ltrust _ltpg
     _trust=$(echo "$_hba" | awk '$NF=="trust" && $1!="local" && $4 !~ /^(127\.0\.0\.1|::1)\//')
     _ltrust=$(echo "$_hba" | awk '$NF=="trust" && ($1=="local" || $4 ~ /^(127\.0\.0\.1|::1)\//)' | wc -l)
+    _ltpg=$(echo "$_hba" | awk '$NF=="trust" && ($1=="local" || $4 ~ /^(127\.0\.0\.1|::1)\//) && $3 ~ /(^|,)(all|postgres)(,|$)/')   # postgres 에 적용되는 로컬 trust
+    local _nor="pg_authid 조회 불가(슈퍼유저 권한 필요) - 수동 확인"
     if [ -z "$_roles" ]; then _kput "D-01" "수동확인" "pg_authid 조회 불가 - postgres 비밀번호 설정 여부 확인"
     elif [ -n "$_trust" ]; then _kput "D-01" "취약" "비밀번호 없이 접속 가능한 원격 trust 인증: $(echo "$_trust" | tr '\n' ',' | sed 's/,$//')"
+    elif [ -n "$_ltpg" ]; then _kput "D-01" "취약" "로컬 trust 인증으로 서버의 모든 OS 사용자가 비밀번호 없이 postgres 접속 가능: $(echo "$_ltpg" | tr '\n' ',' | sed 's/,$//')"
     elif echo "$_pg" | awk -F'|' '$5=="NULL"' | grep -q .; then _kput "D-01" "양호" "기본 계정 postgres 비밀번호 미설정 - 비밀번호 인증 불가(peer 등 OS 인증만 허용, 잠금과 동일)"
     else _kput "D-01" "양호" "기본 계정 postgres 비밀번호 설정 ($(echo "$_pg" | cut -d'|' -f5))$( [ "${_ltrust:-0}" -gt 0 ] && echo " - 참고: 로컬(소켓·루프백) trust 규칙 ${_ltrust}개는 비밀번호 없이 접속 가능하므로 필요성 확인")"; fi
 
@@ -2094,7 +2160,9 @@ kisa_pgsql() {
     _login=$(echo "$_roles" | awk -F'|' '$2=="t"{print $1}' | tr '\n' ' ')
     _test=$(echo "$_login" | tr ' ' '\n' | grep -iE '^(test|guest|demo|temp|tmp|sample|user[0-9]*)[0-9_]*$' | tr '\n' ' ')
     evd_q "D-02" "로그인 가능 역할" "${_login:-없음}"
-    [ -n "$_test" ] && _kput "D-02" "취약" "테스트성 계정 존재: ${_test% }" || _kput "D-02" "수동확인" "로그인 가능 역할: ${_login:-없음}- 인가되지 않은 계정·퇴직자·미사용 계정 여부 확인 (없으면 양호)"
+    if [ -z "$_roles" ]; then _kput "D-02" "수동확인" "$_nor"
+    elif [ -n "$_test" ]; then _kput "D-02" "취약" "테스트성 계정 존재: ${_test% }"
+    else _kput "D-02" "수동확인" "로그인 가능 역할: ${_login:-없음}- 인가되지 않은 계정·퇴직자·미사용 계정 여부 확인 (없으면 양호)"; fi
 
     # D-03 비밀번호 사용 기간(VALID UNTIL) 및 복잡도(passwordcheck/credcheck)
     local _spl _nov
@@ -2104,16 +2172,20 @@ kisa_pgsql() {
     local _b3=""
     echo "$_spl" | grep -qiE 'passwordcheck|credcheck|passwordpolicy' || _b3="${_b3} 복잡도 모듈(passwordcheck/credcheck) 미적용"
     [ -n "$_nov" ] && _b3="${_b3} 사용 기간(VALID UNTIL) 미설정: ${_nov% }"
-    [ -n "$_b3" ] && _kput "D-03" "취약" "비밀번호 정책 미적용:${_b3}" || _kput "D-03" "양호" "복잡도 모듈(${_spl}) 적용, 비밀번호 역할 전부 사용 기간 설정"
+    if [ -n "$_b3" ]; then _kput "D-03" "취약" "비밀번호 정책 미적용:${_b3}"
+    elif [ -z "$_roles" ]; then _kput "D-03" "수동확인" "복잡도 모듈(${_spl}) 적용 / 역할별 사용 기간(VALID UNTIL)은 $_nor"
+    else _kput "D-03" "양호" "복잡도 모듈(${_spl}) 적용, 비밀번호 역할 전부 사용 기간 설정"; fi
 
     # D-04 관리자 권한
     local _adm; _adm=$(echo "$_roles" | awk -F'|' '$1!="postgres" && ($3=="t" || $4=="t") {print $1"("($3=="t"?"SUPERUSER":"CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS")")"}' | tr '\n' ' ')
     evd_q "D-04" "postgres 외 관리 권한 역할" "${_adm:-없음}"
-    [ -n "$_adm" ] && _kput "D-04" "수동확인" "postgres 외 관리자 권한 역할: ${_adm}- 필요성 확인 (불필요 시 취약)" || _kput "D-04" "양호" "관리자 권한이 postgres 에만 부여"
+    if [ -z "$_roles" ]; then _kput "D-04" "수동확인" "$_nor"
+    elif [ -n "$_adm" ]; then _kput "D-04" "수동확인" "postgres 외 관리자 권한 역할: ${_adm}- 필요성 확인 (불필요 시 취약)"
+    else _kput "D-04" "양호" "관리자 권한이 postgres 에만 부여"; fi
 
     _KNA D-05
     evd_q "D-06" "로그인 가능 역할" "${_login:-없음}"
-    _kput "D-06" "수동확인" "로그인 가능 역할: ${_login:-없음}- 사용자·응용프로그램별 개별 계정 사용 여부(공용 계정 사용 시 취약) 확인"
+    _kput "D-06" "수동확인" "로그인 가능 역할: ${_login:-$_nor}- 사용자·응용프로그램별 개별 계정 사용 여부(공용 계정 사용 시 취약) 확인"
     _KNA D-07
 
     # D-08 SCRAM-SHA-256
@@ -2121,20 +2193,26 @@ kisa_pgsql() {
     evd_q "D-08" "password_encryption / MD5 해시 역할" "${_pe} / ${_md5:-없음}"
     if [ -n "$_md5" ]; then _kput "D-08" "취약" "SHA-256 미만(MD5) 해시 비밀번호 역할: ${_md5% } (password_encryption=${_pe})"
     elif [ "$_pe" = "md5" ]; then _kput "D-08" "취약" "password_encryption=md5 (신규 비밀번호가 MD5 로 저장)"
+    elif [ -z "$_roles" ]; then _kput "D-08" "수동확인" "password_encryption=${_pe} / 저장된 역할 비밀번호 해시는 $_nor"
     else _kput "D-08" "양호" "password_encryption=${_pe}, 저장 비밀번호 SCRAM-SHA-256"; fi
 
     _KNA D-09
     # D-10 원격 접속 제한 (listen_addresses + pg_hba 전체 허용 규칙)
     local _la _open; _la=$(run_q "SHOW listen_addresses;")
-    _open=$(echo "$_hba" | awk '$1 ~ /^host/ && ($4 ~ /^(0\.0\.0\.0\/0|::\/0|0\.0\.0\.0\/0\.0\.0\.0|all)$/ || $4 ~ /^0\.0\.0\.0\/0/)')
+    _open=$(echo "$_hba" | awk '$1 ~ /^host/ && $NF!="reject" && ($4 ~ /^(0\.0\.0\.0\/0|::\/0|::\/::|::0\/::0|0\.0\.0\.0\/0\.0\.0\.0|all)$/ || $4 ~ /^0\.0\.0\.0\/0/)')   # pg_hba_file_rules 는 ::/0 을 '::' + netmask '::' 로 표시
     evd_q "D-10" "listen_addresses / 전체 대역 허용 pg_hba 규칙" "${_la} / ${_open:-없음}"
-    if [ -n "$_open" ] && [ "$_la" != "localhost" ]; then _kput "D-10" "취약" "모든 IP 에서 접속 허용 (listen_addresses=${_la}, pg_hba: $(echo "$_open" | tr '\n' ',' | sed 's/,$//'))"
+    if [ -z "$_hba" ] && ! _pg_local_listen "$_la"; then _kput "D-10" "수동확인" "pg_hba_file_rules 조회 불가(슈퍼유저 권한 필요) - listen_addresses=${_la}, pg_hba.conf 접속 허용 대역 수동 확인"
+    elif [ -n "$_open" ] && ! _pg_local_listen "$_la"; then _kput "D-10" "취약" "모든 IP 에서 접속 허용 (listen_addresses=${_la}, pg_hba: $(echo "$_open" | tr '\n' ',' | sed 's/,$//'))"
     else _kput "D-10" "양호" "지정 IP 에서만 접속 허용 (listen_addresses=${_la}$( [ -n "$_open" ] && echo ', 전체 허용 규칙 있으나 로컬 수신만'))"; fi
 
     # D-11 시스템 테이블 접근 (pg_catalog·information_schema 테이블에 개별 역할 권한 부여)
-    local _st; _st=$(run_q "SELECT DISTINCT grantee||'('||table_schema||'.'||table_name||':'||privilege_type||')' FROM information_schema.role_table_grants WHERE table_schema IN ('pg_catalog','information_schema') AND grantee NOT IN ('PUBLIC','postgres') AND grantee NOT LIKE 'pg\\_%' AND grantee NOT IN (SELECT rolname FROM pg_roles WHERE rolsuper) LIMIT 20;" | tr '\n' ' ')
-    evd_q "D-11" "시스템 스키마 테이블 권한 (PUBLIC·슈퍼유저 제외)" "${_st:-없음}"
-    [ -n "$_st" ] && _kput "D-11" "취약" "DBA 외 역할에 시스템 테이블 권한 부여: ${_st% }" || _kput "D-11" "양호" "시스템 테이블 권한이 DBA 에만 부여 (PUBLIC 기본 카탈로그 조회 권한 제외)"
+    local _st _stf; _st=$(_pg_each "SELECT DISTINCT grantee||'('||table_schema||'.'||table_name||':'||privilege_type||')' FROM information_schema.role_table_grants WHERE table_schema IN ('pg_catalog','information_schema') AND grantee NOT IN ('PUBLIC','postgres') AND grantee NOT LIKE 'pg\\_%' AND grantee NOT IN (SELECT rolname FROM pg_roles WHERE rolsuper) LIMIT 20;")
+    _stf=$(echo "$_st" | sed -n 's/^#FAIL://p' | tr '\n' ' '); _st=$(echo "$_st" | grep -v '^#FAIL:' | tr '\n' ' ')
+    evd_q "D-11" "시스템 스키마 테이블 권한 (PUBLIC·슈퍼유저 제외, DB:역할(…))" "${_st:-없음}${_stf:+ / 조회 실패 DB: $_stf}"
+    if [ -n "${_st// /}" ]; then _kput "D-11" "취약" "DBA 외 역할에 시스템 테이블 권한 부여: ${_st% }"
+    elif [ -n "$_stf" ]; then _kput "D-11" "수동확인" "접속·조회 실패 DB(${_stf% }) - 시스템 테이블 권한 수동 확인 (나머지 DB 는 DBA 에만 부여)"
+    elif [ "$_PG_SU" != "on" ]; then _kput "D-11" "수동확인" "점검 계정 슈퍼유저 아님 - information_schema 권한 뷰가 본인 관련 권한만 표시하므로 시스템 테이블 권한 수동 확인"
+    else _kput "D-11" "양호" "시스템 테이블 권한이 DBA 에만 부여 (PUBLIC 기본 카탈로그 조회 권한 제외, 전 DB)"; fi
 
     _KNA D-12 D-13
     # D-14 주요 설정 파일 권한 (postgresql.conf·pg_hba.conf·pg_ident.conf·.psql_history: 일반 사용자 수정 권한 제거)
@@ -2142,15 +2220,18 @@ kisa_pgsql() {
     for _hf in /root/.psql_history /var/lib/pgsql/.psql_history /var/lib/postgresql/.psql_history; do [ -f "$_hf" ] && _cf="${_cf} ${_hf}"; done
     evd "D-14" "ls -lL $_cf 2>/dev/null"
     _w=$(_kisa_perm_w $_cf)
-    if [ -z "${_cf// /}" ]; then _kput "D-14" "수동확인" "설정 파일 경로 조회 불가"
-    elif [ -n "$_w" ]; then _kput "D-14" "취약" "설정 파일에 그룹·일반 사용자 수정 권한: ${_w}"
+    if [ -n "$_w" ]; then _kput "D-14" "취약" "설정 파일에 그룹·일반 사용자 수정 권한: ${_w}"
+    elif ! echo "$_cf" | grep -q 'postgresql\.conf\|\.conf'; then _kput "D-14" "수동확인" "설정 파일 경로 조회 불가(슈퍼유저·pg_read_all_settings 필요) - postgresql.conf·pg_hba.conf·pg_ident.conf 권한 수동 확인"
     else _kput "D-14" "양호" "설정 파일 일반 사용자 수정 권한 없음 ($(for f in $_cf; do [ -e "$f" ] && printf '%s(%s) ' "$f" "$(get_perm "$f")"; done | sed 's/ $//'); 가이드 권고 640 이하·.psql_history 600)"; fi
 
     _KNA D-15 D-16 D-17 D-18 D-19
     # D-20 Object Owner 제한 (슈퍼유저 외 소유 객체)
-    local _ow; _ow=$(run_q "SELECT r.rolname||'('||count(*)||')' FROM pg_class c JOIN pg_roles r ON r.oid=c.relowner WHERE NOT r.rolsuper GROUP BY r.rolname ORDER BY 1;" | tr '\n' ' ')
-    evd_q "D-20" "슈퍼유저 외 Object Owner (pg_class)" "${_ow:-없음}"
-    [ -n "$_ow" ] && _kput "D-20" "취약" "일반 사용자 소유 Object 존재: ${_ow% } - 가이드: Object Owner 를 관리자 계정으로 제한" || _kput "D-20" "양호" "Object Owner 가 관리자(슈퍼유저)로 제한"
+    local _ow _owf; _ow=$(_pg_each "SELECT r.rolname||'('||count(*)||')' FROM pg_class c JOIN pg_roles r ON r.oid=c.relowner WHERE NOT r.rolsuper GROUP BY r.rolname ORDER BY 1;")
+    _owf=$(echo "$_ow" | sed -n 's/^#FAIL://p' | tr '\n' ' '); _ow=$(echo "$_ow" | grep -v '^#FAIL:' | tr '\n' ' ')
+    evd_q "D-20" "슈퍼유저 외 Object Owner (pg_class, DB:역할(객체 수))" "${_ow:-없음}${_owf:+ / 조회 실패 DB: $_owf}"
+    if [ -n "${_ow// /}" ]; then _kput "D-20" "취약" "일반 사용자 소유 Object 존재: ${_ow% } - 가이드: Object Owner 를 관리자 계정으로 제한"
+    elif [ -n "$_owf" ]; then _kput "D-20" "수동확인" "접속·조회 실패 DB(${_owf% }) - Object Owner 수동 확인 (나머지 DB 는 관리자 소유)"
+    else _kput "D-20" "양호" "Object Owner 가 관리자(슈퍼유저)로 제한 (전 DB)"; fi
 
     _KNA D-21 D-22 D-23 D-24
     _kisa_d25
