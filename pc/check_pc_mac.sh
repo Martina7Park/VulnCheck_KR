@@ -63,9 +63,13 @@ urd() {
 }
 # 로컬 포트 리슨 여부 (비root 에서도 가능): 열려 있으면 서비스가 켜진 것
 port_open() { nc -z -w 1 127.0.0.1 "$1" >/dev/null 2>&1; }
-# svc_state <launchd 라벨> <포트>: on / off / unk  (root: launchctl 적재 여부, 비root: 포트가 열려 있으면 on, 아니면 unk)
+# have <명령>: 명령이 있는지 (없으면 그 사실을 '점검불가' 사유로 쓰고, 빈 출력을 양호/취약으로 오판하지 않는다)
+have() { command -v "$1" >/dev/null 2>&1; }
+# svc_state <launchd 라벨> <포트>: on / off / unk  (root: launchctl 적재 여부, 비root: 포트가 열려 있으면 on, 아니면 unk; launchctl 이 없으면 unk)
 svc_state() {
-    if [ "$IS_ROOT" -eq 1 ]; then
+    if [ "$IS_ROOT" -eq 1 ] && ! have launchctl; then
+        echo unk
+    elif [ "$IS_ROOT" -eq 1 ]; then
         if launchctl list 2>/dev/null | awk -v l="$1" '$3==l{f=1} END{exit f?0:1}'; then echo on; else echo off; fi
     else
         if [ -n "$2" ] && port_open "$2"; then echo on; else echo unk; fi
@@ -100,8 +104,9 @@ cloud_info() {
         loc=$(echo "$az" | sed -n 's/.*"location"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | awk 'NR==1')
         echo "Azure (vmId ${vm:-미확인}, region ${loc:-미확인})"; return
     fi
-    g=$(curl -s -m 2 --connect-timeout 2 -H "Metadata-Flavor: Google" "$base/computeMetadata/v1/instance/id" 2>/dev/null)
-    if [ -n "$g" ] && ! echo "$g" | grep -qi '<html'; then
+    g=$(curl -s -f -m 2 --connect-timeout 2 -H "Metadata-Flavor: Google" "$base/computeMetadata/v1/instance/id" 2>/dev/null)
+    # GCP 인스턴스 ID 는 숫자 — 프록시·캡티브 포털의 오류 문구를 GCP 로 오인하지 않도록 숫자만 인정
+    if [ -n "$g" ] && ! echo "$g" | grep -q '[^0-9]'; then
         z=$(curl -s -m 2 --connect-timeout 2 -H "Metadata-Flavor: Google" "$base/computeMetadata/v1/instance/zone" 2>/dev/null | awk -F/ '{print $NF}')
         echo "GCP (instance $g, zone ${z:-미확인})"; return
     fi
@@ -136,8 +141,11 @@ evq() {
 }
 # result 는 항상 0 을 반환 — `조건 && result A || result B` 에서 B 가 중복 출력되지 않도록
 result() {
-    echo "$1"
-    local _r="${1#*|}"; _r="${_r%%|*}"
+    # 결과는 항목당 정확히 1줄 — 명령 출력(csrutil·fdesetup 등 여러 줄)이 근거에 섞여도 줄바꿈·탭을 공백으로 접는다
+    local _m _r
+    _m=$(printf '%s' "$1" | tr '\r\n\t' '   ' | sed 's/  */ /g;s/ $//')
+    echo "$_m"
+    _r="${_m#*|}"; _r="${_r%%|*}"
     case "$_r" in
     양호)     _CP=$((_CP+1)) ;;
     취약)     _CF=$((_CF+1)) ;;
@@ -145,7 +153,7 @@ result() {
     점검불가) _CU=$((_CU+1)) ;;
     N-A)      _CN=$((_CN+1)) ;;
     esac
-    printf '[판정] %s\n\n' "$1" >> "$_EVD"
+    printf '[판정] %s\n\n' "$_m" >> "$_EVD"
     return 0
 }
 
@@ -201,16 +209,20 @@ fi
 
 # ── PC-02: 패스워드 정책 ──────────────────────────────────────────
 evd "PC-02" "pwpolicy getaccountpolicies"
-pw_policy=$(pwpolicy getaccountpolicies 2>/dev/null)
-if [ -n "$pw_policy" ] && echo "$pw_policy" | grep -q "policyAttribute"; then
-    # 기준(PC-02 개선방안): 최소 길이 8자 이상, 최대 사용기간 90일 이하
-    # 최소 길이: policyContent "matches '.{8,}+'" 또는 policyParameters <key>minimumLength</key><integer>N
-    min_len=$(echo "$pw_policy" | grep -oE "matches '\.\{[0-9]+," | grep -oE '[0-9]+' | awk 'NR==1')
-    [ -z "$min_len" ] && min_len=$(echo "$pw_policy" | tr -d '\n\t ' | grep -oE '<key>minimumLength</key><integer>[0-9]+' | grep -oE '[0-9]+$' | awk 'NR==1')
-    # 만료: policyParameters <key>policyAttributeExpiresEveryNDays</key><integer>N (분 단위 ...EveryNMinutes 대비)
-    exp_days=$(echo "$pw_policy" | tr -d '\n\t ' | grep -oE '<key>policyAttributeExpiresEveryNDays</key><integer>[0-9]+' | grep -oE '[0-9]+$' | awk 'NR==1')
-    [ -z "$exp_days" ] && { m=$(echo "$pw_policy" | tr -d '\n\t ' | grep -oE '<key>policyAttributeExpiresEveryNMinutes</key><integer>[0-9]+' | grep -oE '[0-9]+$' | awk 'NR==1'); [ -n "$m" ] && exp_days=$(( m / 1440 )); }
-    evq "PC-02" "pwpolicy 에서 추출한 값 (최소 길이 / 만료 일수)" "min_len=${min_len:-미확인} exp_days=${exp_days:-미설정}"
+evd "PC-02" "profiles -P -o stdout"
+pw_policy=$(pwpolicy getaccountpolicies 2>/dev/null); pw_rc=$?
+prof=""; [ "$IS_ROOT" -eq 1 ] && prof=$(profiles -P -o stdout 2>/dev/null)
+# 기준(PC-02 개선방안): 최소 길이 8자 이상, 최대 사용기간 90일 이하
+# 최소 길이: policyContent "matches '.{8,}+'" 또는 policyParameters <key>minimumLength</key><integer>N, 구성 프로파일 minLength
+min_len=$(echo "$pw_policy" | grep -oE "matches '\.\{[0-9]+," | grep -oE '[0-9]+' | awk 'NR==1')
+[ -z "$min_len" ] && min_len=$(echo "$pw_policy" | tr -d '\n\t ' | grep -oE '<key>minimumLength</key><integer>[0-9]+' | grep -oE '[0-9]+$' | awk 'NR==1')
+[ -z "$min_len" ] && min_len=$(echo "$prof" | grep -iE '(^|[[:space:]])minLength[[:space:]]*=' | grep -oE '[0-9]+' | sort -n | tail -1)
+# 만료: policyParameters <key>policyAttributeExpiresEveryNDays</key><integer>N (분 단위 ...EveryNMinutes 대비), 구성 프로파일 maxPINAgeInDays
+exp_days=$(echo "$pw_policy" | tr -d '\n\t ' | grep -oE '<key>policyAttributeExpiresEveryNDays</key><integer>[0-9]+' | grep -oE '[0-9]+$' | awk 'NR==1')
+[ -z "$exp_days" ] && { m=$(echo "$pw_policy" | tr -d '\n\t ' | grep -oE '<key>policyAttributeExpiresEveryNMinutes</key><integer>[0-9]+' | grep -oE '[0-9]+$' | awk 'NR==1'); [ -n "$m" ] && exp_days=$(( m / 1440 )); }
+[ -z "$exp_days" ] && exp_days=$(echo "$prof" | grep -iE 'maxPINAgeInDays' | grep -oE '[0-9]+' | awk 'NR==1')
+if echo "$pw_policy" | grep -q "policyAttribute" || [ -n "$min_len" ] || [ -n "$exp_days" ]; then
+    evq "PC-02" "pwpolicy·구성 프로파일에서 추출한 값 (최소 길이 / 만료 일수)" "min_len=${min_len:-미확인} exp_days=${exp_days:-미설정}"
     desc="최소 길이=${min_len:-미확인}자, 만료=${exp_days:-미설정}일"
     if [ -n "$min_len" ] && [ "$min_len" -ge 8 ] && [ -n "$exp_days" ] && [ "$exp_days" -gt 0 ] && [ "$exp_days" -le 90 ]; then
         result "PC-02|양호|패스워드 정책 적용: ${desc}"
@@ -219,9 +231,12 @@ if [ -n "$pw_policy" ] && echo "$pw_policy" | grep -q "policyAttribute"; then
     else
         result "PC-02|수동확인|패스워드 정책 일부 확인 불가: ${desc} — MDM/프로파일 정책 확인"
     fi
+elif [ "$IS_ROOT" -eq 1 ] && [ "$pw_rc" -eq 0 ]; then
+    evq "PC-02" "판정에 사용한 값" "pwpolicy 종료코드=${pw_rc} 정책(policyAttribute) 없음, 구성 프로파일 암호 정책 없음"
+    result "PC-02|취약|패스워드 정책 미설정 (pwpolicy 계정 정책·구성 프로파일에 암호 길이/만료 정책 없음)"
 else
     if [ "$IS_ROOT" -eq 1 ]; then
-        result "PC-02|점검불가|패스워드 정책(pwpolicy getaccountpolicies) 조회 결과 없음 - MDM/프로파일 기반 정책이면 수동 확인"
+        result "PC-02|점검불가|패스워드 정책(pwpolicy getaccountpolicies) 조회 실패 (종료코드 ${pw_rc}) - MDM/프로파일 기반 정책이면 수동 확인"
     else
         result "PC-02|점검불가|패스워드 정책(pwpolicy) 조회 불가: ${NEED_ROOT}"
     fi
@@ -233,10 +248,14 @@ evd "PC-03" "urd read com.apple.screensaver askForPasswordDelay"
 evd "PC-03" "urd -currentHost read com.apple.screensaver idleTime"
 evd "PC-03" "sysadminctl -screenLock status"
 evd "PC-03" "pmset -g custom"
-if [ "$IS_ROOT" -eq 1 ] && [ -z "$TUSER" ]; then
+if ! have defaults; then
+    result "PC-03|점검불가|defaults 명령이 없어 화면 잠금 설정을 읽을 수 없음"
+elif [ "$IS_ROOT" -eq 1 ] && [ -z "$TUSER" ]; then
     result "PC-03|점검불가|콘솔에 로그인한 사용자가 없어 사용자 화면 잠금 설정을 읽을 수 없음 (SUDO_USER·콘솔 사용자 없음)"
 else
     ask_pw=$(urd read com.apple.screensaver askForPassword)
+    # 키가 없으면(macOS 13+ 기본 설정 등) sysadminctl -screenLock 상태로 보조 판정
+    sa_lock=""; if [ -z "$ask_pw" ]; then sa_lock=$(if [ "$IS_ROOT" -eq 1 ]; then sudo -n -H -u "$TUSER" sysadminctl -screenLock status 2>&1; else sysadminctl -screenLock status 2>&1; fi); echo "$sa_lock" | grep -qiE 'immediate|delay is [0-9]+' && ask_pw=1; fi
     ask_delay=$(urd read com.apple.screensaver askForPasswordDelay)
     ss_idle=$(urd -currentHost read com.apple.screensaver idleTime)
     # 배터리·AC 모두 확인: 하나라도 0(끄지 않음)이면 0, 아니면 최댓값
@@ -246,6 +265,7 @@ else
         if [ "$v" = "0" ]; then display_sleep=0; break; fi
         { [ -z "$display_sleep" ] || [ "$v" -gt "$display_sleep" ]; } 2>/dev/null && display_sleep=$v
     done
+    [ -n "$sa_lock" ] && evq "PC-03" "askForPassword 키가 없어 sysadminctl -screenLock status 로 보조 판정" "$sa_lock"
     evq "PC-03" "판정에 사용한 값 (대상 사용자=${TUSER}) askForPassword / askForPasswordDelay / screensaver idleTime(초) / displaysleep(분, 배터리·AC 중 최악)" "askForPassword=${ask_pw:-미설정} askForPasswordDelay=${ask_delay:-미설정} idleTime=${ss_idle:-미설정} displaysleep=${display_sleep:-미확인}"
     ss_ok=0; { [ -n "$ss_idle" ] && [ "$ss_idle" -gt 0 ] && [ "$ss_idle" -le 600 ]; } 2>/dev/null && ss_ok=1
     ds_ok=0; { [ -n "$display_sleep" ] && [ "$display_sleep" -gt 0 ] && [ "$display_sleep" -le 10 ]; } 2>/dev/null && ds_ok=1
@@ -266,11 +286,13 @@ evd "PC-04" "launchctl list"
 evd "PC-04" "nc -z -w 1 127.0.0.1 445 && echo 'port 445 open' || echo 'port 445 closed'; nc -z -w 1 127.0.0.1 548 && echo 'port 548 open' || echo 'port 548 closed'"
 smb=$(svc_state com.apple.smbd 445)
 afp=$(svc_state com.apple.AppleFileServer 548)
-shared_list=$(sharing -l 2>/dev/null | grep "name:" | sed 's/.*name:[[:space:]]*//' | tr '\n' ',' | sed 's/,$//')
+shared_list=$(sharing -l 2>/dev/null | sed -n 's/^name:[[:space:]]*//p' | awk '!s[$0]++' | tr '\n' ',' | sed 's/,$//')
 if [ "$smb" = "on" ] || [ "$afp" = "on" ]; then
     result "PC-04|취약|파일 공유 활성: $([ "$smb" = on ] && echo 'SMB ')$([ "$afp" = on ] && echo 'AFP ')공유=${shared_list:-목록 조회 불가($([ "$IS_ROOT" -eq 1 ] || echo "$NEED_ROOT"))}"
-elif [ "$IS_ROOT" -eq 1 ]; then
+elif [ "$IS_ROOT" -eq 1 ] && [ "$smb" = "off" ] && [ "$afp" = "off" ]; then
     result "PC-04|양호|파일 공유 서비스(SMB/AFP) 비활성 (launchctl 시스템 도메인 기준)"
+elif [ "$IS_ROOT" -eq 1 ]; then
+    result "PC-04|점검불가|파일 공유 서비스 상태 조회 불가: launchctl 명령 없음/조회 실패"
 else
     result "PC-04|점검불가|파일 공유 서비스 상태 조회 불가: ${NEED_ROOT} (로컬 포트 445/548 은 닫혀 있으나 launchctl 시스템 도메인을 볼 수 없어 단정 불가)"
 fi
@@ -288,7 +310,11 @@ done
 if [ -n "$bad_svc" ]; then
     result "PC-05|취약|실행 중 불필요 서비스:${bad_svc}"
 elif [ "$unk_svc" -eq 1 ]; then
-    result "PC-05|점검불가|불필요 서비스 적재 여부 조회 불가: ${NEED_ROOT} (포트 리슨 확인된 서비스 없음)"
+    if [ "$IS_ROOT" -eq 1 ]; then
+        result "PC-05|점검불가|불필요 서비스 적재 여부 조회 불가: launchctl 명령 없음/조회 실패 (root 실행)"
+    else
+        result "PC-05|점검불가|불필요 서비스 적재 여부 조회 불가: ${NEED_ROOT} (포트 리슨 확인된 서비스 없음)"
+    fi
 else
     result "PC-05|양호|불필요 서비스 미실행 (화면공유/VNC/TFTP/BOOTP/FTP 등)"
 fi
@@ -319,7 +345,9 @@ auto_check=$(defaults read "/Library/Managed Preferences/com.apple.SoftwareUpdat
 [ -z "$auto_check" ] && auto_check=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null)
 auto_install=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null)
 crit_install=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall 2>/dev/null)
-if [ "$auto_check" = "0" ]; then
+if ! have defaults; then
+    result "PC-07|점검불가|defaults 명령이 없어 자동 업데이트 설정을 읽을 수 없음"
+elif [ "$auto_check" = "0" ]; then
     result "PC-07|취약|자동 업데이트 비활성 (AutomaticCheckEnabled=0)"
 else
     # 키가 없으면 macOS 기본값(자동 확인 사용) 적용
@@ -367,7 +395,11 @@ evd "PC-10" "ps -axo comm"
 evd "PC-10" "nc -z -w 1 127.0.0.1 22 && echo 'port 22 open' || echo 'port 22 closed'; nc -z -w 1 127.0.0.1 5900 && echo 'port 5900 open' || echo 'port 5900 closed'"
 issues10=""; unk10=0
 if [ "$IS_ROOT" -eq 1 ]; then
-    systemsetup -getremotelogin 2>/dev/null | grep -qi ': on' && issues10="${issues10} SSH활성"
+    rl=$(systemsetup -getremotelogin 2>&1)
+    if echo "$rl" | grep -qiE 'Remote Login:[[:space:]]*On'; then issues10="${issues10} SSH활성"
+    elif echo "$rl" | grep -qiE 'Remote Login:[[:space:]]*Off'; then :
+    elif launchctl list 2>/dev/null | awk '$3=="com.openssh.sshd"{f=1} END{exit f?0:1}' || port_open 22; then issues10="${issues10} SSH활성(launchd/포트22)"
+    else unk10=1; rl_err="systemsetup -getremotelogin 결과 판독 불가: $rl"; fi
     svc_state com.apple.screensharing 5900 | grep -q on && issues10="${issues10} 화면공유활성"
 else
     port_open 22 && issues10="${issues10} SSH활성(포트22 리슨)" || unk10=1
@@ -377,7 +409,11 @@ ps -axo comm 2>/dev/null | awk -F/ '$NF=="ARDAgent"{f=1} END{exit f?0:1}' && iss
 if [ -n "$issues10" ]; then
     result "PC-10|취약|원격 접속 서비스 활성:${issues10}"
 elif [ "$unk10" -eq 1 ]; then
-    result "PC-10|점검불가|원격 로그인(SSH)/화면공유 설정 조회 불가: ${NEED_ROOT} (systemsetup·launchctl 시스템 도메인 필요; 로컬 포트 22/5900 닫힘, ARD 프로세스 없음)"
+    if [ "$IS_ROOT" -eq 1 ]; then
+        result "PC-10|점검불가|원격 로그인(SSH) 설정 조회 불가: ${rl_err} (터미널에 전체 디스크 접근 권한이 필요할 수 있음; launchd 미적재, 포트 22 닫힘)"
+    else
+        result "PC-10|점검불가|원격 로그인(SSH)/화면공유 설정 조회 불가: ${NEED_ROOT} (systemsetup·launchctl 시스템 도메인 필요; 로컬 포트 22/5900 닫힘, ARD 프로세스 없음)"
+    fi
 else
     result "PC-10|양호|원격 로그인(SSH)/원격관리/화면공유 모두 비활성"
 fi
@@ -401,7 +437,10 @@ evd "PC-13" "defaults read /Library/Preferences/com.apple.loginwindow GuestEnabl
 evd "PC-13" "sysadminctl -guestAccount status"
 guest_enabled=$(defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled 2>/dev/null)
 sa_guest=$(sysadminctl -guestAccount status 2>&1)
-if [ "$guest_enabled" = "1" ] || [ "$guest_enabled" = "true" ] || echo "$sa_guest" | grep -qi 'enabled'; then
+sa_guest=$(echo "$sa_guest" | sed 's/^[0-9-]* [0-9:.]* sysadminctl\[[0-9:]*\] //')   # 시각·프로세스 접두 제거(원문은 증적에)
+if ! have defaults; then
+    result "PC-13|점검불가|defaults 명령이 없어 Guest 계정 설정을 읽을 수 없음"
+elif [ "$guest_enabled" = "1" ] || [ "$guest_enabled" = "true" ] || echo "$sa_guest" | grep -qi 'enabled'; then
     result "PC-13|취약|Guest 계정 활성화됨 (GuestEnabled=${guest_enabled:-미설정}; ${sa_guest})"
 else
     result "PC-13|양호|Guest 계정 비활성 (GuestEnabled=${guest_enabled:-미설정(기본 비활성)})"
@@ -409,15 +448,19 @@ fi
 
 # ── PC-14: SIP(System Integrity Protection) ───────────────────────
 evd "PC-14" "csrutil status"
-sip_status=$(csrutil status 2>&1)
-if [ -z "$sip_status" ]; then
-    result "PC-14|점검불가|csrutil status 조회 실패"
+sip_status=$(csrutil status 2>&1); sip_rc=$?
+sip_dis=$(echo "$sip_status" | grep -iE ':[[:space:]]*disabled' | grep -viE 'status:' | sed 's/^[[:space:]]*//' | tr '\n' ',' | sed 's/,$//')
+sip_head=$(echo "$sip_status" | awk 'NF{print; exit}')
+if [ "$sip_rc" -eq 127 ] || [ -z "$sip_status" ] || echo "$sip_status" | grep -qiE 'command not found|No such file'; then
+    result "PC-14|점검불가|csrutil status 조회 실패 (종료코드 ${sip_rc}): ${sip_head:-출력 없음}"
 elif echo "$sip_status" | grep -qi 'custom configuration'; then
-    result "PC-14|취약|SIP 일부 보호 해제(Custom Configuration): $sip_status"
+    result "PC-14|취약|SIP 일부 보호 해제(Custom Configuration): ${sip_head}${sip_dis:+ — 해제 항목: ${sip_dis}}"
 elif echo "$sip_status" | grep -qiE 'status: enabled\.?$'; then
-    result "PC-14|양호|SIP 활성: $sip_status"
+    result "PC-14|양호|SIP 활성: $sip_head"
+elif echo "$sip_status" | grep -qiE 'status: (disabled|unknown)'; then
+    result "PC-14|취약|SIP 비활성: ${sip_head}"
 else
-    result "PC-14|취약|SIP 비활성: ${sip_status}"
+    result "PC-14|점검불가|csrutil status 출력을 해석하지 못함: ${sip_head}"
 fi
 
 # ── PC-15: 브라우저 보안 (Safari) ──────────────────────────────────
@@ -443,17 +486,23 @@ fi
 
 # ── PC-16: 로그인 실패 임계값 ──────────────────────────────────────
 evd "PC-16" "pwpolicy getaccountpolicies"
-pw16=$(pwpolicy getaccountpolicies 2>/dev/null)
-if [ -z "$pw16" ] || ! echo "$pw16" | grep -q "policyAttribute"; then
-    if [ "$IS_ROOT" -eq 1 ]; then
-        result "PC-16|점검불가|로그인 실패 임계값 조회 불가: pwpolicy getaccountpolicies 결과 없음 - MDM/프로파일 수동 확인"
+evd "PC-16" "profiles -P -o stdout"
+pw16=$(pwpolicy getaccountpolicies 2>/dev/null); pw16_rc=$?
+prof16=""; [ "$IS_ROOT" -eq 1 ] && prof16=$(profiles -P -o stdout 2>/dev/null)
+max_fail=$(echo "$pw16" | tr -d '\n\t ' | grep -oE '<key>policyAttributeMaximumFailedAuthentications</key><integer>[0-9]+' | grep -oE '[0-9]+$' | awk 'NR==1')
+[ -z "$max_fail" ] && max_fail=$(echo "$pw16" | grep -oE 'policyAttributeFailedAuthentications[[:space:]]*<[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | awk 'NR==1')
+[ -z "$max_fail" ] && max_fail=$(echo "$prof16" | grep -iE 'maxFailedAttempts' | grep -oE '[0-9]+' | awk 'NR==1')
+if ! echo "$pw16" | grep -q "policyAttribute" && [ -z "$max_fail" ]; then
+    if [ "$IS_ROOT" -eq 1 ] && [ "$pw16_rc" -eq 0 ]; then
+        evq "PC-16" "판정에 사용한 값" "pwpolicy 종료코드=${pw16_rc} 정책(policyAttribute) 없음, 구성 프로파일 maxFailedAttempts 없음"
+        result "PC-16|취약|로그인 실패 잠금 임계값 미설정 (pwpolicy 계정 정책·구성 프로파일에 잠금 정책 없음)"
+    elif [ "$IS_ROOT" -eq 1 ]; then
+        result "PC-16|점검불가|로그인 실패 임계값 조회 실패: pwpolicy getaccountpolicies 종료코드 ${pw16_rc} - MDM/프로파일 수동 확인"
     else
         result "PC-16|점검불가|로그인 실패 임계값 조회 불가: ${NEED_ROOT}"
     fi
 else
-    max_fail=$(echo "$pw16" | tr -d '\n\t ' | grep -oE '<key>policyAttributeMaximumFailedAuthentications</key><integer>[0-9]+' | grep -oE '[0-9]+$' | awk 'NR==1')
-    [ -z "$max_fail" ] && max_fail=$(echo "$pw16" | grep -oE 'policyAttributeFailedAuthentications[[:space:]]*<[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | awk 'NR==1')
-    evq "PC-16" "pwpolicy 에서 추출한 로그인 실패 허용 횟수" "max_fail=${max_fail:-미설정}"
+    evq "PC-16" "pwpolicy·구성 프로파일에서 추출한 로그인 실패 허용 횟수" "max_fail=${max_fail:-미설정}"
     if [ -z "$max_fail" ]; then
         result "PC-16|취약|로그인 실패 잠금 임계값 미설정 (pwpolicy 정책에 policyAttributeMaximumFailedAuthentications 없음)"
     elif [ "$max_fail" -ge 1 ] && [ "$max_fail" -le 5 ]; then
@@ -475,15 +524,21 @@ fi
 
 # ── PC-18: FileVault (디스크 암호화) ────────────────────────────────
 evd "PC-18" "fdesetup status"
-fv_status=$(fdesetup status 2>&1)
-if [ -z "$fv_status" ]; then
-    result "PC-18|점검불가|fdesetup status 조회 실패"
+fv_status=$(fdesetup status 2>&1); fv_rc=$?
+if [ "$fv_rc" -eq 127 ] || [ -z "$fv_status" ] || echo "$fv_status" | grep -qiE 'command not found|No such file'; then
+    result "PC-18|점검불가|fdesetup status 조회 실패 (종료코드 ${fv_rc}): ${fv_status:-출력 없음}"
+elif echo "$fv_status" | grep -qi 'Decryption in progress'; then
+    result "PC-18|취약|FileVault 복호화 진행 중(해제되는 중): $fv_status"
+elif echo "$fv_status" | grep -qi 'Encryption in progress'; then
+    result "PC-18|수동확인|FileVault 암호화 진행 중(완료 전): $fv_status"
 elif echo "$fv_status" | grep -qi 'FileVault is On'; then
     result "PC-18|양호|FileVault 활성: $fv_status"
-elif echo "$fv_status" | grep -qi 'Encryption in progress'; then
-    result "PC-18|수동확인|FileVault 암호화 진행 중: $fv_status"
 else
-    result "PC-18|취약|FileVault 비활성: ${fv_status}"
+    if echo "$fv_status" | grep -qi 'FileVault is Off'; then
+        result "PC-18|취약|FileVault 비활성: ${fv_status}"
+    else
+        result "PC-18|점검불가|fdesetup status 출력을 해석하지 못함: ${fv_status}"
+    fi
 fi
 
 # ── 요약 ──────────────────────────────────────────────────────────

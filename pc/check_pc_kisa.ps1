@@ -26,7 +26,7 @@
 $ErrorActionPreference = "SilentlyContinue"
 $ProgressPreference    = "SilentlyContinue"
 
-# ── 공통 헬퍼 (PowerShell 2.0 호환: Get-CimInstance/-Raw/[ordered]/-in 등 3.0+ 전용 구문 미사용) ──
+# ── 공통 헬퍼 (PowerShell 2.0 호환: 3.0+ 전용 cmdlet·연산자·문법 미사용 — cmdlet 은 Get-Command 로 존재 확인 후 호출) ──
 # 결과 인코딩: 이 스크립트는 문자열로 출력만 한다. 파일 저장은 run_*.bat 의 `| Out-File -Encoding UTF8`(UTF-8 BOM)로 한다.
 # (콘솔 OutputEncoding 을 UTF-8 로 바꾸면 net/bcdedit 같은 네이티브 명령의 OEM(cp949) 출력이 깨져 한글 라벨 파싱이 실패하므로 바꾸지 않는다.)
 
@@ -44,8 +44,9 @@ function Get-Wmi([string]$Class,[string]$Filter,[string]$Ns) {
     if (-not $Ns) { $Ns = "root\cimv2" }
     $script:wmiOk = $true
     try {
-        if (Get-Command Get-CimInstance -EA SilentlyContinue) {
-            if ($Filter) { Get-CimInstance -Namespace $Ns -ClassName $Class -Filter $Filter -EA Stop } else { Get-CimInstance -Namespace $Ns -ClassName $Class -EA Stop }
+        $cimCmd = Get-Command Get-CimInstance -EA SilentlyContinue   # PS 3.0+ 에만 있음 — 호출 연산자로 간접 호출(PS 2.0 에서는 $null)
+        if ($cimCmd) {
+            if ($Filter) { & $cimCmd -Namespace $Ns -ClassName $Class -Filter $Filter -EA Stop } else { & $cimCmd -Namespace $Ns -ClassName $Class -EA Stop }
         } else {
             if ($Filter) { Get-WmiObject -Namespace $Ns -Class $Class -Filter $Filter -EA Stop } else { Get-WmiObject -Namespace $Ns -Class $Class -EA Stop }
         }

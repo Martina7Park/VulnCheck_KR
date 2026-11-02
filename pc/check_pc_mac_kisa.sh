@@ -55,9 +55,13 @@ urd() {
 }
 # 로컬 포트 리슨 여부 (비root 에서도 가능): 열려 있으면 서비스가 켜진 것
 port_open() { nc -z -w 1 127.0.0.1 "$1" >/dev/null 2>&1; }
-# svc_state <launchd 라벨> <포트>: on / off / unk  (root: launchctl 적재 여부, 비root: 포트가 열려 있으면 on, 아니면 unk)
+# have <명령>: 명령이 있는지 (없으면 그 사실을 '점검불가' 사유로 쓰고, 빈 출력을 양호/취약으로 오판하지 않는다)
+have() { command -v "$1" >/dev/null 2>&1; }
+# svc_state <launchd 라벨> <포트>: on / off / unk  (root: launchctl 적재 여부, 비root: 포트가 열려 있으면 on, 아니면 unk; launchctl 이 없으면 unk)
 svc_state() {
-    if [ "$IS_ROOT" -eq 1 ]; then
+    if [ "$IS_ROOT" -eq 1 ] && ! have launchctl; then
+        echo unk
+    elif [ "$IS_ROOT" -eq 1 ]; then
         if launchctl list 2>/dev/null | awk -v l="$1" '$3==l{f=1} END{exit f?0:1}'; then echo on; else echo off; fi
     else
         if [ -n "$2" ] && port_open "$2"; then echo on; else echo unk; fi
@@ -92,8 +96,9 @@ cloud_info() {
         loc=$(echo "$az" | sed -n 's/.*"location"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | awk 'NR==1')
         echo "Azure (vmId ${vm:-미확인}, region ${loc:-미확인})"; return
     fi
-    g=$(curl -s -m 2 --connect-timeout 2 -H "Metadata-Flavor: Google" "$base/computeMetadata/v1/instance/id" 2>/dev/null)
-    if [ -n "$g" ] && ! echo "$g" | grep -qi '<html'; then
+    g=$(curl -s -f -m 2 --connect-timeout 2 -H "Metadata-Flavor: Google" "$base/computeMetadata/v1/instance/id" 2>/dev/null)
+    # GCP 인스턴스 ID 는 숫자 — 프록시·캡티브 포털의 오류 문구를 GCP 로 오인하지 않도록 숫자만 인정
+    if [ -n "$g" ] && ! echo "$g" | grep -q '[^0-9]'; then
         z=$(curl -s -m 2 --connect-timeout 2 -H "Metadata-Flavor: Google" "$base/computeMetadata/v1/instance/zone" 2>/dev/null | awk -F/ '{print $NF}')
         echo "GCP (instance $g, zone ${z:-미확인})"; return
     fi
@@ -128,8 +133,11 @@ evq() {
 }
 # result 는 항상 0 을 반환 — `조건 && result A || result B` 에서 B 가 중복 출력되지 않도록
 result() {
-    echo "$1"
-    local _r="${1#*|}"; _r="${_r%%|*}"
+    # 결과는 항목당 정확히 1줄 — 명령 출력(csrutil·fdesetup 등 여러 줄)이 근거에 섞여도 줄바꿈·탭을 공백으로 접는다
+    local _m _r
+    _m=$(printf '%s' "$1" | tr '\r\n\t' '   ' | sed 's/  */ /g;s/ $//')
+    echo "$_m"
+    _r="${_m#*|}"; _r="${_r%%|*}"
     case "$_r" in
     양호)     _CP=$((_CP+1)) ;;
     취약)     _CF=$((_CF+1)) ;;
@@ -137,7 +145,7 @@ result() {
     점검불가) _CU=$((_CU+1)) ;;
     N-A)      _CN=$((_CN+1)) ;;
     esac
-    printf '[판정] %s\n\n' "$1" >> "$_EVD"
+    printf '[판정] %s\n\n' "$_m" >> "$_EVD"
     return 0
 }
 
@@ -188,6 +196,16 @@ USERS=$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2>=500 && $1!~/^_/{prin
 POL=$(pwpolicy getaccountpolicies 2>/dev/null)
 POLU=""; [ -n "$TUSER" ] && POLU=$(pwpolicy -u "$TUSER" getaccountpolicies 2>/dev/null)
 PROF=""; [ "$IS_ROOT" -eq 1 ] && PROF=$(profiles -P -o stdout 2>/dev/null)
+# 암호 정책을 읽었는가: root 이고 pwpolicy/profiles 가 응답했거나, 비root 라도 policyAttribute 가 실제로 조회된 경우
+POL_READ=0
+if echo "$POL$POLU" | grep -q "policyAttribute"; then POL_READ=1
+elif [ "$IS_ROOT" -eq 1 ] && [ -n "$POL$POLU$PROF" ]; then POL_READ=1; fi
+# sysonoff <systemsetup 출력> <라벨>: on / off / unk (권한·전체 디스크 접근 부족으로 값을 못 읽으면 unk)
+sysonoff() {
+    if echo "$1" | grep -qiE "$2:[[:space:]]*On"; then echo on
+    elif echo "$1" | grep -qiE "$2:[[:space:]]*Off"; then echo off
+    else echo unk; fi
+}
 
 # ── PC-01 비밀번호의 주기적 변경 (최대 사용 기간 90일 이하) ──
 evd "PC-01" "pwpolicy getaccountpolicies"
@@ -197,7 +215,7 @@ days=$(xint policyAttributeExpiresEveryNDays "$POL$POLU")
 [ -z "$days" ] && { m=$(xint maxMinutesUntilChangePassword "$POL$POLU"); [ -n "$m" ] && days=$((m/1440)); }
 [ -z "$days" ] && days=$(echo "$PROF" | grep -i maxPINAgeInDays | grep -oE '[0-9]+' | awk 'NR==1')
 evq "PC-01" "정책에서 추출한 최대 사용 기간(일) — policyParameters 의 값 요소만 사용" "days=${days:-미설정}"
-if [ -z "$POL$POLU$PROF" ]; then result "PC-01|점검불가|암호 정책 조회 불가(pwpolicy/profiles 결과 없음): ${NEED_ROOT}"
+if [ "$POL_READ" -eq 0 ]; then result "PC-01|점검불가|암호 정책 조회 불가(pwpolicy/profiles 결과 없음): ${NEED_ROOT}"
 elif [ -n "$days" ] && [ "$days" -gt 0 ] && [ "$days" -le 90 ]; then result "PC-01|양호|최대 암호 사용 기간 ${days}일 (90일 이하)"
 elif [ -n "$days" ]; then result "PC-01|취약|최대 암호 사용 기간 ${days}일 (90일 초과 또는 제한 없음)"
 else result "PC-01|취약|최대 암호 사용 기간 미설정(제한 없음) - 암호 정책에 만료 항목 없음"; fi
@@ -222,7 +240,7 @@ mcc=$(echo "$PROF" | grep -iE 'minComplexChars' | grep -oE '[0-9]+' | awk 'NR==1
 [ -n "$mcc" ] && [ "$mcc" -ge 1 ] && sym=1
 cls=$((alpha+num+sym))
 evq "PC-02" "추출한 값 (최소 길이 / 영문 / 숫자 / 특수문자 요구)" "min_len=${ml:-미설정} alpha=$alpha numeric=$num symbol=$sym"
-if [ -z "$ALL" ]; then result "PC-02|점검불가|암호 정책 조회 불가(pwpolicy/profiles 결과 없음): ${NEED_ROOT}"
+if [ "$POL_READ" -eq 0 ]; then result "PC-02|점검불가|암호 정책 조회 불가(pwpolicy/profiles 결과 없음): ${NEED_ROOT}"
 elif [ "${ml:-0}" -ge 8 ] && [ "$cls" -ge 3 ]; then result "PC-02|양호|암호 정책: 최소 ${ml}자, 영문·숫자·특수문자 요구"
 else result "PC-02|취약|암호 복잡성 정책 미흡 (최소 길이=${ml:-미설정}, 요구 문자 종류=${cls}종; 기준: 8자 이상·영문·숫자·특수문자)"; fi
 
@@ -245,6 +263,7 @@ guest=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.smb.ser
 if [ "$guest" = "1" ]; then result "PC-04|취약|파일 공유 게스트 접근 허용 (AllowGuestAccess=1), 공유: ${shares:-목록 조회 불가}"
 elif [ "$IS_ROOT" -eq 1 ]; then
     if [ -n "$gshare" ]; then result "PC-04|취약|공유 폴더 게스트 접근 허용 (비밀번호 없이 접근): ${gshare}"
+    elif [ -z "$shares" ] && [ "$smb" = "unk" ]; then result "PC-04|점검불가|SMB 서비스 상태(launchctl)·공유 목록(sharing -l)을 조회하지 못함 (launchctl/sharing 명령 없음 또는 오류)"
     elif [ -z "$shares" ] && [ "$smb" = "off" ]; then result "PC-04|양호|파일 공유 비활성 (공유 폴더 없음)"
     else result "PC-04|수동확인|파일 공유 사용: ${shares:-공유 목록 없음(SMB 서비스 적재: $smb)} - 불필요 공유 여부·접근 권한 확인"; fi
 else
@@ -256,10 +275,17 @@ evd "PC-05" "systemsetup -getremotelogin"
 evd "PC-05" "systemsetup -getremoteappleevents"
 evd "PC-05" "launchctl list"
 evd "PC-05" "cupsctl"
-bad=""; unk05=0
+bad=""; unk05=0; why05=""
 if [ "$IS_ROOT" -eq 1 ]; then
-    systemsetup -getremotelogin 2>/dev/null | grep -qi ': On' && bad="${bad} 원격 로그인(SSH)"
-    systemsetup -getremoteappleevents 2>/dev/null | grep -qi ': On' && bad="${bad} 원격 Apple 이벤트"
+    rl=$(systemsetup -getremotelogin 2>&1); ra=$(systemsetup -getremoteappleevents 2>&1)
+    st=$(sysonoff "$rl" "Remote Login")
+    if [ "$st" = "unk" ] && { launchctl list 2>/dev/null | awk '$3=="com.openssh.sshd"{f=1} END{exit f?0:1}' || port_open 22; }; then st=on; fi
+    [ "$st" = "on" ] && bad="${bad} 원격 로그인(SSH)"
+    [ "$st" = "unk" ] && { unk05=1; why05="systemsetup -getremotelogin 판독 불가: ${rl}"; }
+    st=$(sysonoff "$ra" "Remote Apple Events")
+    [ "$st" = "on" ] && bad="${bad} 원격 Apple 이벤트"
+    [ "$st" = "unk" ] && { unk05=1; why05="${why05} / systemsetup -getremoteappleevents 판독 불가: ${ra}"; }
+    have launchctl || { unk05=1; why05="${why05} / launchctl 명령 없음"; }
     launchctl list 2>/dev/null | awk '$3=="com.apple.InternetSharing"{f=1} END{exit f?0:1}' && bad="${bad} 인터넷 공유"
     launchctl list 2>/dev/null | awk '$3 ~ /^com\.apple\.(tftpd|ftpd|telnetd|bootpd)$/{f=1} END{exit f?0:1}' && bad="${bad} TFTP/FTP/Telnet/BOOTP"
 else
@@ -270,6 +296,7 @@ fi
 cups=$(cupsctl 2>/dev/null | grep -c '_share_printers=1')
 [ "${cups:-0}" -gt 0 ] && bad="${bad} 프린터 공유"
 if [ -n "$bad" ]; then result "PC-05|취약|불필요한 서비스 사용:${bad} (업무상 필요 시 예외)"
+elif [ "$unk05" -eq 1 ] && [ "$IS_ROOT" -eq 1 ]; then result "PC-05|점검불가|원격 로그인/Apple 이벤트 설정 조회 불가: ${why05} (터미널에 전체 디스크 접근 권한이 필요할 수 있음)"
 elif [ "$unk05" -eq 1 ]; then result "PC-05|점검불가|원격 Apple 이벤트·인터넷 공유·TFTP/FTP 등 시스템 서비스 상태 조회 불가: ${NEED_ROOT} (포트 22 닫힘, 프린터 공유 없음만 확인)"
 else result "PC-05|양호|불필요한 공유·원격 서비스(원격 로그인·Apple 이벤트·인터넷/프린터 공유·TFTP 등) 미사용"; fi
 
@@ -324,7 +351,8 @@ if [ -n "$last" ]; then
     [ -n "$le" ] && age=$(( ($(date '+%s') - le) / 86400 ))
 fi
 evq "PC-10" "자동 업데이트 설정 / 마지막 설치일(softwareupdate --history) / 경과일" "AutomaticCheckEnabled=${ac:-미설정(기본 1)} CriticalUpdateInstall=${cr:-미설정(기본 1)} last=${last:-확인 불가} age_days=${age:-확인 불가}"
-if [ "$ac" = "0" ] || [ "$cr" = "0" ]; then result "PC-10|취약|자동 업데이트 비활성 (AutomaticCheckEnabled=${ac:-기본}, CriticalUpdateInstall=${cr:-기본}) - 최근 설치 ${last:-확인 불가}"
+if ! have defaults; then result "PC-10|점검불가|defaults 명령이 없어 자동 업데이트 설정을 읽을 수 없음"
+elif [ "$ac" = "0" ] || [ "$cr" = "0" ]; then result "PC-10|취약|자동 업데이트 비활성 (AutomaticCheckEnabled=${ac:-기본}, CriticalUpdateInstall=${cr:-기본}) - 최근 설치 ${last:-확인 불가}"
 elif [ -n "$age" ] && [ "$age" -gt 90 ]; then result "PC-10|취약|최근 업데이트 설치일 ${last} 로부터 ${age}일 경과 (90일 초과; 자동 업데이트 설정은 활성)"
 else result "PC-10|양호|자동 업데이트·보안 응답 설치 활성 (AutomaticCheck=${ac:-기본 1}, Critical=${cr:-기본 1}), 최근 설치 ${last:-확인 불가}${age:+ (${age}일 전)} - 내부 관리 절차는 인터뷰 확인"; fi
 
@@ -342,7 +370,8 @@ else result "PC-11|취약|macOS ${OS_VER} - 보안 업데이트 지원 종료 �
 evd "PC-12" "defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser"
 evd "PC-12" "ls -l /etc/kcpassword"
 al=$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)
-if [ -n "$al" ] || [ -f /etc/kcpassword ]; then result "PC-12|취약|자동 로그인 활성 (autoLoginUser=${al:-설정됨}, kcpassword $([ -f /etc/kcpassword ] && echo 존재 || echo 없음))"
+if ! have defaults; then result "PC-12|점검불가|defaults 명령이 없어 자동 로그인 설정을 읽을 수 없음"
+elif [ -n "$al" ] || [ -f /etc/kcpassword ]; then result "PC-12|취약|자동 로그인 활성 (autoLoginUser=${al:-설정됨}, kcpassword $([ -f /etc/kcpassword ] && echo 존재 || echo 없음))"
 else result "PC-12|양호|자동 로그인 비활성"; fi
 
 # ── PC-13 / PC-14 백신 설치·업데이트 / 실시간 감시 ──
@@ -378,7 +407,9 @@ evd "PC-16" "urd read com.apple.screensaver askForPassword"
 evd "PC-16" "urd read com.apple.screensaver askForPasswordDelay"
 evd "PC-16" "urun sysadminctl -screenLock status"
 evd "PC-16" "pmset -g custom"
-if [ "$IS_ROOT" -eq 1 ] && [ -z "$TUSER" ]; then
+if ! have defaults; then
+    result "PC-16|점검불가|defaults 명령이 없어 화면보호기 설정을 읽을 수 없음"
+elif [ "$IS_ROOT" -eq 1 ] && [ -z "$TUSER" ]; then
     result "PC-16|점검불가|콘솔에 로그인한 사용자가 없어 사용자 화면 잠금 설정을 읽을 수 없음"
 else
     idle=$(urd -currentHost read com.apple.screensaver idleTime)
@@ -402,7 +433,9 @@ fi
 
 # ── PC-17 이동식 미디어 자동 실행 방지 ──
 evd "PC-17" "urd read com.apple.digihub"
-if [ "$IS_ROOT" -eq 1 ] && [ -z "$TUSER" ]; then
+if ! have defaults; then
+    result "PC-17|점검불가|defaults 명령이 없어 디스크 삽입 동작 설정을 읽을 수 없음"
+elif [ "$IS_ROOT" -eq 1 ] && [ -z "$TUSER" ]; then
     result "PC-17|점검불가|콘솔에 로그인한 사용자가 없어 디스크 삽입 동작(com.apple.digihub) 설정을 읽을 수 없음"
 else
     dh=$(urd read com.apple.digihub | grep -E 'action' | grep -vE '= 1;')
@@ -420,6 +453,7 @@ ps -axo comm 2>/dev/null | awk -F/ '$NF=="ARDAgent"{f=1} END{exit f?0:1}' && rs=
 tp=$(ps -axo comm 2>/dev/null | awk -F/ '{print $NF}' | grep -iE '^(TeamViewer|AnyDesk|RemoteView|Chrome Remote|remoting_host)' | sort -u | tr '\n' ',' | sed 's/,$//')
 [ -n "$tp" ] && rs="${rs} 원격 지원 프로그램(${tp})"
 if [ -n "$rs" ]; then result "PC-18|취약|원격 지원 기능 사용:${rs}"
+elif [ "$unk18" -eq 1 ] && [ "$IS_ROOT" -eq 1 ]; then result "PC-18|점검불가|화면 공유 서비스 적재 여부 조회 불가: launchctl 명령 없음/조회 실패"
 elif [ "$unk18" -eq 1 ]; then result "PC-18|점검불가|화면 공유 서비스 적재 여부 조회 불가: ${NEED_ROOT} (포트 5900 닫힘, ARD·원격 지원 프로세스 없음만 확인)"
 else result "PC-18|양호|화면 공유·원격 관리·원격 지원 프로그램 미사용"; fi
 
