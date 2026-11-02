@@ -476,8 +476,14 @@ def _fail_condition(std_text):
     return ""
 
 
-def _condense_evidence(evd_text, max_lines=8, width=60):
-    """증적 원문 → 명령/출력 요약 (출력 없는 명령은 '(출력 없음)' 표기)"""
+_LS_LONG_RE = re.compile(r"^([-dlcbps][rwxsStT-]{9}[.+@]?)\s+\d+\s+(\S+)\s+(\S+)\s+[\d,]+\s+\S+\s+\d+\s+[\d:]+\s+(.+)$")
+
+
+def _condense_evidence(evd_text, max_lines=10, width=120):
+    """증적 원문 → 명령/출력 요약 (출력 없는 명령은 '(출력 없음)' 표기)
+    - 긴 줄은 width 에서 자르고 '…' 표시 / ls -l 출력은 '권한 소유자:그룹 경로' 로 줄여 파일명이 잘리지 않게"""
+    def _cut(t):
+        return t if len(t) <= width else t[:width - 1] + "…"
     out, pending_cmd = [], False
     for ln in evd_text.splitlines():
         if not ln.strip() or ln.startswith("[평가대상 아님]"):
@@ -485,10 +491,14 @@ def _condense_evidence(evd_text, max_lines=8, width=60):
         if ln.startswith(("$ ", "# ", "파일: ")):
             if pending_cmd:
                 out.append("  (출력 없음)")
-            out.append(ln[:width])
+            out.append(_cut(ln))
             pending_cmd = True
         else:
-            out.append("  " + ln.strip()[:width])
+            t = ln.strip()
+            m = _LS_LONG_RE.match(t)
+            if m:
+                t = f"{m.group(1)} {m.group(2)}:{m.group(3)} {m.group(4)}"
+            out.append("  " + _cut(t))
             pending_cmd = False
     if pending_cmd:
         out.append("  (출력 없음)")
@@ -3735,7 +3745,7 @@ KISA_GUIDE_CRITERIA = {
              "원격 지원이 \"사용\"으로 설정된 경우",
              "원격 지원 서비스 비활성화"),
     "D-01": ("기본 계정의 초기 비밀번호를 변경하거나 잠금설정한 경우",
-             "기본 계정의 초기 비밀번호 를 변경하지 않거나 잠금설정을 하지 않은 경우",
+             "기본 계정의 초기 비밀번호를 변경하지 않거나 잠금설정을 하지 않은 경우",
              "기본(관리자) 계정의 초기 비밀번호 및 권한 정책 변경"),
     "D-02": ("계정 정보를 확인하여 불필요한 계정이 없는 경우",
              "인가되지 않은 계정, 퇴직자 계정, 테스트 계정 등 불필요한 계정이 존재하는 경우",
@@ -4969,6 +4979,17 @@ CAT_LABEL = {
 # ================================================================
 # 헤더 파싱 헬퍼
 # ================================================================
+_DBMS_NAMES = {"pgsql": "PostgreSQL", "postgresql": "PostgreSQL", "mysql": "MySQL", "mariadb": "MariaDB",
+               "oracle": "Oracle", "tibero": "Tibero", "mssql": "SQL Server", "sqlserver": "SQL Server"}
+
+
+def _dbms_label(kind, ver):
+    """'pgsql' + 'PostgreSQL 13.23 (Debian …) on x86_64-pc-linux-gnu, compiled by …' → 'PostgreSQL 13.23 (Debian …)'"""
+    ver = re.split(r"\s+on\s+\S+-\S+|,\s*compiled by", ver.strip())[0].strip()
+    name = _DBMS_NAMES.get(kind.strip().lower(), kind.strip())
+    return ver if re.match(rf"(microsoft\s+)?{re.escape(name)}", ver, re.I) else f"{name} {ver}"
+
+
 def _parse_header_info(text):
     """결과 파일 헤더에서 호스트명, OS, 점검일시 등 추출"""
     info = {"hostname": "", "os": "", "date": "", "standard": ""}
@@ -5001,7 +5022,7 @@ def _parse_header_info(text):
         elif "버전" in k and not info.get("version"):
             info["version"] = v
     if info.get("dbms") and info.get("version"):
-        info["dbms"] = f"{info['dbms']} {info['version']}"
+        info["dbms"] = _dbms_label(info["dbms"], info["version"])
     if info.get("os_detail"):   # 점검대상 시트 O/S: 배포판 이름·버전 (+커널)
         info["os"] = info["os_detail"] + (f" (커널 {info['kernel']})" if info.get("kernel") else "")
     return info
@@ -6332,7 +6353,8 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
                            if target_row else os_val)
     ws.cell(6, 9).font = FONT_DATA; ws.cell(6, 9).alignment = ctr
     _apply_border(ws, 6, 6, 1, 12)
-    ws.row_dimensions[6].height = 18
+    _osw = sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(os_val))   # O/S 칸(I:L, 약 52자 폭) 줄 수에 맞춰 행 높이 - 긴 OS·DBMS 표기가 잘리지 않게
+    ws.row_dimensions[6].height = max(18, 15 * -(-_osw // 48))
 
     # R7: IP / 용도
     ws.merge_cells("A7:B7"); ws.merge_cells("C7:F7")
@@ -6659,7 +6681,7 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     _add_bad_count_cf(ws, f"G{stat_data_start}:G{layout['stat_total_row']}")
     ws.auto_filter.ref = f"A{hdr_row}:Q{data_row - 1}"
-    ws.freeze_panes = f"A{hdr_row + 1}"
+    # 틀 고정 없음: 상단 시스템 현황·통계(약 21행)가 고정되면 화면이 작을 때 점검 항목이 스크롤되지 않음
 
 
 def _create_vuln_list_sheet(wb, all_results, criteria_items):
@@ -7626,7 +7648,7 @@ def run_eos_check(category, res, text, base_dir):
         res[eos_code] = (worst, combined)
     # DBMS 주요정보 D-25(보안 패치 적용 버전): EoS = 보안 패치 미제공 → 취약, 지원 중이면 패치 적용 여부는 여전히 확인 필요(수동확인 유지)
     if category == "dbms" and res.get("D-25", ("",))[0] == RESULT_MANUAL:
-        _why = res["D-25"][1]
+        _why = res["D-25"][1].replace(" (지원 종료(EoS) 여부는 컨버터가 자동 판정)", "")
         res["D-25"] = ((RESULT_BAD, f"{combined} - 보안 패치가 제공되지 않는 버전") if worst == RESULT_BAD
                        else (RESULT_MANUAL, f"{_why} / {combined}"))
 
