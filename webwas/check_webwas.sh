@@ -5690,7 +5690,7 @@ _kres "WEB-25" "Apache Tomcat Nginx IIS JEUS WebtoB" "$_r"
 
 # ── WEB-26 로그 디렉터리 및 파일 권한 (일반 사용자 접근 권한 없음) ──
 _ld=""
-[ "$WEB_SRV" = apache ] && _ld="$(for _d in /var/log/httpd /var/log/apache2 "$(_apache_root)/logs"; do [ -d "$_d" ] && echo "$_d"; done) $(_active '(ErrorLog|CustomLog)\s' | grep -oE '/[^ "|]+' | grep -vE '/(rotatelogs|cronolog)$' | xargs -n1 dirname 2>/dev/null)"
+[ "$WEB_SRV" = apache ] && _ld="$(for _d in /var/log/httpd /var/log/apache2 "$(_apache_root)/logs"; do [ -d "$_d" ] && echo "$_d"; done) $(_active '(ErrorLog|CustomLog)\s' | sed "s#\${APACHE_LOG_DIR}#$( { grep -hE '^\s*(export\s+)?APACHE_LOG_DIR=' /etc/apache2/envvars 2>/dev/null | tail -1 | cut -d= -f2 | sed 's/\$SUFFIX//' | tr -d "\"' "; } | grep . || echo /var/log/apache2)#g" | grep -oE '(^|[[:space:]"|])/[^ "|]+' | sed 's#^[^/]*##' | grep -vE '/(rotatelogs|cronolog)$' | xargs -n1 dirname 2>/dev/null | grep -vx '/')"   # ${APACHE_LOG_DIR}(Debian/Ubuntu) 치환, 따옴표·파이프(rotatelogs) 형식 포함
 [ "$WEB_SRV" = nginx ] && _ld="$(_ngx '^\s*(access|error)_log\s+/' | awk '{print $2}' | tr -d ';' | xargs -n1 dirname 2>/dev/null) /var/log/nginx"
 [ -n "$TOMCAT_HOME" ] && _ld="${_ld} $TOMCAT_HOME/logs $(ls -d /var/log/tomcat* 2>/dev/null)"
 [ -n "$JEUS_HOME" ] && _ld="${_ld} $(ls -d "$JEUS_HOME"/domains/*/servers/*/logs 2>/dev/null | tr '\n' ' ')"
