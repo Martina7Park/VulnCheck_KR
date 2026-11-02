@@ -471,6 +471,10 @@ def find_evidence_file(result_path):
         h = pm.group(2)
         candidates += [os.path.join(d, f"{h}_pc_kisa_evidence.txt")] if pm.group(1) else \
                       [os.path.join(d, f"{h}_pc_evidence.txt"), os.path.join(d, f"{h}_pc_mac_evidence.txt")]
+    # check_server.sh 사용법 `> <호스트>_server.txt` 의 결과 ↔ 증적 `<호스트>_srv_evidence.txt` (결과 파일명 접미사 _server/_srv 를 바꿔 탐색)
+    sm = re.match(r"^(.+?)_(?:server|srv)$", base, re.I)
+    if sm:
+        candidates += [os.path.join(d, f"{sm.group(1)}_srv_evidence.txt"), os.path.join(d, f"{sm.group(1)}_server_evidence.txt")]
     for c in candidates:
         if os.path.exists(c):
             return c
@@ -2988,7 +2992,8 @@ def build_net_kisa_checks(lines, text):
     r.update(svc("N-28", "TCP/UDP small 서비스", r"^\s*service (tcp|udp)-small-servers?\b"))
     # BOOTP 서버 기본값은 IOS 버전에 따라 다름(구버전 활성) → 명시 설정이 없으면 수동확인 (N-36 과 같이 '설정 없음=임의 가정' 금지)
     if on(r"^\s*ip bootp server\b"):
-        r["N-29"] = (RESULT_BAD, f"BOOTP 서버 활성: {on(r'^\s*ip bootp server\b')}")
+        bootp_line = on(r'^\s*ip bootp server\b')
+        r["N-29"] = (RESULT_BAD, f"BOOTP 서버 활성: {bootp_line}")
     elif on(r"^\s*no ip bootp server\b"):
         r["N-29"] = (RESULT_GOOD, "BOOTP 서버 비활성: no ip bootp server")
     else:
@@ -3013,7 +3018,8 @@ def build_net_kisa_checks(lines, text):
     else:
         r["N-36"] = (RESULT_BAD, "Domain Lookup 기본 활성 (no ip domain-lookup 미설정)")
     if on(r"^\s*service pad\b"):
-        r["N-37"] = (RESULT_BAD, f"PAD 서비스 활성: {on(r'^\s*service pad\b')}")
+        pad_line = on(r'^\s*service pad\b')
+        r["N-37"] = (RESULT_BAD, f"PAD 서비스 활성: {pad_line}")
     elif on(r"^\s*no service pad\b"):
         r["N-37"] = (RESULT_GOOD, "PAD 서비스 비활성: no service pad")
     else:
@@ -7766,8 +7772,7 @@ def _eos_scan_category(category, base_dir):
             brand, model, fw = _net_brand(text)
             mv = re.search(r"^\s*(?:version|JUNOS|Software Version)\s+(\S+)", text, re.M | re.I)
             hinfo["os"] = " ".join(x for x in ((brand or detect_net_vendor(text)), model, (mv.group(1) if mv else fw)) if x)
-            hn = re.search(r"^\s*hostname\s+(\S+)", text, re.M)
-            host = hn.group(1) if hn else os.path.splitext(f)[0]
+            host = _net_hostname(text) or os.path.splitext(f)[0]
             os_disp, kern = hinfo["os"], ""
         else:
             prod, ver, os_disp = _eos_os_from(text, evd)
@@ -7863,6 +7868,31 @@ def _is_placeholder(rv):
     return why.startswith(("스크립트 미점검 항목", "config에서 자동 판단 불가")) or ("에 해당 없는 항목" in why[:60] and rv[0] == RESULT_NA)
 
 
+def _merge_results(old_res, new_res):
+    """같은 호스트의 두 결과를 항목별로 병합.  컨버터가 채운 미점검 값(placeholder)은 실제 판정에 밀리고,
+    둘 다 실제 판정이면 parse_pipe 와 같은 순위(취약 > 점검불가 > 수동확인 > 양호 > N-A)로 더 나쁜 판정을 남기며 근거를 합친다.
+    반환: (병합 결과, 새 쪽 값이 채택된 항목코드 집합)"""
+    merged, from_new = dict(old_res), set()
+    for c, v in new_res.items():
+        if c not in merged or _is_placeholder(merged[c]):
+            merged[c] = v; from_new.add(c)
+        elif _is_placeholder(v):
+            continue
+        else:
+            ov = merged[c]
+            if ov == v:
+                continue
+            ow, nw = ov[1] or "", v[1] or ""
+            if ov[0] != v[0]:
+                ow = ow if ow.startswith("[") else f"[{ov[0]}] {ow}"
+                nw = f"[{v[0]}] {nw}"
+            if RESULT_RANK.get(v[0], 0) > RESULT_RANK.get(ov[0], 0):
+                merged[c] = (v[0], f"{nw} / {ow}"); from_new.add(c)
+            else:
+                merged[c] = (ov[0], f"{ow} / {nw}")
+    return merged, from_new
+
+
 class _HostSet:
     """변환 대상 호스트 모음.  같은 '점검 대상' 의 결과 파일이 여럿일 때:
       - 서로 다른 항목 집합(전자금융 SRV + 주요정보 U 등)이면 판정·증적을 병합해 1대로 취급
@@ -7909,6 +7939,27 @@ class _HostSet:
             else:
                 overlap = raw_codes & old["raw"]
                 small = max(1, min(len(raw_codes), len(old["raw"])))
+                if overlap and len(overlap) >= 0.5 * small and not (dt and old["dt"] and dt != old["dt"]):
+                    # 같은 항목을 같은 시각(또는 점검 일시 미상)으로 점검한 파일 → 최신을 가릴 수 없으므로 한쪽으로 덮지 않고 항목별로 더 나쁜 판정 유지
+                    old_res, old_sub = self.all_results[key]
+                    merged, from_new = _merge_results(old_res, res)
+                    old_ev = self.evidences.get(key, {})
+                    ev = dict(evidence or {}); ev.update({c: e for c, e in old_ev.items() if c not in from_new})
+                    ev.update({c: e for c, e in (evidence or {}).items() if c in from_new})
+                    self.all_results[key] = (merged, sub or old_sub)
+                    self.evidences[key] = ev
+                    old_hi = self._hi(key)
+                    for k, v in hinfo.items():
+                        if v and not old_hi.get(k):
+                            old_hi[k] = v
+                    old_hi["src_file"] = f"{old_hi.get('src_file', '')}, {fname}"
+                    old["raw"] = old["raw"] | raw_codes
+                    old["file"] = f"{old['file']}, {fname}"
+                    msg = (f"'{key}' 의 결과 파일 {old['file']} 는 점검 일시가 같거나 알 수 없어(기존 {old['dt'] or '미상'} / 신규 {dt or '미상'}) "
+                           f"최신 파일을 가릴 수 없음 → 겹치는 항목은 더 나쁜 판정(취약 > 점검불가 > 수동확인 > 양호 > N-A)을 유지하고 근거를 합침")
+                    print(f"[알림] {msg}")
+                    note.append({"type": "duplicate_merged_worst", "message": msg})
+                    return key
                 if overlap and len(overlap) >= 0.5 * small:   # 같은 항목을 다시 점검한 결과 → 점검 일시가 최신인 파일 채택
                     newer = (dt or datetime.datetime.min) >= (old["dt"] or datetime.datetime.min)
                     keep, drop = (fname, old["file"]) if newer else (old["file"], fname)
@@ -7926,12 +7977,12 @@ class _HostSet:
                     return key
                 # 보완 관계(서로 다른 항목 집합) → 판정·증적 병합, 대상 1대
                 old_res, old_sub = self.all_results[key]
-                merged = dict(old_res)
-                for c, v in res.items():
-                    if c not in merged or _is_placeholder(merged[c]) or not _is_placeholder(v):
-                        merged[c] = v
+                merged, from_new = _merge_results(old_res, res)
                 self.all_results[key] = (merged, sub or old_sub)
-                self.evidences[key] = {**self.evidences.get(key, {}), **(evidence or {})}
+                old_ev = self.evidences.get(key, {})
+                ev = {**(evidence or {}), **{c: e for c, e in old_ev.items() if c not in from_new}}
+                ev.update({c: e for c, e in (evidence or {}).items() if c in from_new})
+                self.evidences[key] = ev
                 old_hi = self._hi(key)
                 for k, v in hinfo.items():
                     if v and not old_hi.get(k):
@@ -8075,7 +8126,9 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
             hinfo["hostname"] = pure
 
         res = parse_pipe(text, fname)
-        if _category_mismatch(res, criteria_items, fname):
+        # MI: 2026 가이드 코드(WEB-xx 만 있는 `check_webwas.sh mi` 결과)도 정상 입력으로 인정
+        known_codes = dict(criteria_items, **{k: {} for k in KISA_GUIDE_ITEMS}) if mode == "MI" else criteria_items
+        if _category_mismatch(res, known_codes, fname):
             continue
         if not _scope_check(scope, hinfo, fname):
             continue
@@ -8733,18 +8786,15 @@ def run_convert(mode, category, base_dir, criteria_excel):
                 res.update(kres)
                 raw_codes |= set(kres)
             mv = re.search(r"^\s*(?:version|JUNOS|Software Version)\s+(\S+)", text, re.M | re.I)
-            hn = re.search(r"^\s*hostname\s+(\S+)", text, re.M)
+            hn = _net_hostname(text)
             if hn and hinfo["hostname"] == pure:
-                hinfo["hostname"] = hn.group(1)
+                hinfo["hostname"] = hn
             if not hinfo.get("os"):
                 brand, model, fw = _net_brand(text)
                 ver = mv.group(1) if mv else fw
                 hinfo["os"] = " ".join(x for x in ((brand or vendor), model, ver) if x)
             if not hinfo.get("ip"):   # 설정에서 관리 IP 추정 (헤더 메타데이터가 없는 config)
-                ips = []
-                for m in re.finditer(r"^\s*ip address\s+(\d+\.\d+\.\d+\.\d+)(?:\s|/)", text, re.M | re.I):
-                    if m.group(1) not in ips and not m.group(1).startswith("127."):
-                        ips.append(m.group(1))
+                ips = _net_mgmt_ips(text)
                 if ips:
                     hinfo["ips"] = ips[:4]
                     hinfo["ip"] = ", ".join(ips[:4])
@@ -8777,14 +8827,35 @@ def run_convert(mode, category, base_dir, criteria_excel):
     _finish(category, mode, cat_dir, base_dir, hs, criteria_items)
 
 
+def _net_hostname(text):
+    """네트워크 config 의 장비 이름: IOS/ASA/NX-OS 'hostname', Junos 'set system host-name'/'host-name x;', 'sysname', D-Link 'config command_prompt'"""
+    for pat in (r"^\s*hostname\s+\"?([^\s\";]+)", r"^\s*(?:set\s+system\s+)?host-name\s+\"?([^\s\";]+)",
+                r"^\s*sysname\s+(\S+)", r"^\s*config\s+command_prompt\s+\"?([^\s\"]+)"):
+        m = re.search(pat, text, re.M | re.I)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _net_mgmt_ips(text):
+    """네트워크 config 에서 장비 IP 추정: 'ip address a.b.c.d', Junos 'family inet address a.b.c.d/n', D-Link 'ipif … ipaddress a.b.c.d/n'"""
+    ips = []
+    for pat in (r"^\s*ip address\s+(\d+\.\d+\.\d+\.\d+)(?:\s|/)", r"\bfamily inet address\s+(\d+\.\d+\.\d+\.\d+)(?:/|\s|;|$)",
+                r"^\s*address\s+(\d+\.\d+\.\d+\.\d+)/\d+\s*;", r"\bipaddress\s+(\d+\.\d+\.\d+\.\d+)(?:/|\s|$)"):
+        for m in re.finditer(pat, text, re.M | re.I):
+            ip = m.group(1)
+            if ip not in ips and not ip.startswith("127.") and ip != "0.0.0.0":
+                ips.append(ip)
+    return ips
+
+
 def _net_scope_info(hinfo, text, pure):
     """네트워크 config 의 범위 판정용 호스트 정보 (config 의 hostname·관리 IP 포함)"""
     info = dict(hinfo)
-    hn = re.search(r"^\s*hostname\s+(\S+)", text, re.M)
+    hn = _net_hostname(text)
     if hn:
-        info["hostname"] = hn.group(1)
-    ips = [m.group(1) for m in re.finditer(r"^\s*ip address\s+(\d+\.\d+\.\d+\.\d+)(?:\s|/)", text, re.M | re.I)]
-    info["ips"] = list(info.get("ips") or []) + ips
+        info["hostname"] = hn
+    info["ips"] = list(info.get("ips") or []) + _net_mgmt_ips(text)
     return info
 
 
