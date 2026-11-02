@@ -7,3 +7,6 @@
 converter/*/output/
 converter/network/config/
 converter/logs/
+
+# 파이썬 캐시
+__pycache__/

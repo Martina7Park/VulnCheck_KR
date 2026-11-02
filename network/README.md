@@ -4,9 +4,9 @@
 
 | 장비 | config 추출 명령 |
 |------|------------------|
-| Cisco IOS / IOS-XE / NX-OS | `show running-config` |
+| Cisco IOS / IOS-XE / NX-OS / ASA | `show running-config` (ASA·NX-OS 는 전용 판정) |
 | Juniper JunOS | `show configuration \| display set` |
-| D-Link | `show running-config` (또는 웹 콘솔에서 백업) |
+| D-Link | `show config current_config` / `show running-config` (또는 웹 콘솔에서 백업) — 고유 CLI(`create snmp community`, `create trusted_host` 등)와 IOS 계열 CLI 모두 지원 |
 | Alteon / A10 | `show running-config` |
 | Dell FTOS | `show running-config` |
 
