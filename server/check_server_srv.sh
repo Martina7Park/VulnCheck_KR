@@ -392,6 +392,7 @@ evd_file() {
     fi
 }
 
+# >>> SRV-COMMON-BEGIN — 원본: server/check_server_srv.sh. 사본(webwas/check_webwas.sh)은 python tools/sync_common.py 로 갱신
 # 전체 파일시스템 탐색 시 네트워크/가상 파일시스템 제외 (NFS/CIFS/WSL 윈도우 드라이브 등)
 _FP="( -fstype nfs -o -fstype nfs4 -o -fstype cifs -o -fstype smbfs -o -fstype 9p -o -fstype drvfs -o -fstype fuse.sshfs -o -fstype autofs -o -fstype proc -o -fstype sysfs ) -prune -o"
 # ── 공통 함수 ────────────────────────────────────────────────────
@@ -3499,7 +3500,9 @@ check_SRV172() {
         result "SRV-172|양호|배너에 시스템 정보 미노출"
 }
 
+# <<< SRV-COMMON-END
 # ── 실행 (SRV-001 ~ SRV-179 전체) ───────────────────────────────
+# >>> SRV-RUN-BEGIN — 원본: server/check_server_srv.sh. 사본(webwas/check_webwas.sh)은 python tools/sync_common.py 로 갱신
 check_SRV001
 check_SRV002
 check_SRV003
@@ -3686,6 +3689,7 @@ check_SRV177
 evd "SRV-178" "uname -s"
 result "SRV-178|N-A|Windows 개인 키 passphrase (Linux/Unix 해당 없음)"
 check_SRV179
+# <<< SRV-RUN-END
 
 _TOTAL=$((_CP + _CF + _CM + _CN))
 echo "# ================================================================"

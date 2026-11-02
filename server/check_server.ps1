@@ -215,6 +215,8 @@ function EvdQ([string]$item,[string]$desc,[string]$val) {
     "[$item] $(Get-Date -Format 'HH:mm:ss') $desc`n$val`n" | Add-Content $script:EVD -Encoding UTF8
 }
 
+Write-Output "# OS 정보: $($os.Caption) Build $build"
+# >>> SRV-COMMON-BEGIN — 원본: server/check_server.ps1. 사본(webwas/check_webwas.ps1)은 python tools/sync_common.py 로 갱신
 # ── SRV-001: SNMP 버전 ───────────────────────────────────────────
 Evd "SRV-001" "Get-Service SNMP -EA SilentlyContinue | Select-Object Status,StartType"
 $snmpSvc   = Get-SvcState "SNMP"; $winSnmpOn = $snmpSvc -and $snmpSvc.Status -match "Running"
@@ -872,7 +874,6 @@ else { NA "SRV-178" "사용자 SSH 개인 키 없음 (개인 키 미사용)" }
 # ── SRV-179: EoS 시스템 교체 ────────────────────────────────────
 Evd "SRV-179" "Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -EA SilentlyContinue | Select-Object ProductName,EditionID,InstallationType,CurrentBuild,UBR,DisplayVersion,ReleaseId | Format-List; Get-CimInstance Win32_OperatingSystem -EA SilentlyContinue | Select-Object Caption,Version,OSArchitecture | Format-List"
 MC "SRV-179" "Windows 버전 지원 종료 여부 수동 확인 (Microsoft 제품 수명 주기 페이지 참조)"
-Write-Output "# OS 정보: $($os.Caption) Build $build"
 
 # ── SRV-062/063/064/066: DNS 서버 점검 ─────────────────────────
 Evd "SRV-062" "Get-Service DNS -EA SilentlyContinue | Select-Object Status,StartType"
@@ -1055,6 +1056,7 @@ if (-not ($dns -and $dns.Status -eq "Running")) {
     else { Pass "SRV-173" "동적 업데이트 비활성 또는 보안 업데이트만 허용" }
 }
 
+# <<< SRV-COMMON-END
 # 평가기준상 WIN 평가대상이 아닌 항목 중 위에서 출력되지 않은 항목 N-A
 $emitted = @(Get-Content $script:EVD -EA SilentlyContinue | Select-String '^\[판정\] (SRV-\d{3})' | ForEach-Object { $_.Matches[0].Groups[1].Value })
 foreach ($code in $script:NA_WIN) { if ($emitted -notcontains $code) { NA $code "평가대상 아님 (WIN 해당 없음 - 평가기준 평가대상 열)" } }

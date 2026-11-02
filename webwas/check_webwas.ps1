@@ -558,6 +558,7 @@ function Get-IisFtpSites {   # IIS 7+ FTP 사이트별 설정(siteDefaults 상�
 # [1] OS 공통 항목 — check_server.ps1 점검 로직 (평가기준 판단기준·방법 동일 항목)
 # ════════════════════════════════════════════════════════════════
 $script:PHASE = "os"
+# >>> SRV-COMMON-BEGIN — 원본: server/check_server.ps1. 사본(webwas/check_webwas.ps1)은 python tools/sync_common.py 로 갱신
 # ── SRV-001: SNMP 버전 ───────────────────────────────────────────
 Evd "SRV-001" "Get-Service SNMP -EA SilentlyContinue | Select-Object Status,StartType"
 $snmpSvc   = Get-SvcState "SNMP"; $winSnmpOn = $snmpSvc -and $snmpSvc.Status -match "Running"
@@ -1396,6 +1397,8 @@ if (-not ($dns -and $dns.Status -eq "Running")) {
     elseif ($nonsec.Count -gt 0) { Fail "SRV-173" "보안되지 않은 동적 업데이트 허용 영역(AllowUpdate=1): $($nonsec -join ', ')" }
     else { Pass "SRV-173" "동적 업데이트 비활성 또는 보안 업데이트만 허용" }
 }
+
+# <<< SRV-COMMON-END
 
 # ════════════════════════════════════════════════════════════════
 # [2] 기존 IIS 점검 — 평가기준 일치 항목(KEEP)만 반영, 나머지는 REF-(참고)
