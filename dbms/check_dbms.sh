@@ -289,7 +289,7 @@ mc()  { _emit "$1" "수동확인" "$2"; }
 evd() {
     local item="$1"; shift
     printf '[%s] %s $ %s\n' "$item" "$(date '+%H:%M:%S')" "$*" >> "$_EVD"
-    eval "$@" >> "$_EVD" 2>&1
+    eval "$@" >> "$_EVD" 2>&1 </dev/null
     printf '\n' >> "$_EVD"
 }
 evd_file() {
@@ -981,6 +981,7 @@ check_mysql() {
 
     # DBM-025: EoS
     evd_q "DBM-025" "MySQL/MariaDB 버전 (EoS 판단용)" "${DB_VER}"
+    evd "DBM-025" "rpm -qa 2>/dev/null | grep -iE '^(mariadb|mysql|percona|postgresql)[-0-9]*(-server)?-[0-9]' | sort; dpkg -l 2>/dev/null | awk '/^ii/ && \$2 ~ /^(mariadb-server|mysql-server|postgresql-[0-9])/ {print \$2, \$3}'"   # 배포판 패키지 여부 (원 개발사 EoS 와 배포판 보안 지원 구분)
     mc "025" "MySQL/MariaDB ${DB_VER} EoS 여부 수동 확인"
 
     # DBM-026: 구동 계정 umask
@@ -1298,6 +1299,7 @@ $(run_q "SELECT 'role:'||pg_get_userbyid(m.member)||' ADMIN '||pg_get_userbyid(m
 
     # DBM-025: EoS
     evd_q "DBM-025" "PostgreSQL 버전 (EoS 판단용)" "${DB_VER}"
+    evd "DBM-025" "rpm -qa 2>/dev/null | grep -iE '^(mariadb|mysql|percona|postgresql)[-0-9]*(-server)?-[0-9]' | sort; dpkg -l 2>/dev/null | awk '/^ii/ && \$2 ~ /^(mariadb-server|mysql-server|postgresql-[0-9])/ {print \$2, \$3}'"   # 배포판 패키지 여부 (원 개발사 EoS 와 배포판 보안 지원 구분)
     mc "025" "PostgreSQL EoS 여부 수동 확인 (위 버전 참조)"
 
     # DBM-026: 구동 계정 umask

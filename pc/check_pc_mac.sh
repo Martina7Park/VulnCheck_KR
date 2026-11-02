@@ -68,7 +68,7 @@ result() {
 evd() {
     local item="$1"; shift
     printf '[%s] %s $ %s\n' "$item" "$(date '+%H:%M:%S')" "$*" >> "$_EVD"
-    eval "$@" >> "$_EVD" 2>&1
+    eval "$@" >> "$_EVD" 2>&1 </dev/null
     printf '\n' >> "$_EVD"
 }
 evd_file() {

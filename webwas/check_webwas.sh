@@ -518,7 +518,7 @@ _merge_hold() {
 evd() {
     local item; item="$(_route_code "$1")"; shift
     printf '[%s] %s $ %s\n' "$item" "$(date '+%H:%M:%S')" "$*" >> "$_EVD"
-    eval "$@" >> "$_EVD" 2>&1
+    eval "$@" >> "$_EVD" 2>&1 </dev/null
     printf '\n' >> "$_EVD"
 }
 
@@ -4842,10 +4842,22 @@ _cgi_dirs() {  # ScriptAlias /cgi-bin/ 경로 + 배포판 기본 경로
 _apache_ver() {
     { httpd -v 2>/dev/null || apache2 -v 2>/dev/null || apachectl -v 2>/dev/null; } | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
 }
+_tomcat_info() {   # 'Server version: Apache Tomcat/x.y.z' — version.sh 없는 배포판 패키지(Ubuntu tomcat9 등)는 catalina.jar 의 ServerInfo
+    local h jar _ch
+    _ch=$(ps -eo args 2>/dev/null | grep -o 'catalina\.home=[^ ]*' | head -1 | cut -d= -f2)   # 실행 중 Tomcat 의 -Dcatalina.home (CATALINA_BASE 와 분리된 배포판 패키지)
+    for h in "$TOMCAT_HOME" "$CATALINA_HOME" "$_ch"; do
+        [ -n "$h" ] && [ -d "$h" ] || continue
+        grep -h "Apache Tomcat Version" "$h/RELEASE-NOTES" 2>/dev/null && return
+        sh "$h/bin/version.sh" 2>/dev/null | grep -iE "Server (version|number)" | grep . && return
+        jar="$h/lib/catalina.jar"
+        [ -f "$jar" ] || continue
+        command -v java >/dev/null 2>&1 && java -cp "$jar" org.apache.catalina.util.ServerInfo 2>/dev/null </dev/null | grep -iE "Server (version|number)" | grep . && return
+        unzip -p "$jar" org/apache/catalina/util/ServerInfo.properties 2>/dev/null | grep -iE '^server\.(info|number)' | grep . && return
+    done
+}
 _tomcat_ver() {
-    [ -n "$TOMCAT_HOME" ] || return
-    { grep -h "Apache Tomcat Version" "$TOMCAT_HOME/RELEASE-NOTES" 2>/dev/null
-      sh "$TOMCAT_HOME/bin/version.sh" 2>/dev/null | grep -i "Server number"; } | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+    [ -n "$TOMCAT_HOME$CATALINA_HOME" ] || return
+    _tomcat_info | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
 }
 
 if [ -z "$WEB_SRV$WAS_SRV" ]; then
@@ -5531,7 +5543,7 @@ _kres "WEB-24" "Apache Tomcat Nginx IIS JEUS WebtoB" "$_r"
 # ── WEB-25 주기적 보안 패치 및 벤더 권고사항 적용 ──
 _jv=""; [ "$WAS_SRV" = jeus ] && _jv=$( { jeusadmin -version 2>/dev/null || "$JEUS_HOME/bin/jeusadmin" -version 2>/dev/null; } | head -1)
 _wv2=""; [ "$WEB_SRV" = webtob ] && _wv2=$( { wscfl -version 2>&1 || "$_WT_HOME/bin/wscfl" -version 2>&1; } | grep -iE 'webtob|version' | head -1)
-evd "WEB-25" "httpd -v 2>/dev/null || apache2 -v 2>/dev/null; nginx -v 2>&1; sh ${TOMCAT_HOME:-/nonexistent}/bin/version.sh 2>/dev/null | head -5; echo 'JEUS: $_jv'; echo 'WebtoB: $_wv2'"
+evd "WEB-25" "httpd -v 2>/dev/null || apache2 -v 2>/dev/null; nginx -v 2>&1; _tomcat_info 2>/dev/null | head -3; echo 'JEUS: $_jv'; echo 'WebtoB: $_wv2'"
 _r=""
 case "$WEB_SRV" in
 apache) _r="$(_eos_one apache "$(_apache_ver)")" ;;

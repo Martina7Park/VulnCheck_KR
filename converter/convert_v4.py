@@ -513,9 +513,17 @@ def _category_mismatch(res, criteria_items, fname):
         print(f"[경고] {fname}: 항목코드({','.join(pfx)})가 이 분야 기준({','.join(exp)})과 불일치 → {why}하여 제외" if not guide
               else f"[경고] {fname}: 항목코드({','.join(pfx)})가 전자금융 기준({','.join(exp)})과 불일치 → {why} (제외)")
         return True
-    if hit < len(res) * 0.3:
-        print(f"[경고] {fname}: 기준과 일치하는 항목 {hit}/{len(res)}개뿐 — 분야 확인 필요")
+    # 'all' 모드 결과는 같은 분야의 다른 기준 코드(SRV↔U·W, WST↔WEB, DBM↔D …)를 함께 담으므로 비율 계산에서 제외
+    hit_pfx = {c.split("-")[0] for c in res if c in criteria_items}
+    sib = {p for h in hit_pfx for p in _STD_SIBLING.get(h, ())}
+    pool = [c for c in res if c.split("-")[0] not in sib]
+    if pool and hit < len(pool) * 0.3:
+        print(f"[경고] {fname}: 기준과 일치하는 항목 {hit}/{len(pool)}개뿐 — 분야 확인 필요")
     return False
+
+
+_STD_SIBLING = {"SRV": ("U", "W"), "U": ("SRV",), "W": ("SRV",), "WST": ("WEB",), "WEB": ("WST",),
+                "DBM": ("D",), "D": ("DBM",), "NET": ("N",), "N": ("NET",), "ISS": ("S",), "S": ("ISS",)}   # 같은 분야의 전자금융↔주요정보 코드
 
 
 def compose_status(res, evidence, criteria_items, sub_key=None):
@@ -4124,6 +4132,9 @@ def _kisa_na_allowed(code, why):
     return bool(pat and re.search(pat, why))
 
 
+_KISA_EOS_ITEM = {"U-64": "SRV-179", "WEB-25": "WST-126", "D-25": "DBM-025"}   # 가이드 패치 항목 ← 컨버터 EoS 판정 항목(run_eos_check)
+
+
 def _kisa_result(res, criteria_items, kisa_items, family):
     """
     판정 결과(res) → 가이드 항목 판정
@@ -4136,6 +4147,9 @@ def _kisa_result(res, criteria_items, kisa_items, family):
     for k, it in kisa_items.items():
         if k in res:
             out[k] = res[k]
+            ec = _KISA_EOS_ITEM.get(k)   # 지원 종료(EoS) 제품 = 보안 패치 미제공 → 패치 항목 취약 (가이드 양호: 보안 패치가 적용된 버전 사용)
+            if ec and res.get(ec, ("",))[0] == RESULT_BAD and res[k][0] != RESULT_BAD:
+                out[k] = (RESULT_BAD, f"지원 종료(EoS) 제품 사용 - 보안 패치 미제공: {res[ec][1]}\n※ 점검 스크립트 판정({res[k][0]}): {res[k][1]}")
             continue
         srcs = [s for s in it["sources"] if s in res]
         if not srcs:
@@ -4784,6 +4798,9 @@ def load_criteria(excel_path, sheet_name, mode):
       applies_to  : {"LINUX": True/False, ...}  ← OS/DB/장비 적용 대상 여부
       criteria_by : {"LINUX": {"기준": "...", "방법": "..."}, ...}  ← 세부 판단기준
     """
+    if not excel_path:   # 기준 엑셀 없음(주요정보 변환): 가이드 내장 항목만 사용, 전자금융 결과 → 가이드 연계 판정은 생략
+        print(f"[안내] 기준 엑셀 없음 - '{sheet_name}' 평가기준 항목 미로드 (주요정보 가이드 전용 스크립트 결과로 판정)")
+        return {}
     wb = load_workbook(excel_path, read_only=True)
     ws = wb[sheet_name]
     items = {}
@@ -5057,6 +5074,9 @@ def _init_sheet_names(hostnames):
     used = {n.lower() for n in _FIXED_SHEETS}
     for h in hostnames:
         base = re.sub(r"[\[\]:*?/\\]", "_", str(h)).strip("'") or "host"
+        ipm = re.search(r"[_(]\d{1,3}(\.\d{1,3}){3}\)?$", base)   # 'localhost.localdomain_10.1.2.3' 처럼 IP 로 구분한 이름은 IP 를 남기고 앞을 줄임
+        if len(base) > 31 and ipm:
+            base = base[:31 - len(ipm.group())] + ipm.group()
         name, i = base[:31], 1
         while name.lower() in used:
             i += 1
@@ -7013,6 +7033,7 @@ def _eos_scan_category(category, base_dir):
         for kind, prod, ver in comps:
             if mod and ver:
                 r, e, desc = mod.check_eos(prod, ver, os.environ.get("EOS_OFFLINE") != "1")
+                r, desc = _eos_distro_adjust(r, desc, prod, text + "\n" + evd)
             else:
                 r, e, desc = RESULT_MANUAL, None, f"{prod} {ver or ''} 버전 미확인 - 벤더 지원 정책 수동 확인".strip()
             judged.append((kind, prod, ver, r, e, desc))
@@ -7279,7 +7300,8 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
             hinfo["hostname"] = pure
 
         res = parse_pipe(text)
-        if _category_mismatch(res, criteria_items, fname):
+        known = dict(criteria_items, **{k: {} for k in KISA_GUIDE_ITEMS if k.startswith("WEB-")}) if mode == "MI" else criteria_items
+        if _category_mismatch(res, known, fname):
             continue
         evd_path = os.path.join(input_dir, fname) if evidence_only else find_evidence_file(os.path.join(input_dir, fname))
         if evd_path:
@@ -7303,7 +7325,7 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
                 else:
                     res[code] = (RESULT_NA, f"현재 유형({web_disp}/{was_disp})에 해당 없는 항목")
 
-        res = run_eos_check("webwas", res, text, base_dir)
+        res = run_eos_check("webwas", res, text, base_dir, read_text(evd_path) if evd_path and os.path.exists(evd_path) else "")
 
         detected_sub = detect_srv_os(text)
         if detected_sub:
@@ -7337,10 +7359,10 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
         all_results[_h] = (res, detected_sub)
         hosts_info.append(hinfo)
 
-        total = sum(1 for k in res if k in criteria_items)
-        bad   = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_BAD)
-        good  = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_GOOD)
-        print(f"[INFO] {fname} → 웹서버={web_disp}, WAS={was_disp}, 양호 {good} / 취약 {bad}")
+        cnt_items = criteria_items if mode != "MI" else {k for k in res if k.startswith("WEB-")}
+        bad   = sum(1 for k, v in res.items() if k in cnt_items and v[0] == RESULT_BAD)
+        good  = sum(1 for k, v in res.items() if k in cnt_items and v[0] == RESULT_GOOD)
+        print(f"[INFO] {fname} → 웹서버={web_disp}, WAS={was_disp}, 양호 {good} / 취약 {bad}{' (가이드 항목 직접 판정분)' if mode == 'MI' else ''}")
 
     if not all_results:
         _no_results_stop(mode, "webwas")
@@ -7352,6 +7374,7 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
     wb = openpyxl.Workbook()
     print(f"[INFO] 보고서 생성 중...")
 
+    _init_sheet_names(list(all_results.keys()))   # 시트명 먼저 확정 (개요 시트 수식이 호스트 시트를 참조)
     _create_cover_sheet(wb, mode, "webwas", hosts_info)
     _create_overview_sheet(wb, mode, "webwas", hosts_info, criteria_items,
                            next(iter(all_results), None))
@@ -7522,10 +7545,37 @@ EOS_ITEM_CODES = {
     "network": "NET-059",
 }
 
-def run_eos_check(category, res, text, base_dir):
+_DISTRO_PKG_NAMES = {"mariadb": "mariadb", "mysql": "mysql", "postgresql": "postgresql", "nginx": "nginx",
+                     "apache": "httpd|apache2", "tomcat": "tomcat", "redis": "redis"}
+
+
+def _distro_pkg(prod, blob):
+    """제품이 배포판 패키지(RHEL·OL·Rocky el, Amazon amzn, Ubuntu·Debian)로 설치됐으면 패키지 표기 반환"""
+    n = _DISTRO_PKG_NAMES.get(prod)
+    if not n:
+        return ""
+    m = re.search(rf"(?i)\b(?:{n})[-a-z0-9]*-\d[\w.:+~-]*?\.(?:el\d+|amzn\d+|module\+el\d+)[\w.]*", blob)
+    if m:
+        return m.group(0)
+    m = re.search(rf"(?i)(?:{n}|{prod})[^\n]{{0,40}}?\d+\.\d+[^\n]{{0,60}}?(ubuntu|debian|\+deb\d+)", blob)
+    return m.group(0).strip() if m else ""
+
+
+def _eos_distro_adjust(result, desc, prod, blob):
+    """원 개발사 EoS(취약)라도 배포판 패키지면 배포판이 보안 패치를 계속 제공할 수 있음 → 수동확인 (오탐 방지)"""
+    if result != RESULT_BAD:
+        return result, desc
+    pkg = _distro_pkg(prod, blob)
+    if not pkg:
+        return result, desc
+    return (RESULT_MANUAL, f"{desc} - 단, 배포판 패키지({pkg[:60]}) 설치: 원 개발사 지원 종료와 별개로 배포판"
+                           f"(RHEL/OL AppStream·Ubuntu/Debian LTS) 보안 지원 기간 확인 (지원 중이면 양호, 종료면 취약)")
+
+
+def run_eos_check(category, res, text, base_dir, evd_text=""):
     """
     EoS 항목 자동 판정 (eos_checker.py 직접 import).
-    text: 원본 점검 결과 파일 텍스트 (헤더에서 버전 추출용)
+    text: 원본 점검 결과 파일 텍스트, evd_text: 증적 원문 — EoS 현황(.txt)과 같은 방식으로 OS·제품 버전 추출
     """
     check_eos = _load_eos_checker(base_dir)
     if not check_eos:
@@ -7535,7 +7585,16 @@ def run_eos_check(category, res, text, base_dir):
     if not eos_code:
         return res
 
-    versions = parse_version_info(text)
+    # EoS 현황과 같은 추출기 사용 (OS 상세·os-release·증적의 제품 버전) → 없으면 머리말 기반 구 방식
+    versions = []
+    if category == "server":
+        prod, ver, _ = _eos_os_from(text, evd_text or "")
+        if prod and ver:
+            versions = [(prod, ver)]
+    elif category in ("webwas", "dbms"):
+        versions = [(p, v) for _, p, v in _eos_products_from(category, text, evd_text or "", {}) if v]
+    if not versions:
+        versions = parse_version_info(text)
     if not versions:
         return res
 
@@ -7545,6 +7604,7 @@ def run_eos_check(category, res, text, base_dir):
             continue
         try:
             result, eol_date, desc = check_eos(product, version, use_api=False)
+            result, desc = _eos_distro_adjust(result, desc, product, text + "\n" + (evd_text or ""))
             eos_results.append((product, version, result, eol_date, desc))
         except Exception:
             pass
@@ -7875,6 +7935,7 @@ def run_pc_convert(mode, base_dir):
     wb = openpyxl.Workbook()
     print(f"[INFO] 보고서 생성 중...")
 
+    _init_sheet_names(list(all_results.keys()))   # 시트명 먼저 확정 (개요 시트 수식이 호스트 시트를 참조)
     _create_cover_sheet(wb, mode, "pc", hosts_info)
     _create_overview_sheet(wb, mode, "pc", hosts_info, criteria_items,
                            next(iter(all_results), None))
@@ -8014,6 +8075,9 @@ def run_convert(mode, category, base_dir, criteria_excel):
 
         if input_mode == "pipe":
             res = parse_pipe(text)
+            if kisa_mode and not criteria_items and res and all(c.split("-")[0] in ("SRV", "WST", "DBM", "NET", "ISS") for c in res):
+                print(f"[안내] {fname}: 전자금융 스크립트 결과 - 기준 엑셀이 없어 주요정보 변환 근거로 쓰지 않음 (같은 호스트의 주요정보 결과 파일로 판정)")
+                continue
             if _category_mismatch(res, known_codes, fname):
                 continue
             if not kisa_mode and any(k in KISA_GUIDE_ITEMS for k in res) and not any(k in criteria_items for k in res):
@@ -8100,7 +8164,8 @@ def run_convert(mode, category, base_dir, criteria_excel):
                     res[code] = (RESULT_MANUAL, "config에서 자동 판단 불가 (수동 확인)")
             print(f"[INFO] {fname} → 벤더: {vendor}, 취약: {sum(1 for v in res.values() if v[0]==RESULT_BAD)}건")
 
-        res = run_eos_check(category, res, text, base_dir)
+        _evd_raw = read_text(evd_path) if input_mode == "pipe" and evd_path and os.path.exists(evd_path) else ""
+        res = run_eos_check(category, res, text, base_dir, _evd_raw)
 
         detected_sub = sub_key if input_mode == "pipe" else "GENERIC"
         _h = _host_key(all_results, host_ips, hinfo)
@@ -8124,9 +8189,10 @@ def run_convert(mode, category, base_dir, criteria_excel):
             continue
         all_results[_h] = (res, detected_sub)
         hosts_info.append(hinfo)
-        total = sum(1 for k in res if k in criteria_items)
-        bad   = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_BAD)
-        good  = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_GOOD)
+        cnt_items = known_codes if not kisa_mode else {k for k in res if k in KISA_GUIDE_ITEMS}   # 주요정보: 가이드 항목 직접 판정분
+        total = sum(1 for k in res if k in cnt_items)
+        bad   = sum(1 for k, v in res.items() if k in cnt_items and v[0] == RESULT_BAD)
+        good  = sum(1 for k, v in res.items() if k in cnt_items and v[0] == RESULT_GOOD)
         print(f"[INFO] {fname} → 총 {total}개 / 양호 {good} / 취약 {bad}")
 
     if not all_results:
@@ -8152,6 +8218,7 @@ def _write_report(mode, category, cat_dir, base_dir, all_results, hosts_info, cr
     wb = openpyxl.Workbook()
     print(f"[INFO] 보고서 생성 중...")
 
+    _init_sheet_names(list(all_results.keys()))   # 시트명 먼저 확정 (개요 시트 수식이 호스트 시트를 참조)
     _create_cover_sheet(wb, mode, category, hosts_info)
     _create_overview_sheet(wb, mode, category, hosts_info, criteria_items,
                            next(iter(all_results), None))
@@ -8221,12 +8288,11 @@ def main():
                              if "취약점" in f and "평가기준" in f and f.endswith(".xlsx")]
     criteria_excel = next((p for p in criteria_candidates if os.path.exists(p)), None)
 
-    if not criteria_excel:
-        print("[ERROR] 기준 엑셀 파일을 찾을 수 없습니다.")
-        print("  → 이 스크립트와 같은 폴더에 '전자금융기반시설_보안_취약점_평가기준_제2026-1호.xlsx' 를 넣어주세요.")
-        sys.exit(1)
-
-    print(f"\n[기준 엑셀] {os.path.basename(criteria_excel)}")
+    if criteria_excel:
+        print(f"\n[기준 엑셀] {os.path.basename(criteria_excel)}")
+    else:   # 주요정보(2026 가이드 내장 항목)·PC·가상화는 기준 엑셀 없이 변환 가능
+        print("\n[안내] 기준 엑셀(전자금융기반시설_보안_취약점_평가기준_제2026-1호.xlsx) 없음")
+        print("       → 주요정보통신기반시설(2026 가이드 내장 항목)·PC·가상화 변환만 가능, 전자금융 서버·웹/WAS·DBMS·네트워크·보안장비는 기준 엑셀 필요")
 
     # ── 1단계: 평가 기반 선택 ─────────────────────────────────
     print("\n[1단계] 평가 기반 선택")
@@ -8265,6 +8331,11 @@ def main():
         if sel == "6": category = "pc";       cat_name = "PC(업무용 단말)"; break
         if sel == "7": category = "hypervisor"; cat_name = "가상화(ESXi)"; break
         print("  1~8 중 하나를 입력하세요.")
+
+    if not criteria_excel and mode == "EF" and category not in ("pc", "hypervisor"):
+        print(f"\n[ERROR] 전자금융기반시설 {cat_name} 변환에는 기준 엑셀이 필요합니다.")
+        print("  → 이 스크립트와 같은 폴더에 '전자금융기반시설_보안_취약점_평가기준_제2026-1호.xlsx' 를 넣거나, 평가 기반 '2. 주요정보통신기반시설'을 선택하세요.")
+        sys.exit(1)
 
     print(f"\n[실행] {mode_name} / {cat_name} 점검 컨버팅 시작")
     sub = "config" if category == "network" else "output"

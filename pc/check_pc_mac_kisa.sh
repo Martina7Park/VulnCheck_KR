@@ -54,7 +54,7 @@ result() {
 evd() {
     local item="$1"; shift
     printf '[%s] %s $ %s\n' "$item" "$(date '+%H:%M:%S')" "$*" >> "$_EVD"
-    eval "$@" >> "$_EVD" 2>&1
+    eval "$@" >> "$_EVD" 2>&1 </dev/null
     printf '\n' >> "$_EVD"
 }
 USERS=$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2>=500 && $1!~/^_/{print $1}' | tr '\n' ' ')
