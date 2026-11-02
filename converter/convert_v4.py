@@ -253,6 +253,8 @@ DB_CRITERIA = {
 }
 
 # 네트워크 장비 그룹 컬럼 (네트워크 장비 시트)
+NET_CONFIG_EXTS = (".txt", ".cfg", ".conf", ".log")   # 네트워크 장비 config 파일 확장자 (converter/network/config/)
+
 NET_COLS = {
     "SW":      11,
     "RTR":     12,
@@ -653,7 +655,8 @@ def detect_net_vendor(text):
                   if not re.match(r'\s*(description|hostname|sysname|banner|alias|name\s|set system host-name|snmp-server (location|contact))', l))
     if re.search(r'alteon|radware|^/c/sys|^/cfg/sys', t, re.M): return "ALTEON"
     if re.search(r'a10networks|vthunder|\bacos\b|^!version \S+.*build|^slb |^interface management\s*$', t, re.M): return "A10"
-    if re.search(r'\bftos\b|dell networking|force10', t):     return "DELL"
+    if re.search(r'^:?\s*(asa|pix) version \d', t, re.M): return "ASA"
+    if re.search(r'\bftos\b|dell networking|force10|^boot system stack-unit|^stack-unit \d+ provision', t, re.M): return "DELL"
     dl = sum(bool(re.search(p, t, re.M)) for p in (
         r'^\s*#.*\b(dgs|des|dxs|dws)-\d', r'^config (ports|terminal_line|safeguard_engine|traffic_control|snmp community)\b',
         r'^create account\b', r'^enable password encryption\b', r'^create vlan\b', r'^config ipif\b'))
@@ -671,7 +674,11 @@ def detect_net_vendor(text):
 def _l3_capable(lines):
     """라우팅 기능 사용 여부: ip routing / 라우팅 프로토콜 / 물리(비 SVI·관리) 인터페이스에 IP 주소 /
     IP 가 설정된 VLAN 인터페이스(SVI) 2개 이상 (VLAN 간 라우팅 — 관리용 SVI 1개만 있으면 L2)"""
-    if any_m(lines, r'^\s*ip routing\b|^\s*router\s+(ospf|bgp|eigrp|rip|isis)\b|^\s*ipv6 unicast-routing|^\s*feature interface-vlan\b'):
+    if any_m(lines, r'^\s*ip routing\b|^\s*router\s+(ospf|bgp|eigrp|rip|isis)\b|^\s*ipv6 unicast-routing|^\s*feature interface-vlan\b'
+                    r'|^\s*set protocols (ospf|bgp|isis|rip)\b'):
+        return True
+    # Junos L3 VLAN 인터페이스(irb·vlan unit) 2개 이상 = VLAN 간 라우팅
+    if len({m.group(1) for l in lines for m in [re.match(r'\s*set interfaces (?:irb|vlan) unit (\d+) family inet address', l)] if m}) >= 2:
         return True
     if any(re.match(r'\s*ip route\s+(?!0\.0\.0\.0\s+0\.0\.0\.0)(?!0\.0\.0\.0/0)\S', l, re.I) for l in lines):
         return True
@@ -703,7 +710,9 @@ def detect_net_dtype(lines):
     """스위치/라우터 구분 — 스위치 포트가 있으면 SW(라우팅 사용 시 L3SW), 없으면 RTR"""
     if detect_net_vendor("\n".join(lines)) == "DLINK":   # D-Link 관리형 스위치 (DGS/DES/DXS)
         return "L3SW" if any_m(lines, r'^\s*create\s+iproute|^\s*enable\s+(ospf|rip|bgp)\b') else "SW"
-    has_sw = any_m(lines, r'switchport|spanning-tree|^\s*vlan\s+\d+')
+    # 스위치 단서: IOS 계열 switchport·spanning-tree·vlan / Junos ethernet-switching·vlans·rstp / Huawei port link-type·vlan batch
+    has_sw = any_m(lines, r'switchport|spanning-tree|^\s*vlan\s+\d+|ethernet-switching|^\s*set vlans\s|^\s*set protocols (r|m|v)stp\b'
+                          r'|^\s*port link-type\b|^\s*vlan batch\b')
     if has_sw:
         return "L3SW" if _l3_capable(lines) else "SW"
     return "RTR"
@@ -1067,6 +1076,9 @@ def build_net_checks(lines, text):
 
     if vendor == "DLINK":
         return build_dlink_checks(lines, text)
+    if vendor == "JUNIPER" and not any(l.startswith("set ") for l in lines):   # 계층형 설정 → set 형식으로 판정
+        text = _junos_to_set(text)
+        lines = text.splitlines()
 
     dtype  = detect_net_dtype(lines)
     # IOS 유사 문법 D-Link DGS-3630: 제조사 기본값이 Cisco 와 다름 (CLI Reference Guide R2.25)
@@ -1573,6 +1585,11 @@ def build_net_checks(lines, text):
     elif any_m(r'^feature \S') and not any_m(r'transport input'):   # NX-OS: VTY transport 명령 없음, Telnet 은 feature telnet 으로 활성
         results['NET-015'] = ng(fmt("feature telnet 활성", "SSH 전용 (no feature telnet)", "Telnet 평문 접속 허용")) if any_m(r'^feature telnet\b') \
             else ok(fmt(f"NX-OS feature telnet 미사용{' / feature ssh' if any_m(r'^feature ssh') else ''}", "SSH 전용", "Telnet 비활성 (NX-OS 기본)"))
+    elif vendor == "JUNIPER":   # Junos: telnet 은 system services telnet 설정 시에만 활성
+        _jt = fline(r'^\s*set system services telnet\b')
+        results['NET-015'] = ng(fmt(_jt, "암호화 프로토콜(SSH)만 허용", "Telnet 평문 접속 허용")) if _jt \
+            else ok(fmt("system services telnet 미설정" + (" / system services ssh" if any_m(r'^\s*set system services ssh\b') else ""),
+                        "SSH 전용", "Telnet 미사용 (Junos 기본값)"))
     elif not vty_blocks:
         results['NET-015'] = mc(fmt("VTY 없음", "VTY transport input ssh", "수동 확인"))
     else:
@@ -1851,13 +1868,14 @@ def build_net_checks(lines, text):
 
     # NET-035: 로그 버퍼 크기
     if vendor == "ASA":
-        buf_asa = fline(r'logging buffer-size\s+\d+')
+        buf_asa = fline(r'^\s*logging buffered\s+\S+')
+        bsz = fline(r'^\s*logging buffer-size\s+\d+')
         if buf_asa:
-            sz = re.search(r'\d+', buf_asa)
-            size = int(sz.group()) if sz else 0
-            results['NET-035'] = ok(fmt(f"{buf_asa}", "logging buffer-size 설정", f"로깅 버퍼 {size}bytes 설정됨"))
+            results['NET-035'] = ok(fmt(f"{buf_asa}" + (f" / {bsz}" if bsz else " (buffer-size 기본 4096)"), "logging buffered 설정", "ASA 버퍼 로깅 활성"))
+        elif bsz:
+            results['NET-035'] = mc(fmt(f"{bsz} (logging buffered 미설정)", "logging buffered [레벨] 설정", "버퍼 크기만 지정 - 버퍼 로깅 활성 여부 show logging 확인"))
         else:
-            results['NET-035'] = ng(fmt("logging buffer-size 미설정", "logging buffer-size 16384 이상", "버퍼 미설정"))
+            results['NET-035'] = ng(fmt("logging buffered 미설정", "logging buffered [레벨] 설정", "ASA 버퍼 로깅 기본 비활성 - 메모리 로그 없음"))
     else:
         buf = fline(r'logging buffered\s+')
         if buf:
@@ -1902,8 +1920,14 @@ def build_net_checks(lines, text):
 
     # NET-037: 콘솔 로깅 레벨
     if vendor == "ASA":
-        cl = fline(r'logging console\s+\S+')
-        results['NET-037'] = ok(fmt(f"{cl}", "logging console 레벨 설정", "ASA 콘솔 로그 설정됨")) if cl else mc(fmt("logging console 미설정", "적절한 레벨 설정", "콘솔 로그 레벨 수동 확인"))
+        cl = fline(r'^\s*logging console\s+\S+')
+        lv = re.search(r'logging console\s+(\S+)', cl, re.I).group(1).lower() if cl else ""
+        if not cl:
+            results['NET-037'] = ok(fmt("logging console 미설정 (ASA 기본 비활성)", "콘솔 로깅 중지 또는 critical 이상", "콘솔 로깅 미사용"))
+        elif lv in ("emergencies", "alerts", "critical", "0", "1", "2"):
+            results['NET-037'] = ok(fmt(cl, "콘솔 로깅 중지 또는 critical 이상", f"콘솔 로그 레벨 {lv}"))
+        else:
+            results['NET-037'] = ng(fmt(cl, "콘솔 로깅 중지 또는 critical 이상", f"콘솔 로그 레벨 {lv} - 불필요한 콘솔 로깅"))
     elif vendor == "JUNIPER":
         jcl = fline(r'set system syslog console')
         results['NET-037'] = ok(fmt(f"{jcl or 'Junos console syslog'}", "콘솔 로그 설정", "Junos 콘솔 로그 설정됨")) if jcl else mc(fmt("콘솔 로그 수동 확인", "syslog console 설정", "수동 확인"))
@@ -2308,7 +2332,16 @@ def build_net_checks(lines, text):
     _bf = fline(r'login block-for\s+\d+\s+attempts\s+\d+|aaa authentication rejected\s+\d+\s+in\s+\d+')
     _n  = int(re.search(r'max-fail\s+(\d+)', _mf).group(1)) if _mf else (int(re.search(r'(?:attempts|rejected)\s+(\d+)', _bf).group(1)) if _bf else None)
     lockout = _mf or _bf or fline(r'aaa.*lockout|security authentication failure rate')
-    if _n is not None and _n <= 5:
+    if vendor == "JUNIPER":   # Junos: retry-options lockout-period 설정 시 계정 잠금 (tries-before-disconnect 는 세션 종료만)
+        _jtry = fline(r'retry-options tries-before-disconnect\s+\d+')
+        _jlock = fline(r'retry-options lockout-period\s+\d+')
+        _jn = int(re.search(r'(\d+)\s*$', _jtry).group(1)) if _jtry else None
+        if _jlock and (_jn is None or _jn <= 5):
+            results['NET-058'] = ok(fmt(f"{_jlock}" + (f" / {_jtry}" if _jtry else ""), "계정 잠금 임계값 적절(5회 이하)", "로그인 실패 시 계정 잠금"))
+        else:
+            results['NET-058'] = mc(fmt((_jtry or "retry-options 미설정") + (f" / {_jlock}" if _jlock else ""), "계정 잠금 임계값 적절(5회 이하)",
+                                        "lockout-period 미설정 또는 시도 횟수 5회 초과 - 계정 잠금 동작 확인 (tries-before-disconnect 는 세션 종료만)"))
+    elif _n is not None and _n <= 5:
         results['NET-058'] = ok(fmt(lockout, "계정 잠금 임계값 적절(5회 이하)", f"로그인 실패 {_n}회 잠금/차단"))
     elif _n is not None:
         results['NET-058'] = ng(fmt(lockout, "계정 잠금 임계값 적절(5회 이하)", f"임계값 {_n}회 - 과다"))
@@ -2318,7 +2351,7 @@ def build_net_checks(lines, text):
         results['NET-058'] = ng(fmt("login block-for / authentication failure rate 미설정", "로그인 실패 시 차단 설정", "무제한 로그인 시도 허용 - 무차별 공격 취약"))
 
     # 벤더 전용 파서가 없는 항목은 IOS 문법 기준으로 판정되므로, 비 Cisco 장비의 '취약'은 수동확인으로 전환
-    _aware = {"JUNIPER": {"NET-007", "NET-011", "NET-030", "NET-031", "NET-033", "NET-034", "NET-036", "NET-037", "NET-050", "NET-057"},
+    _aware = {"JUNIPER": {"NET-007", "NET-011", "NET-015", "NET-030", "NET-031", "NET-033", "NET-034", "NET-036", "NET-037", "NET-050", "NET-057", "NET-058"},
               "ALTEON":  {"NET-007", "NET-015", "NET-030", "NET-031", "NET-033", "NET-036"}}
     if vendor == "JUNIPER" and not any_m(r'^set '):   # 계층형(show configuration) 형식은 set 기반 전용 파서 적용 불가
         _aware["JUNIPER"] = set()
@@ -2412,6 +2445,79 @@ def build_net_checks(lines, text):
                 results['NET-058'] = ng(fmt(f"{_dev}: 로그인 실패 잠금 명령 없음 ({_ref}), AAA 서버 인증 미사용", "로그인 실패 시 차단 설정",
                                             "무제한 로그인 시도 허용 - 인증 서버 잠금 정책 적용 필요"))
 
+    # Cisco ASA(방화벽): IOS 라우터 문법·기본값 가정 항목은 수동확인, ASA 문법으로 확인되는 항목만 판정
+    #   관리 접속 허용 호스트 ssh/telnet/http <망> <마스크> <인터페이스> / enable·계정 비밀번호 encrypted(MD5)·pbkdf2
+    #   ssh timeout 기본 5분·console timeout 기본 0(무제한) / 인터페이스 ACL: access-group <ACL> in interface <if>
+    if vendor == "ASA":
+        _asa_ok = {"NET-001", "NET-007", "NET-009", "NET-012", "NET-031", "NET-033", "NET-034", "NET-035", "NET-036",
+                   "NET-037", "NET-048", "NET-049", "NET-050", "NET-052", "NET-056", "NET-058"}
+        if not any_m(r'^\s*snmp-server\s'):   # SNMP 미사용이면 SNMP 항목(미사용 판정)은 문법과 무관
+            _asa_ok |= {"NET-003", "NET-004", "NET-005", "NET-006"}
+        for _c, _v in list(results.items()):
+            if _c not in _asa_ok and _v[0] in (RESULT_BAD, RESULT_GOOD, RESULT_NA):
+                results[_c] = mc(f"ASA(방화벽) 설정 문법 자동 판정 미지원 - 수동 확인 (IOS 기준 참고: {_v[1][:100]})")
+        _mgmt = [(m.group(1).lower(), m.group(2), m.group(3), m.group(4)) for l in lines
+                 for m in [re.match(r'^\s*(ssh|telnet|http)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)', l, re.I)] if m]
+        _any = [f"{p} {a} {k} {i}" for p, a, k, i in _mgmt if a == "0.0.0.0" and k == "0.0.0.0"]
+        _cli = [x for x in _mgmt if x[0] in ("ssh", "telnet")]
+        if _any:
+            results['NET-013'] = ng(fmt(f"모든 IP 허용: {'; '.join(_any[:3])}", "관리 접속 허용 IP 제한", "모든 IP 에서 관리 접속 가능"))
+        elif _cli:
+            results['NET-013'] = ok(fmt("; ".join(f"{p} {a} {k} {i}" for p, a, k, i in _cli[:3]), "관리 접속 허용 IP 제한", "SSH/Telnet 허용 호스트 지정 - 허가 IP 적정성 확인"))
+        else:
+            results['NET-013'] = ok(fmt("ssh/telnet 허용 호스트 설정 없음", "관리 접속 허용 IP 제한", "원격 CLI 접속 불가 (ASA 기본값)"))
+        _tn = [x for x in _mgmt if x[0] == "telnet"]
+        results['NET-015'] = ng(fmt(f"Telnet 허용 호스트: {_tn[0][1]} {_tn[0][2]} {_tn[0][3]}", "암호화 프로토콜(SSH)만 허용", "Telnet 평문 접속 허용")) if _tn \
+            else ok(fmt("telnet 허용 호스트 설정 없음" + (" / SSH 허용 호스트 지정" if _cli else ""), "SSH 전용", "Telnet 미사용 (ASA 기본값)"))
+        _st = fline(r'^\s*ssh timeout\s+\d+'); _ct = fline(r'^\s*console timeout\s+\d+')
+        _sv = int(re.search(r'\d+', _st).group()) if _st else 5
+        _cv = int(re.search(r'\d+', _ct).group()) if _ct else 0
+        _bad = [x for x in ((f"ssh timeout {_sv}분" if _sv > 15 else ""), ("console timeout 0(무제한" + (")" if _ct else ", 기본값)") if _cv == 0 else
+                                                                            (f"console timeout {_cv}분" if _cv > 15 else ""))) if x]
+        results['NET-014'] = ng(fmt(" / ".join(_bad), "세션 타임아웃 15분 이하", "타임아웃 초과·무제한 존재")) if _bad \
+            else ok(fmt(f"ssh timeout {_sv}분{'' if _st else '(기본값)'} / console timeout {_cv}분", "세션 타임아웃 15분 이하", "기준 충족"))
+        _en = fline(r'^\s*enable password\s+\S+')
+        results['NET-010'] = ok(fmt("enable password 설정 (" + ("pbkdf2" if _en and "pbkdf2" in _en.lower() else "암호화 저장") + ")", "enable 비밀번호 설정", "enable 비밀번호 설정됨")) if _en \
+            else ng(fmt("enable password 미설정", "enable 비밀번호 설정", "ASA 기본값(빈 enable 비밀번호) - 설정 필요"))
+        _pw = [l for l in find_lines(r'^\s*(enable password|username\s+\S+\s+password|passwd)\s+\S+')]
+        _weak = [re.sub(r'\s+\S+\s+(encrypted|pbkdf2).*$', '', l) for l in _pw if not re.search(r'\bpbkdf2\b', l, re.I)]
+        if _pw:
+            results['NET-011'] = ng(fmt("; ".join(_weak[:4]) + " - encrypted(MD5 기반)", "비밀번호 안전한 알고리즘 암호화", f"약한 해시 {len(_weak)}건 - 비밀번호 재설정 시 pbkdf2 저장")) if _weak \
+                else ok(fmt(f"비밀번호 {len(_pw)}건 pbkdf2 저장", "비밀번호 안전한 알고리즘 암호화", "PBKDF2 적용"))
+        _srv = fline(r'^\s*aaa-server\s+\S+\s+protocol\s+(tacacs\+|radius|ldap)')
+        _loc = fline(r'^\s*aaa authentication\s+(ssh|telnet|http|serial)\s+console\s+\S+')
+        if _srv:
+            results['NET-008'] = ok(fmt(f"{_srv}" + (f" / {_loc}" if _loc else ""), "AAA 인증 설정 또는 별도 인증서버", "인증서버 연동"))
+        elif _loc:
+            results['NET-008'] = mc(fmt(_loc, "AAA 인증 설정 또는 별도 인증서버", "계정별 로컬 인증 사용 - 기관 정책상 중앙 인증서버 연동 필요 여부 확인"))
+        else:
+            results['NET-008'] = ng(fmt("aaa authentication ... console 미설정", "AAA 인증 설정", "관리 접속 사용자 인증 미설정"))
+        _ag = find_lines(r'^\s*access-group\s+\S+\s+(in|out)\s+interface\s+\S+')
+        for _c, _dir in (('NET-038', 'in'), ('NET-039', 'out')):
+            _l = [x for x in _ag if f" {_dir} interface " in x]
+            results[_c] = mc(fmt(f"인터페이스 ACL: {'; '.join(_l[:2])}" if _l else f"access-group {_dir} 미적용 (보안 레벨 기본 정책)",
+                                 "외부 인터페이스 필터 적용", "ACL 룰 내용·외부 인터페이스 적용 확인"))
+        _rp = fline(r'^\s*ip verify reverse-path interface\s+\S+')
+        if _rp:
+            results['NET-040'] = ok(fmt(_rp, "스푸핑 방지(uRPF) 설정", "uRPF 적용"))
+        elif _net_external(text):
+            results['NET-040'] = ng(fmt("ip verify reverse-path 미설정", "외부 인터페이스 uRPF 설정", "스푸핑 방지 미설정"))
+        results['NET-057'] = ok(fmt("ASA - CDP·Finger·identd·Smart Install 미지원", "취약 서비스 비활성화", "해당 서비스 없음"))
+        # 불필요 서비스: SNMP v1/v2c · ASDM(http server) 전체 허용 · DHCP 서버 · DNS 조회 (ASA 는 모두 설정 시에만 활성)
+        _svc = []
+        if any_m(r'^\s*snmp-server (community|host\s+\S+\s+\S+.*\bcommunity\b)') and not any_m(r'^\s*snmp-server (group|user)\s.*\bv3\b'):
+            _svc.append("SNMP(v1/v2c)")
+        if any_m(r'^\s*http server enable\b') and any(p == "http" and a == "0.0.0.0" for p, a, k, i in _mgmt):
+            _svc.append("HTTP(ASDM) 모든 IP 허용")
+        if any_m(r'^\s*dhcpd enable\s+\S+'):
+            _svc.append("DHCP서버(dhcpd)")
+        if any_m(r'^\s*dns domain-lookup\s+\S+'):
+            _svc.append("Domain-lookup(dns domain-lookup)")
+        results['NET-030'] = ng(fmt(f"활성 불필요 서비스 {len(_svc)}개 - {', '.join(_svc)}", "SNMP-v1v2/HTTP/DHCP/Domain-lookup 등 비활성화", f"비활성화 필요: {', '.join(_svc)}")) if _svc \
+            else ok(fmt("SNMP v1/v2c·ASDM 전체 허용·DHCP 서버·DNS 조회 설정 없음", "불필요 서비스 비활성화", "ASA 기본값 - 해당 서비스 미사용"))
+        if results.get('NET-058', ("",))[0] == RESULT_BAD:
+            results['NET-058'] = ng(fmt("aaa local authentication attempts max-fail 미설정", "로그인 실패 시 차단 설정", "로컬 계정 로그인 실패 잠금 없음"))
+
     # Cisco NX-OS: IOS 기본값·명령 가정 항목을 NX-OS 기본값으로 판정
     #   AAA 항상 활성(로컬 인증) / enable 모드 없음(역할 기반) / password 5 $5$·$6$ = SHA-2 crypt
     #   Proxy ARP·Directed Broadcast 기본 비활성 / 로그 타임스탬프 기본 기록 / 콘솔 로깅 기본 critical(2)
@@ -2496,6 +2602,93 @@ def _net_external(text):
     return False
 
 
+# 평가기준 통합 점검 항목(NET-030 불필요 서비스·NET-057 취약 서비스) → 가이드 서비스별 항목: (근거 항목, 서비스 판별 정규식)
+_NET_SHARED = {
+    "N-17": ("NET-030", r"SNMP"), "N-27": ("NET-030", r"HTTP|Web|웹"), "N-28": ("NET-030", r"small"),
+    "N-29": ("NET-030", r"BOOTP"), "N-36": ("NET-030", r"Domain"), "N-37": ("NET-030", r"\bPAD\b"),
+    "N-21": ("NET-057", r"TFTP"), "N-26": ("NET-057", r"Finger"), "N-30": ("NET-057", r"CDP|LLDP"), "N-35": ("NET-057", r"identd"),
+}
+
+
+def _net_shared_split(res, text):
+    """주요정보: 통합 항목이 '취약'이어도 활성 서비스 목록에 없는 서비스의 가이드 항목은 취약을 물려받지 않음
+    (예: SNMP 만 사용 중인데 웹·BOOTP·PAD 항목까지 취약). 직접 판정이 있는 항목(IOS 계열)은 건드리지 않음"""
+    out = {}
+    for k, (src, pat) in _NET_SHARED.items():
+        if k in res or src not in res or res[src][0] != RESULT_BAD:
+            continue
+        actual = res[src][1].split("[기준]")[0]   # [실제값] 부분 = 활성 서비스 목록 (기준 문구에는 모든 서비스명이 있음)
+        name = KISA_GUIDE_ITEMS[k][2]
+        if not re.search(pat, actual, re.I):
+            out[k] = (RESULT_MANUAL, f"{src} 통합 점검의 활성 서비스에 해당 없음 ({actual.replace('[실제값]', '').strip()[:80]}) - {name} 별도 확인")
+        elif k == "N-17":   # 가이드: 사용하지 않는 SNMP 비활성화 → 사용 중이면 필요성 확인
+            out[k] = (RESULT_MANUAL, f"SNMP 사용 중 ({src}) - 업무상 필요 여부 확인 (불필요 시 비활성화)")
+        elif k == "N-27" and re.search(r"(?mi)^\s*config\s+trusted_host\b", text):   # D-Link 네이티브: 관리 접속 IP 제한
+            out[k] = (RESULT_GOOD, f"웹 관리 사용 - trusted_host 로 관리 접속 IP 제한 ({src})")
+    return out
+
+
+def _junos_to_set(text):
+    """Junos 계층형 설정(show configuration) → set 형식 (show configuration | display set 과 같은 줄)
+    inactive: 로 비활성화한 설정은 제외, 목록 [ a b ] 은 항목별 set 줄로 분리"""
+    out, stack, buf, quote = [], [], [], False
+    body = "\n".join(re.sub(r"(^|\s)#.*$", "", l) if '"' not in l else re.sub(r"\s##.*$", "", l)   # # / ## 주석 제거
+                     for l in text.splitlines())
+    body = re.sub(r"/\*.*?\*/", " ", body, flags=re.S)
+    for ch in body:   # 문자 단위: 따옴표 안의 { } ; 는 문장 일부
+        if ch == '"':
+            quote = not quote
+        if quote or ch not in "{};":
+            buf.append(ch)
+            continue
+        stmt = " ".join("".join(buf).split()); buf = []
+        if ch == "{":
+            stack.append(stmt)
+            continue
+        if ch == "}":
+            if stack:
+                stack.pop()
+            continue
+        if not stmt or stmt.startswith("inactive:") or any(p.startswith("inactive:") for p in stack):
+            continue
+        path = [re.sub(r"^(protect|replace):\s*", "", p) for p in stack if p]
+        m = re.match(r"^(.*?)\s*\[\s*(.*?)\s*\]$", stmt)
+        if m:
+            out += ["set " + " ".join(path + ([m.group(1)] if m.group(1) else []) + [x]) for x in m.group(2).split()]
+        else:
+            out.append("set " + " ".join(path + [stmt]))
+    return "\n".join(out)
+
+
+def _net_os_label(vendor, text, ver=None):
+    """보고서 O/S 표시용 플랫폼 이름 (Cisco 는 IOS / IOS-XE / NX-OS / ASA 구분)"""
+    if vendor == "CISCO":
+        if _net_nxos(text):
+            return "Cisco NX-OS"
+        major = (ver or "").split(".")[0]
+        return "Cisco IOS-XE" if ("IOS XE" in text or "IOS-XE" in text or major in ("16", "17", "26")) else "Cisco IOS"
+    return {"ASA": "Cisco ASA", "JUNIPER": "Juniper Junos", "HUAWEI": "Huawei VRP", "DELL": "Dell OS9", "ALTEON": "Radware Alteon",
+            "A10": "A10 ACOS", "BIGIP": "F5 BIG-IP", "CITRIX": "Citrix ADC", "BROCADE": "Brocade", "PIOLINK": "Piolink"}.get(vendor, vendor)
+
+
+def _net_identity(text):
+    """config → (호스트명, OS 버전) — 벤더별 문법 (IOS/NX-OS/ASA/Dell/A10 hostname, Junos host-name, Huawei sysname)"""
+    hn = None
+    for pat in (r'^\s*hostname\s+"?([^"\s]+)', r'^\s*set system host-name\s+"?([^"\s]+)', r'^\s*host-name\s+"?([^";\s]+)',
+                r'^\s*sysname\s+(\S+)', r'^\s*config snmp system_name\s+(\S+)'):
+        m = re.search(pat, text, re.M | re.I)
+        if m:
+            hn = m.group(1); break
+    ver = None
+    for pat in (r'^:?\s*(?:ASA|PIX) Version\s+(\S+)', r'^\s*set version\s+(\S+)', r'^\s*version\s+([^\s;]+);',
+                r'^!\s*Version\s+([^\s,]+)', r'^/\*\s*Version\s+(\S+)',
+                r'^\s*(?:version|JUNOS|Software Version)\s+(\S+)'):
+        m = re.search(pat, text, re.M | re.I)
+        if m:
+            ver = m.group(1); break
+    return hn, ver
+
+
 def _net_nxos(text):
     """Cisco NX-OS config 여부 (running-config 의 version 은 IOS 는 15.2, NX-OS 는 9.3(8) 형식)"""
     return bool(re.search(r"(?mi)^\s*feature\s+\S|^\s*version\s+\d+\.\d+\(\d+\)|\bnx-?os\b", text))
@@ -2535,7 +2728,7 @@ def build_net_kisa_checks(lines, text):
     - 제조사(D-Link 등) 기본값 차이 반영, L3 인터페이스 보유 여부로 인터페이스 항목 적용
     """
     vendor = detect_net_vendor(text)
-    if vendor not in ("CISCO", "ASA"):
+    if vendor != "CISCO":   # ASA·Juniper 등은 전자금융 항목의 벤더별 판정을 근거로 변환
         return {}
     brand, model, _ = _net_brand(text)
     dlink = brand == "D-LINK"
@@ -2701,11 +2894,7 @@ def build_net_kisa_checks(lines, text):
                          else (RESULT_MANUAL, f"{dev}: 기본 로깅(logging on 기본 활성, 버퍼 warnings 이상)만 동작 - 기관 로그 기록 정책(레벨·대상)에 부합하는지 확인 ({DGS_REF}), 원격 로그는 N-11"))
     # N-14 (IOS 계열): running-config 에 로깅 구문이 없으면 기본 로깅(logging on)만 동작 - 정책 부합 여부는 config 만으로 판정 불가
     if "N-14" not in r:
-        if vendor == "ASA":
-            le, lt = on(r"^\s*logging enable\b"), on(r"^\s*logging (trap|host)\b")
-            r["N-14"] = ((RESULT_GOOD, f"로깅 활성: {le}" + (f" / {lt}" if lt else ""))
-                         if le else (RESULT_BAD, "logging enable 미설정 - ASA 기본 로깅 비활성"))
-        elif on(r"^\s*no\s+logging\s+on\b"):
+        if on(r"^\s*no\s+logging\s+on\b"):
             r["N-14"] = (RESULT_BAD, "시스템 로깅 비활성 (no logging on)")
         else:
             lg = on(r"^\s*logging\s+(buffered|host|server|trap|console|monitor|\d)")
@@ -7187,7 +7376,9 @@ def _eos_products_from(category, text, evd, hinfo):
         osd = hinfo.get("os", "")
         v = re.search(r"(\d+\.\d+(?:\.\d+)?)", osd)
         vendor = detect_net_vendor(text)
-        if "IOS XE" in text or "IOS-XE" in text or (vendor == "CISCO" and v and v.group(1).split(".")[0] in ("16", "17", "26")):
+        if vendor == "CISCO" and _net_nxos(text):   # NX-OS 는 내장 EoS 데이터 없음 → 확인 필요
+            out.append(("네트워크 OS", "cisco-nx-os", v.group(1) if v else ""))
+        elif "IOS XE" in text or "IOS-XE" in text or (vendor == "CISCO" and v and v.group(1).split(".")[0] in ("16", "17", "26")):
             out.append(("네트워크 OS", "cisco-ios-xe", v.group(1) if v else ""))
         elif vendor == "CISCO" and "D-LINK" not in osd:
             out.append(("네트워크 OS", "cisco-ios", v.group(1) if v else ""))
@@ -7215,7 +7406,7 @@ def _eos_scan_category(category, base_dir):
     d = os.path.join(base_dir, category, "config" if category == "network" else "output")
     if not os.path.isdir(d):
         return [], mod
-    files = sorted(f for f in os.listdir(d) if f.endswith(".txt"))
+    files = sorted(f for f in os.listdir(d) if f.lower().endswith(NET_CONFIG_EXTS if category == "network" else (".txt",)))
     res_files = [f for f in files if "evidence" not in f.lower()] if category != "network" else files
     use_evd_only = category != "network" and not res_files
     targets = files if use_evd_only else res_files
@@ -7234,11 +7425,12 @@ def _eos_scan_category(category, base_dir):
         comps = []
         if category == "network":
             lines = text.splitlines()
+            if not text.strip():   # 빈 파일은 장비 아님
+                continue
             brand, model, fw = _net_brand(text)
-            mv = re.search(r"^\s*(?:version|JUNOS|Software Version)\s+(\S+)", text, re.M | re.I)
-            hinfo["os"] = " ".join(x for x in ((brand or detect_net_vendor(text)), model, (mv.group(1) if mv else fw)) if x)
-            hn = re.search(r"^\s*hostname\s+(\S+)", text, re.M)
-            host = hn.group(1) if hn else os.path.splitext(f)[0]
+            hn, mv = _net_identity(text)
+            hinfo["os"] = " ".join(x for x in ((brand or _net_os_label(detect_net_vendor(text), text, mv)), model, (mv or fw)) if x)
+            host = hn or os.path.splitext(f)[0]
             os_disp, kern = hinfo["os"], ""
         else:
             prod, ver, os_disp = _eos_os_from(text, evd)
@@ -7980,8 +8172,9 @@ def run_convert(mode, category, base_dir, criteria_excel):
         print(f"[ERROR] 입력 폴더 없음: {input_dir}")
         return
 
+    _exts = NET_CONFIG_EXTS if input_mode == "config" else (".txt",)
     input_files = [f for f in os.listdir(input_dir)
-                   if f.endswith(".txt") and "evidence" not in f.lower()]
+                   if f.lower().endswith(_exts) and "evidence" not in f.lower()]
     # 결과 파일이 없으면 증적 파일(*_evidence.txt)의 [판정] 줄로 결과 복원
     evidence_only = False
     if not input_files and input_mode == "pipe":
@@ -7991,7 +8184,7 @@ def run_convert(mode, category, base_dir, criteria_excel):
             evidence_only = True
             print(f"[안내] 결과 파일 없음 → 증적 파일 {len(input_files)}개의 [판정] 줄로 결과 복원")
     if not input_files:
-        print(f"[ERROR] {input_dir}에 .txt 파일 없음")
+        print(f"[ERROR] {input_dir}에 {'/'.join(_exts)} 파일 없음")
         return
 
     # 기준 엑셀에서 항목 목록 로드
@@ -8084,7 +8277,17 @@ def run_convert(mode, category, base_dir, criteria_excel):
                 else:
                     res[code] = (RESULT_MANUAL, "스크립트 미점검 항목 (수동 확인 필요)")
         else:  # network config
+            if not text.strip():
+                print(f"[경고] {fname}: 빈 파일 - 제외")
+                continue
             vendor = detect_net_vendor(text)
+            if vendor == "JUNIPER" and not re.search(r"(?m)^set ", text):   # 계층형(show configuration) → set 형식
+                text = _junos_to_set(text); lines = text.splitlines()
+                print(f"[INFO] {fname}: Junos 계층형 설정 → set 형식으로 변환해 판정")
+            if vendor == "UNKNOWN":
+                print(f"[경고] {fname}: 제조사를 판별하지 못함 - 자동 판정 없이 전 항목 수동확인 (장비 config 파일이 맞는지 확인)")
+            elif vendor in ("HUAWEI", "A10", "DELL", "BIGIP", "CITRIX", "BROCADE", "PIOLINK"):
+                print(f"[안내] {fname}: {vendor} 장비는 전용 판정 규칙이 없어 대부분 수동확인으로 나옵니다")
             res    = build_net_checks(lines, text)
             sub_key = None
             # 판정된 항목도 평가대상(장비 유형·벤더 그룹) 아니면 N-A
@@ -8094,14 +8297,14 @@ def run_convert(mode, category, base_dir, criteria_excel):
                     res[code] = (RESULT_NA, f"평가대상 아님 (장비 유형 {detect_net_dtype(lines)}·벤더 {vendor} 해당 없음 - 평가기준 평가대상 열)")
             if mode == "MI":   # 가이드 항목 직접 판정 (통합 점검 항목 분리)
                 res.update(build_net_kisa_checks(lines, text))
+                res.update(_net_shared_split(res, text))
             if not hinfo.get("os"):
-                mv = re.search(r"^\s*(?:version|JUNOS|Software Version)\s+(\S+)", text, re.M | re.I)
-                hn = re.search(r"^\s*hostname\s+(\S+)", text, re.M)
+                hn, mv = _net_identity(text)
                 if hn and hinfo["hostname"] == pure:
-                    hinfo["hostname"] = hn.group(1)
+                    hinfo["hostname"] = hn
                 brand, model, fw = _net_brand(text)
-                ver = mv.group(1) if mv else fw
-                hinfo["os"] = " ".join(x for x in ((brand or vendor), model, ver) if x)
+                ver = mv or fw
+                hinfo["os"] = " ".join(x for x in ((brand or _net_os_label(vendor, text, ver)), model, ver) if x)
             net_subs = detect_net_subtypes(text, lines)
             for code in criteria_items:
                 if code in res: continue
@@ -8111,7 +8314,8 @@ def run_convert(mode, category, base_dir, criteria_excel):
                     res[code] = (RESULT_NA, f"장비 유형({', '.join(net_subs) or vendor})에 해당 없음")
                 else:
                     res[code] = (RESULT_MANUAL, "config에서 자동 판단 불가 (수동 확인)")
-            print(f"[INFO] {fname} → 벤더: {vendor}, 취약: {sum(1 for v in res.values() if v[0]==RESULT_BAD)}건")
+            print(f"[INFO] {fname} → {_net_os_label(vendor, text, _net_identity(text)[1])} / 장비 유형 {detect_net_dtype(lines)}"
+                  + (" / 외부망 연결 단서(공인 IP·BGP) 있음" if _net_external(text) else ""))
 
         res = run_eos_check(category, res, text, base_dir)
 
