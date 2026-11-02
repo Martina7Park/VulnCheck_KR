@@ -172,6 +172,7 @@ _local_ips() {   # 루프백 제외 IPv4 전부 (중복 제거)
     { ip -o -4 addr show 2>/dev/null | awk '{print $4}' | sed 's#/.*##'
       ifconfig -a 2>/dev/null | sed -n 's/.*inet \(addr:\)\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\2/p'
       hostname -I 2>/dev/null | tr ' ' '\n'
+      [ -r /proc/net/fib_trie ] && awk '$1=="|--"{ip=$2} /\/32 host LOCAL/{print ip}' /proc/net/fib_trie 2>/dev/null   # ip·ifconfig·hostname 이 없는 최소 Linux
     } | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -v '^127\.' | awk '!s[$0]++'
 }
 _ip_header() { local l; l=$(_local_ips | tr '\n' ',' | sed 's/,$//; s/,/, /g'); echo "${l:-미확인}"; }
