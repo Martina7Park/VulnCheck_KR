@@ -24,7 +24,7 @@
 #   PgSQL:   PGSQL_USER   PGSQL_DB     PGSQL_HOST  (PGPASSWORD/.pgpass 없으면 소켓+peer(root 실행 시 postgres 구동 계정) → localhost 순)
 #   ※ 비밀번호는 환경변수 또는 실행 중 숨김 입력으로만 전달 (명령 인자·파일에 남기지 않음)
 #   Tibero:  TIBERO_USER  TIBERO_PASS  TIBERO_DB
-#   MSSQL:   MSSQL_USER   MSSQL_PASS   MSSQL_SERVER MSSQL_PORT (기본: sa/CHANGE_ME/localhost/1433)
+#   MSSQL:   MSSQL_USER   MSSQL_PASS   MSSQL_SERVER MSSQL_PORT (기본: sa/-/localhost/1433, MSSQL_PASS 미지정 시 숨김 입력)
 #
 # [실행 방법]
 #   DBMS_TYPE=oracle  bash check_dbms.sh > /tmp/$(hostname)_oracle.txt
@@ -1496,14 +1496,28 @@ check_tibero() {
         return
     fi
 
+    # 접속 문자열은 표준입력의 CONNECT 로만 전달 (명령 인자면 ps 로 비밀번호가 보임) — 이 방식이 안 되는 tbsql 만 인자 방식(_TB_ARGV=1)
+    _TB_ARGV=""
     run_q() {
-        "$TBSQL" "${TB_USER}/${TB_PASS}${TB_DB:+@${TB_DB}}" << EOF 2>/dev/null
-SET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 200 TRIMSPOOL ON
-$1
-EXIT
-EOF
+        local _o _c="${TB_USER}/${TB_PASS}${TB_DB:+@${TB_DB}}"
+        if [ -z "$_TB_ARGV" ]; then
+            _o=$(printf 'CONNECT %s\nSET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 200 TRIMSPOOL ON\nPROMPT __Q_BEGIN__\n%s\nEXIT\n' "$_c" "$1" | "$TBSQL" -s 2>/dev/null)
+        else
+            _o=$(printf 'SET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 200 TRIMSPOOL ON\nPROMPT __Q_BEGIN__\n%s\nEXIT\n' "$1" | "$TBSQL" -s "$_c" 2>/dev/null)
+        fi
+        # -s 미지원·PROMPT 미지원 버전도 배너·접속 메시지가 결과로 섞이지 않도록 표지 이후만 사용
+        printf '%s\n' "$_o" | grep -q '^__Q_BEGIN__$' && _o=$(printf '%s\n' "$_o" | awk 'f {print} /^__Q_BEGIN__$/ {f = 1}')
+        if printf '%s\n' "$_o" | grep -qE '^TBR-[0-9]+'; then
+            printf '[SQL오류] %s\n%s\n\n' "$(printf '%s' "$1" | head -c 200)" "$(printf '%s\n' "$_o" | grep -E '^TBR-')" >> "$_EVD"
+            printf '%s\n' "$_o" | grep -E '^TBR-' | head -1
+        else printf '%s\n' "$_o"; fi
     }
+    _tb_one() { run_q "$1" | grep -v '^[[:space:]]*$' | head -1 | tr -d ' ' | grep -v '^TBR-'; }   # 단일 값 (조회 실패는 빈 값 → 각 항목에서 수동확인)
     _tbc=$(run_q "SELECT 'CONN_'||'OK' FROM DUAL;")
+    if ! echo "$_tbc" | grep -q CONN_OK; then
+        _TB_ARGV=1; _tbc=$(run_q "SELECT 'CONN_'||'OK' FROM DUAL;")
+        if echo "$_tbc" | grep -q CONN_OK; then printf '[경고] tbsql 표준입력 CONNECT 실패 → 접속 문자열을 명령 인자로 전달 (점검 중 ps 에 비밀번호 노출)\n\n' >> "$_EVD"; else _TB_ARGV=""; fi
+    fi
     if ! echo "$_tbc" | grep -q CONN_OK && [ -z "$TIBERO_DB" ]; then TB_DB="tibero"; _tbc=$(run_q "SELECT 'CONN_'||'OK' FROM DUAL;"); fi
     _conn_ok "$_tbc" "Tibero" || return
     # 파라미터는 V$PARAMETERS(대문자 이름) — 실무 스크립트 동일 표기, 조회 실패는 빈 값
@@ -1540,14 +1554,16 @@ EOF
     # DBM-006: 로그인 실패 횟수 제한
     # 평가기준: 계정별 적용 프로파일 FAILED_LOGIN_ATTEMPTS UNLIMITED/5 초과 → 취약 (Oracle 호환 뷰, 조회 실패 시 DEFAULT 프로파일)
     _tp6=$(run_q "SELECT u.USERNAME||'='||DECODE(p.LIMIT,'DEFAULT',d.LIMIT,p.LIMIT) FROM DBA_USERS u JOIN DBA_PROFILES p ON p.PROFILE=u.PROFILE AND p.RESOURCE_NAME='FAILED_LOGIN_ATTEMPTS' JOIN DBA_PROFILES d ON d.PROFILE='DEFAULT' AND d.RESOURCE_NAME='FAILED_LOGIN_ATTEMPTS' WHERE u.ACCOUNT_STATUS='OPEN' ORDER BY 1;" | grep "=" | grep -vi "TBR-")
-    failed=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='FAILED_LOGIN_ATTEMPTS';" | tr -d ' \n')
+    failed=$(_tb_one "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='FAILED_LOGIN_ATTEMPTS';")
     evd_q "DBM-006" "OPEN 계정별 FAILED_LOGIN_ATTEMPTS / DEFAULT" "$(echo "$_tp6" | _csv) / ${failed}"
     _tb6=$(echo "$_tp6" | awk -F= '$2=="UNLIMITED" || $2+0>5 || $2=="" {print}' | head -8)
     if [ -n "$_tp6" ]; then
         [ -n "$_tb6" ] && ng "006" "FAILED_LOGIN_ATTEMPTS UNLIMITED/5 초과 계정: $(echo "$_tb6" | _csv) - 서비스 운영 계정은 평가 제외 가능" \
                        || ok "006" "OPEN 계정 FAILED_LOGIN_ATTEMPTS 5회 이하"
-    elif [ "$failed" = "UNLIMITED" ] || [ -z "$failed" ]; then
-        ng "006" "FAILED_LOGIN_ATTEMPTS=${failed:-UNLIMITED(기본값)}"
+    elif [ -z "$failed" ]; then
+        mc "006" "DBA_PROFILES 조회 실패 - FAILED_LOGIN_ATTEMPTS 수동 확인"
+    elif [ "$failed" = "UNLIMITED" ]; then
+        ng "006" "FAILED_LOGIN_ATTEMPTS=UNLIMITED"
     elif [ "$failed" -le 5 ] 2>/dev/null; then
         ok "006" "FAILED_LOGIN_ATTEMPTS=${failed} (5회 이하, DEFAULT 프로파일)"
     else
@@ -1557,20 +1573,21 @@ EOF
     # 계정별 적용 프로파일 값 (OPEN 계정, LIMIT=DEFAULT 는 DEFAULT 프로파일 값) — 평가기준 '계정별 프로파일'
     _tb_prof() { run_q "SELECT u.USERNAME||'='||DECODE(p.LIMIT,'DEFAULT',d.LIMIT,p.LIMIT) FROM DBA_USERS u JOIN DBA_PROFILES p ON p.PROFILE=u.PROFILE AND p.RESOURCE_NAME='$1' JOIN DBA_PROFILES d ON d.PROFILE='DEFAULT' AND d.RESOURCE_NAME='$1' WHERE u.ACCOUNT_STATUS='OPEN' ORDER BY 1;" | grep "=" | grep -vi "TBR-"; }
     # DBM-007: 패스워드 복잡도
-    _tb_pwfunc=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_VERIFY_FUNCTION';" | tr -d ' \n')
+    _tb_pwfunc=$(_tb_one "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_VERIFY_FUNCTION';")
     _tp7=$(_tb_prof PASSWORD_VERIFY_FUNCTION)
     evd_q "DBM-007" "PASSWORD_VERIFY_FUNCTION (DEFAULT / OPEN 계정별)" "${_tb_pwfunc:-미설정} / $(echo "$_tp7" | _csv)"
-    _tn7=$(echo "$_tp7" | awk -F= '$2=="" || toupper($2)=="NULL" {print $1}' | head -8)
+    _tn7=$(echo "$_tp7" | awk -F= '$2=="" || toupper($2)=="NULL" || toupper($2)=="NULL_VERIFY_FUNCTION" {print $1}' | head -8)   # NULL_VERIFY_FUNCTION = 검증 안 함(기본값)
     # 평가기준: 검증 함수 미적용 계정 존재 또는 함수 내용이 복잡도(2종 10자/3종 8자) 미충족 시 취약 → 적용 시 함수 내용 확인
     if [ -n "$_tp7" ] && [ -n "$_tn7" ]; then ng "007" "비밀번호 검증 함수 미적용 계정: $(echo "$_tn7" | _csv)"
     elif [ -n "$_tp7" ]; then mc "007" "OPEN 계정 검증 함수 적용: $(echo "$_tp7" | cut -d= -f2 | sort -u | _csv) - 함수 내용이 복잡도 기준(2종 10자/3종 8자) 충족하는지 확인"
-    elif [ -z "$_tb_pwfunc" ] || [ "$_tb_pwfunc" = "NULL" ]; then ng "007" "PASSWORD_VERIFY_FUNCTION 미설정"
+    elif [ -z "$_tb_pwfunc" ]; then mc "007" "DBA_PROFILES 조회 실패 - PASSWORD_VERIFY_FUNCTION 수동 확인"
+    elif [ "${_tb_pwfunc^^}" = "NULL" ] || [ "${_tb_pwfunc^^}" = "NULL_VERIFY_FUNCTION" ]; then ng "007" "PASSWORD_VERIFY_FUNCTION=${_tb_pwfunc} (검증 함수 미적용)"
     else mc "007" "PASSWORD_VERIFY_FUNCTION=${_tb_pwfunc} - 함수 내용이 복잡도 기준(2종 10자/3종 8자) 충족하는지 확인"; fi
 
     # DBM-008: 패스워드 변경 주기
     # 평가기준: 만료 정책(PASSWORD_LIFE_TIME, PASSWORD_GRACE_TIME) — 변경 후 90일 이상 지나도 계정이 만료되지 않으면 취약
-    _tb_life=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_LIFE_TIME';" | tr -d ' \n')
-    _tb_grace=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_GRACE_TIME';" | tr -d ' \n')
+    _tb_life=$(_tb_one "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_LIFE_TIME';")
+    _tb_grace=$(_tb_one "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_GRACE_TIME';")
     _tp8=$(join -t= <(_tb_prof PASSWORD_LIFE_TIME | sort) <(_tb_prof PASSWORD_GRACE_TIME | sort) 2>/dev/null)
     evd_q "DBM-008" "PASSWORD_LIFE_TIME / PASSWORD_GRACE_TIME (DEFAULT / OPEN 계정별 LIFE=GRACE)" "${_tb_life} / ${_tb_grace} / $(echo "$_tp8" | _csv)"
     _tb8=$(echo "$_tp8" | awk -F= '{l=$2; g=$3; if (g=="UNLIMITED") g=99999; if (l=="UNLIMITED" || l=="" || l+0+g>90) print $1"="$2"+"$3}' | head -8)
@@ -1578,9 +1595,13 @@ EOF
     if [ -n "$_tp8" ]; then
         [ -n "$_tb8" ] && ng "008" "90일 지나도 만료되지 않는 계정(LIFE+GRACE): $(echo "$_tb8" | _csv) - 서비스 운영 계정은 평가 제외 가능" \
                        || ok "008" "OPEN 계정 PASSWORD_LIFE_TIME+GRACE_TIME 90일 이내 만료"
-    elif [ "$_tb_life" = "UNLIMITED" ] || [ -z "$_tb_life" ]; then
-        ng "008" "PASSWORD_LIFE_TIME=${_tb_life:-UNLIMITED(기본값)} (무제한)"
-    elif [ $((${_tb_life%%.*} + ${_g%%.*})) -le 90 ] 2>/dev/null; then
+    elif [ -z "$_tb_life" ]; then
+        mc "008" "DBA_PROFILES 조회 실패 - PASSWORD_LIFE_TIME 수동 확인"
+    elif [ "$_tb_life" = "UNLIMITED" ]; then
+        ng "008" "PASSWORD_LIFE_TIME=UNLIMITED (무제한)"
+    elif ! [[ "${_tb_life%%.*}" =~ ^[0-9]+$ && "${_g%%.*}" =~ ^[0-9]+$ ]]; then
+        mc "008" "PASSWORD_LIFE_TIME=${_tb_life}, GRACE_TIME=${_tb_grace} - 값 해석 불가, 수동 확인"
+    elif [ $((${_tb_life%%.*} + ${_g%%.*})) -le 90 ]; then
         ok "008" "PASSWORD_LIFE_TIME=${_tb_life}일 + GRACE_TIME=${_tb_grace:-0}일 (90일 이내 만료)"
     else
         ng "008" "PASSWORD_LIFE_TIME=${_tb_life}일 + GRACE_TIME=${_tb_grace:-0}일 (90일 지나도 만료되지 않음)"
@@ -1588,7 +1609,7 @@ EOF
 
     # DBM-009: 세션 타임아웃 (IDLE_TIME + resource_limit)
     # 평가기준: ACTIVE_SESSION_TIMEOUT (전체 접속 적용 - 운영 영향 고려). tip 파일 우선, 파라미터 뷰 보조
-    _tb_ast=$(grep -hiE '^\s*ACTIVE_SESSION_TIMEOUT\s*=' "$TB_HOME"/config/*.tip 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
+    _tb_ast=$(grep -hiE '^[[:space:]]*ACTIVE_SESSION_TIMEOUT[[:space:]]*=' "$TB_HOME"/config/*.tip 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
     [ -z "$_tb_ast" ] && _tb_ast=$(_tb_param ACTIVE_SESSION_TIMEOUT)
     evd_q "DBM-009" "ACTIVE_SESSION_TIMEOUT (tip/V\$PARAMETERS)" "${_tb_ast:-미설정}"
     if [ -z "$_tb_ast" ] || [ "$_tb_ast" = "0" ]; then
@@ -1599,7 +1620,7 @@ EOF
 
     # DBM-011: 감사 로그
     _tb_audit=$(_tb_param AUDIT_TRAIL)
-    [ -z "$_tb_audit" ] && _tb_audit=$(grep -hiE '^\s*AUDIT_TRAIL\s*=' "$TB_HOME"/config/*.tip 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
+    [ -z "$_tb_audit" ] && _tb_audit=$(grep -hiE '^[[:space:]]*AUDIT_TRAIL[[:space:]]*=' "$TB_HOME"/config/*.tip 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
     evd_q "DBM-011" "AUDIT_TRAIL (V\$PARAMETERS / tip)" "${_tb_audit:-조회 실패}"
     if [ -z "$_tb_audit" ]; then mc "011" "AUDIT_TRAIL 조회 실패(V\$PARAMETERS/tip) - 수동 확인"
     elif [ "${_tb_audit^^}" = "NONE" ]; then ng "011" "AUDIT_TRAIL=NONE"
@@ -1615,8 +1636,8 @@ EOF
 
     # DBM-013: 원격 접속 제어
     # 평가기준: $TB_SID.tip 의 LSNR_INVITED_IP / LSNR_DENIED_IP (_FILE 포함) 설정 여부
-    evd "DBM-013" "grep -hiE '^\s*LSNR_(INVITED|DENIED)_IP' ${TB_HOME}/config/*.tip 2>/dev/null"
-    _tb_acl=$(grep -hiE '^\s*LSNR_(INVITED|DENIED)_IP(_FILE)?\s*=' "$TB_HOME"/config/*.tip 2>/dev/null | head -3 | tr '\n' ' ')
+    evd "DBM-013" "grep -hiE '^[[:space:]]*LSNR_(INVITED|DENIED)_IP' ${TB_HOME}/config/*.tip 2>/dev/null"
+    _tb_acl=$(grep -hiE '^[[:space:]]*LSNR_(INVITED|DENIED)_IP(_FILE)?[[:space:]]*=' "$TB_HOME"/config/*.tip 2>/dev/null | head -3 | tr '\n' ' ')
     if [ -n "$_tb_acl" ]; then ok "013" "리스너 IP 접근제어 설정: ${_tb_acl}"
     elif ls "$TB_HOME"/config/*.tip >/dev/null 2>&1; then ng "013" "LSNR_INVITED_IP/LSNR_DENIED_IP 미설정 - 네트워크 장비·솔루션 접근제어 적용 시 수동 확인"
     else mc "013" "tip 파일 미발견 - 원격 접근제어 수동 확인"; fi
@@ -1632,7 +1653,7 @@ EOF
     esac
 
     # DBM-015: PUBLIC 불필요 권한
-    _tb_pub=$(run_q "SELECT TABLE_NAME||' ('||PRIVILEGE||')' FROM DBA_TAB_PRIVS WHERE GRANTEE='PUBLIC' AND PRIVILEGE='EXECUTE' AND TABLE_NAME IN ('UTL_HTTP','UTL_FILE','UTL_SMTP','UTL_TCP','DBMS_SCHEDULER');" | grep -v "^$" | head -10)
+    _tb_pub=$(run_q "SELECT TABLE_NAME||' ('||PRIVILEGE||')' FROM DBA_TAB_PRIVS WHERE GRANTEE='PUBLIC' AND PRIVILEGE='EXECUTE' AND TABLE_NAME IN ('UTL_HTTP','UTL_FILE','UTL_SMTP','UTL_TCP','DBMS_SCHEDULER');" | grep -vi "TBR-" | grep -v "^$" | head -10)
     _tb_pubrs=$(run_q "SELECT GRANTED_ROLE FROM DBA_ROLE_PRIVS WHERE GRANTEE='PUBLIC' UNION ALL SELECT PRIVILEGE FROM DBA_SYS_PRIVS WHERE GRANTEE='PUBLIC';" | grep -v "^$" | grep -vi "TBR-" | head -10)
     evd_q "DBM-015" "PUBLIC Role·시스템 권한 / 위험 패키지 EXECUTE" "${_tb_pubrs:-없음} / ${_tb_pub:-없음}"
     if [ -n "$_tb_pubrs" ]; then ng "015" "PUBLIC 에 Role/시스템 권한 부여: $(echo "$_tb_pubrs" | _csv)"
@@ -1649,8 +1670,8 @@ EOF
     mc "017" "시스템 테이블 접근 권한 수동 확인 (위 현황 참조)"
 
     # DBM-019: 패스워드 재사용 제한
-    _tb_rmax=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_REUSE_MAX';" | tr -d ' \n')
-    _tb_rtime=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_REUSE_TIME';" | tr -d ' \n')
+    _tb_rmax=$(_tb_one "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_REUSE_MAX';")
+    _tb_rtime=$(_tb_one "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='PASSWORD_REUSE_TIME';")
     _tp19=$(join -t= <(_tb_prof PASSWORD_REUSE_MAX | sort) <(_tb_prof PASSWORD_REUSE_TIME | sort) 2>/dev/null)
     _tb19=$(echo "$_tp19" | awk -F= '$2=="UNLIMITED" && $3=="UNLIMITED" {print $1}' | head -8)
     evd_q "DBM-019" "PASSWORD_REUSE_MAX=${_tb_rmax}, TIME=${_tb_rtime} (DEFAULT) / OPEN 계정별 MAX=TIME" "$(echo "$_tp19" | _csv)"
@@ -1703,7 +1724,7 @@ EOF
     mc "028" "불필요 DB Object 수동 확인 (위 현황 참조)"
 
     # DBM-029: 자원 사용 제한 (프로파일)
-    _tb_sess=$(run_q "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='SESSIONS_PER_USER';" | tr -d ' \n')
+    _tb_sess=$(_tb_one "SELECT LIMIT FROM DBA_PROFILES WHERE PROFILE='DEFAULT' AND RESOURCE_NAME='SESSIONS_PER_USER';")
     evd_q "DBM-029" "SESSIONS_PER_USER" "$_tb_sess"
     [ "$_tb_sess" != "UNLIMITED" ] && [ -n "$_tb_sess" ] && ok "029" "SESSIONS_PER_USER=${_tb_sess}" || mc "029" "DBA_PROFILES 자원 제한 수동 확인"
 
@@ -1731,7 +1752,7 @@ EOF
     fi
 
     # DBM-033: 이중화 비밀번호 평문 노출 (Tibero Standby)
-    _tb_standby=$(run_q "SELECT DATABASE_ROLE FROM V\$DATABASE;" 2>/dev/null | tr -d ' \n')
+    _tb_standby=$(run_q "SELECT DATABASE_ROLE FROM V\$DATABASE;" 2>/dev/null | grep -v '^[[:space:]]*$' | grep -v '^TBR-' | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')   # 'PHYSICAL STANDBY' 공백 유지
     evd_q "DBM-033" "V\$DATABASE ROLE" "${_tb_standby:-PRIMARY 또는 조회불가}"
     if [ "${_tb_standby^^}" = "PHYSICAL STANDBY" ] || [ "${_tb_standby^^}" = "LOGICAL STANDBY" ]; then
         mc "033" "Standby 구성됨 - 복제 통신 암호화 수동 확인"
@@ -1757,7 +1778,7 @@ EOF
 # ================================================================
 check_mssql() {
     MSSQL_USER="${MSSQL_USER:-sa}"
-    MSSQL_PASS="${MSSQL_PASS-CHANGE_ME}"
+    MSSQL_PASS="${MSSQL_PASS-}"
     MSSQL_SERVER="${MSSQL_SERVER:-localhost}"
     MSSQL_PORT="${MSSQL_PORT:-1433}"
 
@@ -1776,17 +1797,31 @@ check_mssql() {
         return
     fi
 
-    _SQLCMD_OPTS="-S ${MSSQL_SERVER},${MSSQL_PORT} -U ${MSSQL_USER} -P ${MSSQL_PASS} -h -1 -W -s |"
-    if [ -n "$MSSQL_ENCRYPT" ] && [ "$MSSQL_ENCRYPT" = "0" ]; then
-        _SQLCMD_OPTS="$_SQLCMD_OPTS -N n"
-    else
-        _SQLCMD_OPTS="$_SQLCMD_OPTS -C"
-    fi
+    [ -z "$MSSQL_PASS" ] && [ -t 0 ] && { read -rs -p "SQL Server ${MSSQL_USER} 비밀번호: " MSSQL_PASS </dev/tty; echo >&2; }
+    # 비밀번호는 -P 대신 SQLCMDPASSWORD 환경변수 (명령 인자면 ps·/proc 으로 노출), 인자는 배열(공백·와일드카드 포함 값 안전)
+    #   -C: 서버 인증서 신뢰 (ODBC 18·go-sqlcmd 기본 암호화 필수 대응). ※ 이전 MSSQL_ENCRYPT=0 의 '-N n' 은 어떤 sqlcmd 도 받지 않아 제거
+    export SQLCMDPASSWORD="$MSSQL_PASS"
+    _SQLCMD_OPTS=(-S "${MSSQL_SERVER},${MSSQL_PORT}" -U "$MSSQL_USER" -h -1 -W -s '|' -C)
 
-    # -r 1: 오류(Msg nnn …)를 stderr 로 분리해 증적에만 기록 → 오류 문장이 결과(계정·권한 목록)로 섞이지 않음
-    run_q() { $SQLCMD $_SQLCMD_OPTS -r 1 -Q "$1" 2>>"$_EVD" | grep -v "^$" | grep -v "^---" | grep -vE "^\([0-9]+ rows"; }
+    # SET NOCOUNT ON: go-sqlcmd 의 '(1 row affected)' 등 행 수 메시지 제거
+    # -r 1: 오류(Msg nnn …)는 stderr → 증적에 기록하고 결과 끝에 '#ERR# …' 한 줄 (조회 실패를 '없음 → 양호'로 판정하지 않도록)
+    run_q() {
+        local _o _e
+        _o=$( { "$SQLCMD" "${_SQLCMD_OPTS[@]}" -r 1 -Q "SET NOCOUNT ON; $1" 2>&1 1>&3 | sed 's/^/#ERR# /'; } 3>&1 )
+        _e=$(printf '%s\n' "$_o" | grep '^#ERR# ' | grep -vE 'Changed (database context|language setting)')
+        printf '%s\n' "$_o" | grep -v '^#ERR# ' | grep -v "^$" | grep -v "^---" | grep -vE "^\([0-9]+ rows? affected\)"
+        if [ -n "$_e" ]; then
+            { printf '[SQL오류] %s\n' "$(printf '%s' "$1" | head -c 200)"; printf '%s\n\n' "$_e"; } >> "$_EVD"
+            printf '%s\n' "$_e" | head -1
+        fi
+    }
+    _ms_n() { run_q "$1" | grep -v '^#ERR# ' | tail -1 | tr -d ' \r' | grep -E '^[0-9]+$'; }   # 숫자 1개 (조회 실패는 빈 값)
+    _ms_err() { case "$1" in *"#ERR# "*) return 0 ;; esac; return 1; }
 
     _conn_ok "$(run_q "SELECT 'CONN_'+'OK'")" "MSSQL" || return
+    # sysadmin 이 아니면 카탈로그 뷰가 본인 관련 행만 보여 '없음 → 양호'로 오판 → 마지막에 SQL 조회 항목의 양호를 수동확인으로 보정
+    _ms_isadm=$(_ms_n "SELECT IS_SRVROLEMEMBER('sysadmin')")
+    [ "$_ms_isadm" != "1" ] && echo "# [경고] 점검 계정(${MSSQL_USER})이 sysadmin 아님 - 카탈로그 조회 범위 제한, SQL 조회 항목 양호는 수동확인 처리"
     DB_VER=$(run_q "SELECT @@VERSION" | head -1)
     _ver_num=""; echo "$DB_VER" | grep -oE "SQL Server [0-9]{4}" >/dev/null && _ver_num=$(echo "$DB_VER" | grep -oE "[0-9]{4}" | head -1)
     _build=""; echo "$DB_VER" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" >/dev/null && _build=$(echo "$DB_VER" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1)
@@ -1805,7 +1840,7 @@ check_mssql() {
     fi
 
     # DBM-001: 취약 패스워드 (비밀번호 정책 미적용 계정)
-    _ms_weakpw=$(run_q "SELECT COUNT(*) FROM sys.sql_logins WHERE is_policy_checked=0 AND is_disabled=0" | tail -1 | tr -d ' ')
+    _ms_weakpw=$(_ms_n "SELECT COUNT(*) FROM sys.sql_logins WHERE is_policy_checked=0 AND is_disabled=0")
     evd_q "DBM-001" "is_policy_checked=0 AND is_disabled=0 계정 수" "$_ms_weakpw"
     [ "${_ms_weakpw:-0}" -gt 0 ] 2>/dev/null && mc "001" "비밀번호 정책 미적용 활성 계정 ${_ms_weakpw}개 (크랙 우선 대상) - 계정 비밀번호 복잡도·취약 비밀번호 여부는 해시 크랙으로 확인 필요" || mc "001" "모든 SQL 계정 비밀번호 정책 적용됨 - 계정 비밀번호 복잡도·취약 비밀번호 여부는 해시 크랙으로 확인 필요"
 
@@ -1820,49 +1855,57 @@ check_mssql() {
     mc "004" "서버 수준 관리자 역할 부여: $(echo "${_ms_sysadmin:-없음}" | _csv) - 업무상 필요 여부 인터뷰 확인"
 
     # DBM-005: TDE 암호화
-    _ms_tde=$(run_q "SELECT COUNT(*) FROM sys.dm_database_encryption_keys WHERE encryption_state=3" | tail -1 | tr -d ' ')
+    _ms_tde=$(_ms_n "SELECT COUNT(*) FROM sys.dm_database_encryption_keys WHERE encryption_state=3")
     evd_q "DBM-005" "TDE encryption_state=3 count" "$_ms_tde"
     mc "005" "TDE 암호화 DB ${_ms_tde:-0}개 (참고) - 중요정보 컬럼 암호화(Always Encrypted·컬럼 암호화) 적용 여부 확인"
 
     # DBM-006: 로그인 실패 횟수 제한 (Linux 환경은 SQL Server 자체 정책)
-    _ms_nopol=$(run_q "SELECT COUNT(*) FROM sys.sql_logins WHERE is_policy_checked=0 AND is_disabled=0" | tail -1 | tr -d ' ')
+    _ms_nopol=$(_ms_n "SELECT COUNT(*) FROM sys.sql_logins WHERE is_policy_checked=0 AND is_disabled=0")
     evd_q "DBM-006" "is_policy_checked=0 (비밀번호 정책 미적용) 활성 계정 수" "$_ms_nopol"
-    if [ "${_ms_nopol:-0}" -eq 0 ] 2>/dev/null; then
+    if [ -z "$_ms_nopol" ]; then
+        mc "006" "sys.sql_logins 조회 실패 - 비밀번호 정책(로그인 실패 잠금) 적용 여부 수동 확인"
+    elif [ "$_ms_nopol" -eq 0 ]; then
         mc "006" "모든 SQL 계정 is_policy_checked=1 - Linux 환경 PAM/OS 계정 잠금 정책 수동 확인"
     else
         ng "006" "비밀번호 정책 미적용 계정 ${_ms_nopol}개 (is_policy_checked=0 → 로그인 실패 제한 미적용)"
     fi
 
     # DBM-007: 비밀번호 복잡도
-    _ms_nopwc=$(run_q "SELECT COUNT(*) FROM sys.sql_logins WHERE is_policy_checked=0 AND is_disabled=0 AND name NOT LIKE '##%'" | tail -1 | tr -d ' ')
+    _ms_nopwc=$(_ms_n "SELECT COUNT(*) FROM sys.sql_logins WHERE is_policy_checked=0 AND is_disabled=0 AND name NOT LIKE '##%'")
     evd_q "DBM-007" "is_policy_checked=0 (sa 제외) 계정 수" "$_ms_nopwc"
-    [ "${_ms_nopwc:-0}" -gt 0 ] 2>/dev/null && ng "007" "비밀번호 복잡도 정책 미적용 계정 ${_ms_nopwc}개" || ok "007" "모든 SQL 계정 비밀번호 복잡도 정책 적용됨"
+    if [ -z "$_ms_nopwc" ]; then mc "007" "sys.sql_logins 조회 실패 - 비밀번호 복잡도 정책 수동 확인"
+    elif [ "$_ms_nopwc" -gt 0 ]; then ng "007" "비밀번호 복잡도 정책 미적용 계정 ${_ms_nopwc}개"
+    else ok "007" "모든 SQL 계정 비밀번호 복잡도 정책 적용됨"; fi
 
     # DBM-008: 비밀번호 변경 주기
-    _ms_noexp=$(run_q "SELECT COUNT(*) FROM sys.sql_logins WHERE is_expiration_checked=0 AND is_disabled=0 AND name NOT IN ('sa','##MS_PolicyEventProcessingLogin##')" | tail -1 | tr -d ' ')
+    _ms_noexp=$(_ms_n "SELECT COUNT(*) FROM sys.sql_logins WHERE is_expiration_checked=0 AND is_disabled=0 AND name NOT IN ('sa','##MS_PolicyEventProcessingLogin##')")
     evd_q "DBM-008" "is_expiration_checked=0 계정 수" "$_ms_noexp"
     # 평가기준: PasswordLastSetTime 90일 이상 경과 계정 존재 시 취약
     _ms_old=$(run_q "SELECT name+' ('+CONVERT(varchar(10),CAST(LOGINPROPERTY(name,'PasswordLastSetTime') AS datetime),120)+')' FROM sys.sql_logins WHERE is_disabled=0 AND name NOT LIKE '##%' AND DATEDIFF(DAY,CAST(LOGINPROPERTY(name,'PasswordLastSetTime') AS datetime),GETDATE())>=90" | head -10)
     evd_q "DBM-008" "PasswordLastSetTime 90일 이상 경과 활성 로그인" "${_ms_old:-없음}"
-    if [ -n "$_ms_old" ]; then ng "008" "비밀번호 변경 후 90일 이상 경과 계정: $(echo "$_ms_old" | _csv) - 서비스 운영 계정은 평가 제외 가능"
+    if _ms_err "$_ms_old" || [ -z "$_ms_noexp" ]; then mc "008" "비밀번호 변경일 조회 실패 - 수동 확인"
+    elif [ -n "$_ms_old" ]; then ng "008" "비밀번호 변경 후 90일 이상 경과 계정: $(echo "$_ms_old" | _csv) - 서비스 운영 계정은 평가 제외 가능"
     elif [ "${_ms_noexp:-0}" -gt 0 ] 2>/dev/null; then mc "008" "90일 이상 경과 계정 없음, CHECK_EXPIRATION 미설정 ${_ms_noexp}개 - 주기적 변경 관리 확인"
     else ok "008" "활성 SQL 로그인 모두 90일 이내 비밀번호 변경"; fi
 
     # DBM-009: 미사용 세션 종료 (SQL Server는 글로벌 유휴 세션 타임아웃 미지원)
-    _ms_rg=$(run_q "SELECT COUNT(*) FROM sys.resource_governor_configuration WHERE is_enabled=1" 2>/dev/null | tail -1 | tr -d ' ')
-    _ms_rqt=$(run_q "SELECT value_in_use FROM sys.configurations WHERE name='remote query timeout'" | tail -1 | tr -d ' ')
+    _ms_rg=$(_ms_n "SELECT COUNT(*) FROM sys.resource_governor_configuration WHERE is_enabled=1")
+    _ms_rqt=$(_ms_n "SELECT value_in_use FROM sys.configurations WHERE name='remote query timeout'")
     evd_q "DBM-009" "Resource Governor=${_ms_rg:-미확인}, remote_query_timeout=${_ms_rqt:-미확인}" "SQL Server는 글로벌 유휴 세션 타임아웃 미지원 (Resource Governor 또는 응용 프로그램 레벨 설정)"
     _ms_idle=$(run_q "SELECT login_name+' (idle '+CAST(DATEDIFF(MINUTE,last_request_end_time,GETDATE()) AS varchar)+'분)' FROM sys.dm_exec_sessions WHERE is_user_process=1 AND status='sleeping' AND DATEDIFF(MINUTE,last_request_end_time,GETDATE())>15" | head -5)
     evd_q "DBM-009" "15분 초과 유휴 사용자 세션" "${_ms_idle:-없음}"
-    [ -n "$_ms_idle" ] && ng "009" "15분 초과 유휴 세션: $(echo "$_ms_idle" | _csv) - 서비스 계정은 평가 제외 가능" \
-                       || mc "009" "현재 15분 초과 유휴 세션 없음 - 자동 종료 설정(접근제어 솔루션 등) 여부 확인"
+    if _ms_err "$_ms_idle"; then mc "009" "세션 조회 실패 - 유휴 세션 자동 종료 설정 수동 확인"
+    elif [ -n "$_ms_idle" ]; then ng "009" "15분 초과 유휴 세션: $(echo "$_ms_idle" | _csv) - 서비스 계정은 평가 제외 가능"
+    else mc "009" "현재 15분 초과 유휴 세션 없음 - 자동 종료 설정(접근제어 솔루션 등) 여부 확인"; fi
 
     # DBM-011: 감사 로그
-    _ms_audit=$(run_q "SELECT COUNT(*) FROM sys.server_audits WHERE is_state_enabled=1" | tail -1 | tr -d ' ')
+    _ms_audit=$(_ms_n "SELECT COUNT(*) FROM sys.server_audits WHERE is_state_enabled=1")
     evd_q "DBM-011" "server_audits enabled count" "$_ms_audit"
-    _ms_spec=$(run_q "SELECT COUNT(*) FROM sys.server_audit_specifications s JOIN sys.server_audit_specification_details d ON s.server_specification_id=d.server_specification_id WHERE s.is_state_enabled=1 AND d.audit_action_name IN ('FAILED_LOGIN_GROUP','SUCCESSFUL_LOGIN_GROUP')" | tail -1 | tr -d ' ')
+    _ms_spec=$(_ms_n "SELECT COUNT(*) FROM sys.server_audit_specifications s JOIN sys.server_audit_specification_details d ON s.server_specification_id=d.server_specification_id WHERE s.is_state_enabled=1 AND d.audit_action_name IN ('FAILED_LOGIN_GROUP','SUCCESSFUL_LOGIN_GROUP')")
     evd_q "DBM-011" "로그인 성공/실패 감사 사양 수" "${_ms_spec:-0}"
-    if [ "${_ms_audit:-0}" -gt 0 ] 2>/dev/null && [ "${_ms_spec:-0}" -gt 0 ] 2>/dev/null; then
+    if [ -z "$_ms_audit" ] || [ -z "$_ms_spec" ]; then
+        mc "011" "서버 감사·감사 사양 조회 실패 - 수동 확인"
+    elif [ "$_ms_audit" -gt 0 ] && [ "$_ms_spec" -gt 0 ]; then
         mc "011" "서버 감사 ${_ms_audit}개·로그인 감사 사양 ${_ms_spec}건 수집 중 - 주기적 백업 여부 인터뷰/증적 확인"
     elif [ "${_ms_audit:-0}" -gt 0 ] 2>/dev/null; then
         ng "011" "서버 감사 활성이나 로그인 성공/실패 감사 사양 미설정"
@@ -1876,11 +1919,19 @@ check_mssql() {
 
     # DBM-013: 원격 접속 접근 제어
     # 평가기준: DB 포트에 대한 방화벽·네트워크 장비·솔루션 원격 접근제어 ('remote access'는 서버 간 원격 프로시저 호출 옵션으로 무관)
-    _ms_port=$(run_q "SET NOCOUNT ON; SELECT TOP 1 local_tcp_port FROM sys.dm_exec_connections WHERE local_tcp_port IS NOT NULL" | grep -oE '^[0-9]+' | head -1); _ms_port=${_ms_port:-1433}
+    _ms_port=$(_ms_n "SELECT TOP 1 local_tcp_port FROM sys.dm_exec_connections WHERE local_tcp_port IS NOT NULL"); _ms_port=${_ms_port:-1433}
     evd "DBM-013" "iptables -S 2>/dev/null | grep -E '$_ms_port' | head -5; firewall-cmd --list-all 2>/dev/null | head -20; ufw status 2>/dev/null | grep $_ms_port"
-    _ms_fw=$( { iptables -S 2>/dev/null | grep -E -- "--dport $_ms_port" | grep -E -- '-s [0-9]'; firewall-cmd --list-rich-rules 2>/dev/null | grep "$_ms_port"; ufw status 2>/dev/null | grep "$_ms_port" | grep -v Anywhere; } | head -3 | tr '\n' ' ')
-    [ -n "$_ms_fw" ] && ok "013" "DB 포트(${_ms_port}) 출발지 제한 규칙: ${_ms_fw}" \
-                     || mc "013" "DB 포트(${_ms_port}) 호스트 방화벽 출발지 제한 미확인 - 네트워크 장비·솔루션 접근제어 수동 확인"
+    # 출발지 지정 허용 규칙 + (기본 정책 DROP/REJECT 또는 해당 포트 차단 규칙) 이어야 제한 — 1433 이 14330 과 일치하지 않도록 포트 경계 확인
+    local _ipt _ms_fw _ms_deny
+    _ipt=$(iptables -S 2>/dev/null)
+    _ms_fw=$( { printf '%s\n' "$_ipt" | grep -E -- "--dport ${_ms_port}( |$)" | grep -E -- '-s [0-9]' | grep -E -- '-j ACCEPT'
+                firewall-cmd --list-rich-rules 2>/dev/null | grep -E "port=\"${_ms_port}\"" | grep 'source address=' | grep -i 'accept'
+                ufw status 2>/dev/null | grep -E "^${_ms_port}(/tcp)?[[:space:]]" | grep -i allow | grep -v Anywhere; } | head -3 | tr '\n' ' ')
+    _ms_deny=$( { printf '%s\n' "$_ipt" | grep -E '^-P INPUT (DROP|REJECT)'; printf '%s\n' "$_ipt" | grep -E -- "--dport ${_ms_port}( |$)" | grep -E -- '-j (DROP|REJECT)'
+                  firewall-cmd --state 2>/dev/null | grep -x running; ufw status 2>/dev/null | grep -i 'Status: active'; } | head -1)
+    if [ -n "$_ms_fw" ] && [ -n "$_ms_deny" ]; then ok "013" "DB 포트(${_ms_port}) 출발지 제한 허용 규칙 + 기본 차단: ${_ms_fw}"
+    elif [ -n "$_ms_fw" ]; then mc "013" "DB 포트(${_ms_port}) 출발지 허용 규칙(${_ms_fw})은 있으나 기본 정책 ACCEPT·차단 규칙 미확인 - 수동 확인"
+    else mc "013" "DB 포트(${_ms_port}) 호스트 방화벽 출발지 제한 미확인 - 네트워크 장비·솔루션 접근제어 수동 확인"; fi
 
     evd_q "DBM-014" "해당 없음 (MSSQL)" "Oracle 전용 항목 (OS_ROLES/REMOTE_OS_ROLES)"
     na "014" "Oracle 전용 항목 (OS_ROLES/REMOTE_OS_ROLES)"
@@ -1891,7 +1942,9 @@ check_mssql() {
     _ms_dbs=$(run_q "SET NOCOUNT ON; SELECT name+' ('+state_desc COLLATE DATABASE_DEFAULT+')' FROM sys.databases" | _csv)
     _ms_pubpriv=$( { run_q "SET NOCOUNT ON; DECLARE @s nvarchar(max)=N''; SELECT @s=@s+N'SELECT N'''+REPLACE(name,'''','''''')+N':''+p.class_desc COLLATE DATABASE_DEFAULT+N'':''+ISNULL(o.name,N''-'') COLLATE DATABASE_DEFAULT+N'':''+p.permission_name COLLATE DATABASE_DEFAULT FROM '+QUOTENAME(name)+N'.sys.database_permissions p LEFT JOIN '+QUOTENAME(name)+N'.sys.all_objects o ON p.class=1 AND o.object_id=p.major_id WHERE p.grantee_principal_id=0 AND p.state IN (''G'',''W'') AND p.permission_name NOT IN (''CONNECT'',''VIEW ANY COLUMN ENCRYPTION KEY DEFINITION'',''VIEW ANY COLUMN MASTER KEY DEFINITION'') AND (p.class<>1 OR o.is_ms_shipped=0) UNION ALL ' FROM sys.databases WHERE state_desc='ONLINE' AND HAS_DBACCESS(name)=1; IF LEN(@s)>0 BEGIN SET @s=LEFT(@s,LEN(@s)-10); EXEC(@s); END"; run_q "SET NOCOUNT ON; SELECT 'SERVER:'+class_desc+' '+permission_name FROM sys.server_permissions WHERE grantee_principal_id=2 AND permission_name NOT IN ('VIEW ANY DATABASE','CONNECT SQL') AND NOT (class_desc='ENDPOINT' AND permission_name='CONNECT') AND state IN ('G','W')"; } | head -10)
     evd_q "DBM-015" "public 역할 비기본 권한 (전 DB: ${_ms_dbs} + 서버 수준)" "${_ms_pubpriv:-없음}"
-    [ -n "$_ms_pubpriv" ] && mc "015" "public 역할 비기본 권한: $(echo "$_ms_pubpriv" | _csv) - 업무상 필요 여부 확인 (불필요 시 취약)" || ok "015" "public 역할에 기본 외 권한 없음"
+    if _ms_err "$_ms_pubpriv"; then mc "015" "public 권한 조회 실패(일부 DB 접근 불가 등) - 수동 확인: $(echo "$_ms_pubpriv" | grep -v '^#ERR#' | _csv)"
+    elif [ -n "$_ms_pubpriv" ]; then mc "015" "public 역할 비기본 권한: $(echo "$_ms_pubpriv" | _csv) - 업무상 필요 여부 확인 (불필요 시 취약)"
+    else ok "015" "public 역할에 기본 외 권한 없음"; fi
 
     # DBM-016: 보안패치
     evd_q "DBM-016" "SQL Server version" "${_ver_num} (${_build})"
@@ -1901,7 +1954,9 @@ check_mssql() {
     _ms_syslist=$(run_q "SET NOCOUNT ON; DECLARE @s nvarchar(max)=N''; SELECT @s=@s+N'SELECT N'''+REPLACE(name,'''','''''')+N':''+o.name COLLATE DATABASE_DEFAULT+N'':''+d.name COLLATE DATABASE_DEFAULT+N'':''+p.permission_name COLLATE DATABASE_DEFAULT FROM '+QUOTENAME(name)+N'.sys.database_permissions p JOIN '+QUOTENAME(name)+N'.sys.all_objects o ON o.object_id=p.major_id AND p.class=1 JOIN '+QUOTENAME(name)+N'.sys.database_principals d ON d.principal_id=p.grantee_principal_id WHERE (o.schema_id=4 OR o.type=''S'') AND p.state IN (''G'',''W'') AND p.grantee_principal_id<>0 AND d.is_fixed_role=0 AND d.name NOT IN (''dbo'',''sys'',''INFORMATION_SCHEMA'',''guest'') AND d.name NOT LIKE ''##%'' UNION ALL ' FROM sys.databases WHERE state_desc='ONLINE' AND HAS_DBACCESS(name)=1; IF LEN(@s)>0 BEGIN SET @s=LEFT(@s,LEN(@s)-10); EXEC(@s); END" | head -20)
     _ms_systbl=$(echo "$_ms_syslist" | grep -c .)
     evd_q "DBM-017" "sys 스키마·시스템 테이블 권한 (전 DB, 고정 역할·dbo·guest·## 제외)" "${_ms_syslist:-없음}"
-    if [ "${_ms_systbl:-0}" -gt 0 ] 2>/dev/null; then
+    if _ms_err "$_ms_syslist"; then
+        mc "017" "시스템 테이블 권한 조회 실패 - 수동 확인"
+    elif [ "${_ms_systbl:-0}" -gt 0 ] 2>/dev/null; then
         mc "017" "시스템 테이블/뷰 접근 권한 ${_ms_systbl}건: $(echo "$_ms_syslist" | head -5 | _csv) - 적정성 수동 확인"
     else
         ok "017" "일반 사용자의 시스템 테이블 직접 접근 권한 없음"
@@ -1918,7 +1973,7 @@ check_mssql() {
 
     # DBM-021: 연결 서버(Linked Server)
     # 평가기준: ODBC 데이터 소스(DSN) 중 불필요 항목 (Linux: /etc/odbc.ini, ~/.odbc.ini) — Linked Server 는 참고
-    _ms_linked=$(run_q "SELECT COUNT(*) FROM sys.servers WHERE is_linked=1" | tail -1 | tr -d ' ')
+    _ms_linked=$(_ms_n "SELECT COUNT(*) FROM sys.servers WHERE is_linked=1")
     _ms_dsn=$( { odbcinst -q -s 2>/dev/null; grep -h '^\[' /etc/odbc.ini "$HOME/.odbc.ini" 2>/dev/null; } | grep '^\[' | sort -u | tr -d '[]' | head -10)
     evd_q "DBM-021" "ODBC DSN / (참고) Linked Server 수" "${_ms_dsn:-없음} / ${_ms_linked:-0}"
     [ -n "$_ms_dsn" ] && mc "021" "ODBC 데이터 소스: $(echo "$_ms_dsn" | _csv) - 업무상 불필요 항목 확인 (존재 시 취약)" || ok "021" "등록된 ODBC 데이터 소스(DSN) 없음"
@@ -1939,7 +1994,9 @@ check_mssql() {
     _ms_goptlist=$(run_q "SET NOCOUNT ON; DECLARE @s nvarchar(max)=N''; SELECT @s=@s+N'SELECT N'''+REPLACE(name,'''','''''')+N':''+dp.name COLLATE DATABASE_DEFAULT+N'':''+p.class_desc COLLATE DATABASE_DEFAULT+N'':''+ISNULL(OBJECT_NAME(p.major_id,'+CAST(database_id AS nvarchar(10))+N'),N''-'') COLLATE DATABASE_DEFAULT+N'':''+p.permission_name COLLATE DATABASE_DEFAULT FROM '+QUOTENAME(name)+N'.sys.database_permissions p JOIN '+QUOTENAME(name)+N'.sys.database_principals dp ON dp.principal_id=p.grantee_principal_id WHERE p.state=''W'' UNION ALL ' FROM sys.databases WHERE state_desc='ONLINE' AND HAS_DBACCESS(name)=1; IF LEN(@s)>0 BEGIN SET @s=LEFT(@s,LEN(@s)-10); EXEC(@s); END" | head -20)
     _ms_grantopt=$(echo "$_ms_goptlist" | grep -c .)
     evd_q "DBM-024" "WITH GRANT OPTION(state=W) 권한 (전 DB db:grantee:class:object:permission)" "${_ms_goptlist:-없음}"
-    [ "${_ms_grantopt:-0}" -gt 0 ] 2>/dev/null && mc "024" "WITH GRANT OPTION ${_ms_grantopt}건: $(echo "$_ms_goptlist" | head -5 | _csv) - 업무상 필요 여부 확인(불필요 시 취약)" || ok "024" "WITH GRANT OPTION 설정 권한 없음"
+    if _ms_err "$_ms_goptlist"; then mc "024" "WITH GRANT OPTION 조회 실패 - 수동 확인"
+    elif [ "${_ms_grantopt:-0}" -gt 0 ] 2>/dev/null; then mc "024" "WITH GRANT OPTION ${_ms_grantopt}건: $(echo "$_ms_goptlist" | head -5 | _csv) - 업무상 필요 여부 확인(불필요 시 취약)"
+    else ok "024" "WITH GRANT OPTION 설정 권한 없음"; fi
 
     # DBM-025: EoS
     evd_q "DBM-025" "SQL Server version (EoS)" "${_ver_num} (${_build})"
@@ -1947,13 +2004,13 @@ check_mssql() {
 
     # DBM-026: 구동 계정 umask (Linux)
     evd "DBM-026" "ps -ef 2>/dev/null | grep sqlservr | grep -v grep | head -3"
-    _ms_proc_user=$(ps -ef 2>/dev/null | grep "sqlservr" | grep -v grep | awk '{print $1}' | head -1)
+    _ms_proc_user=$(_proc_user sqlservr)
     _ms_umask=$(_get_umask "$_ms_proc_user" "sqlservr")
     _judge_umask "$_ms_umask" "MSSQL" "026" "${_ms_proc_user:-mssql}"
 
     # DBM-028: 불필요 DB Object (xp_cmdshell, Ole Automation)
-    _ms_xp=$(run_q "SELECT value_in_use FROM sys.configurations WHERE name='xp_cmdshell'" | tail -1 | tr -d ' ')
-    _ms_ole=$(run_q "SELECT value_in_use FROM sys.configurations WHERE name='Ole Automation Procedures'" | tail -1 | tr -d ' ')
+    _ms_xp=$(_ms_n "SELECT value_in_use FROM sys.configurations WHERE name='xp_cmdshell'")
+    _ms_ole=$(_ms_n "SELECT value_in_use FROM sys.configurations WHERE name='Ole Automation Procedures'")
     evd_q "DBM-028" "xp_cmdshell=${_ms_xp}, Ole Automation=${_ms_ole}" ""
     _issues28=""
     [ "$_ms_xp" = "1" ] && _issues28="xp_cmdshell(활성)"
@@ -1964,7 +2021,7 @@ check_mssql() {
     mc "028" "사용자 생성 Object/Owner 인가 여부 인터뷰 확인 (위 현황 참조)"
 
     # DBM-029: 자원 사용 제한
-    _ms_maxmem=$(run_q "SELECT value_in_use FROM sys.configurations WHERE name='max server memory (MB)'" | tail -1 | tr -d ' ')
+    _ms_maxmem=$(_ms_n "SELECT value_in_use FROM sys.configurations WHERE name='max server memory (MB)'")
     evd_q "DBM-029" "max server memory (MB)" "$_ms_maxmem"
     mc "029" "자원 사용 제한 수동 확인 (max server memory=${_ms_maxmem:-미확인}MB)"
 
@@ -1985,24 +2042,28 @@ check_mssql() {
     esac
 
     # DBM-032: 통신구간 암호화 (MSSQL TLS — force encryption은 mssql-conf 레벨)
-    _ms_encrypt=$(run_q "SELECT DISTINCT encrypt_option FROM sys.dm_exec_connections WHERE session_id=@@SPID" 2>/dev/null | tail -1 | tr -d ' ')
+    _ms_plain=$(_ms_n "SELECT COUNT(*) FROM sys.dm_exec_connections WHERE net_transport='TCP' AND encrypt_option='FALSE'")   # 점검 도구 자신의 연결 대신 전체 TCP 연결
     _ms_forceenc=""
     [ -x "/opt/mssql/bin/mssql-conf" ] && _ms_forceenc=$(/opt/mssql/bin/mssql-conf get network.forceencryption 2>/dev/null | grep -oE '[01]' | head -1)
     [ -z "$_ms_forceenc" ] && [ -f /var/opt/mssql/mssql.conf ] && _ms_forceenc=$(grep -i "forceencryption" /var/opt/mssql/mssql.conf 2>/dev/null | grep -oE "[01]" | head -1)
-    evd_q "DBM-032" "encrypt_option=${_ms_encrypt:-미확인}, forceencryption=${_ms_forceenc:-미설정}" ""
+    evd_q "DBM-032" "forceencryption=${_ms_forceenc:-미설정}, 암호화되지 않은 TCP 연결 수=${_ms_plain:-조회 실패}" ""
     if [ "$_ms_forceenc" = "1" ]; then
         ok "032" "강제 암호화 설정됨 (forceencryption=1)"
-    elif [ "$_ms_encrypt" = "TRUE" ]; then
-        mc "032" "현재 연결 암호화됨 - 전체 연결 강제 암호화(forceencryption) 여부 수동 확인"
+    elif [ -z "$_ms_plain" ]; then
+        mc "032" "연결 암호화 상태 조회 실패, forceencryption=${_ms_forceenc:-미설정} - 수동 확인"
+    elif [ "$_ms_plain" -gt 0 ]; then
+        ng "032" "강제 암호화 미설정(forceencryption=${_ms_forceenc:-0}), 암호화되지 않은 TCP 연결 ${_ms_plain}건"
     else
-        ng "032" "연결 암호화 미확인 (encrypt_option=${_ms_encrypt:-FALSE})"
+        mc "032" "현재 TCP 연결은 모두 암호화되나 강제 암호화(forceencryption) 미설정 - 클라이언트 설정 의존, 수동 확인"
     fi
 
     # DBM-033: 이중화 비밀번호 평문 노출 (Always On / Mirroring)
-    _ms_ag=$(run_q "SELECT COUNT(*) FROM sys.availability_groups" 2>/dev/null | tail -1 | tr -d ' ')
-    _ms_mirror=$(run_q "SELECT COUNT(*) FROM sys.database_mirroring WHERE mirroring_state IS NOT NULL" 2>/dev/null | tail -1 | tr -d ' ')
+    _ms_ag=$(_ms_n "SELECT COUNT(*) FROM sys.availability_groups")
+    _ms_mirror=$(_ms_n "SELECT COUNT(*) FROM sys.database_mirroring WHERE mirroring_state IS NOT NULL")
     evd_q "DBM-033" "AG count=${_ms_ag}, Mirroring count=${_ms_mirror:-0}" ""
-    if [ "${_ms_ag:-0}" -gt 0 ] 2>/dev/null || [ "${_ms_mirror:-0}" -gt 0 ] 2>/dev/null; then
+    if [ -z "$_ms_ag" ] && [ -z "$_ms_mirror" ]; then
+        mc "033" "이중화 구성 조회 실패 - 수동 확인"
+    elif [ "${_ms_ag:-0}" -gt 0 ] 2>/dev/null || [ "${_ms_mirror:-0}" -gt 0 ] 2>/dev/null; then
         mc "033" "이중화 구성됨 (AG=${_ms_ag:-0}, Mirror=${_ms_mirror:-0}) - 암호화 수동 확인"
     else
         na "033" "Always On/Mirroring 미구성"
@@ -2010,7 +2071,7 @@ check_mssql() {
 
     # DBM-034: 서비스 구동 권한
     evd "DBM-034" "ps -ef 2>/dev/null | grep sqlservr | grep -v grep"
-    _ms_svc=$(ps -ef 2>/dev/null | grep "sqlservr" | grep -v grep | awk '{print $1}' | head -1)
+    _ms_svc=$(_proc_user sqlservr)
     if [ -n "$_ms_svc" ]; then
         if [ "$_ms_svc" = "root" ]; then
             ng "034" "SQL Server root 계정으로 실행 (전용 계정 mssql 권고)"
@@ -2023,16 +2084,22 @@ check_mssql() {
 
     # DBM-035: xp_cmdshell 비활성화 (MSSQL 전용)
     evd_q "DBM-035" "xp_cmdshell value_in_use" "$_ms_xp"
-    [ "${_ms_xp:-0}" = "0" ] && ok "035" "xp_cmdshell 비활성화됨 (=0)" || ng "035" "xp_cmdshell 활성화됨 (=1) - 보안 위험"
+    case "$_ms_xp" in
+    0) ok "035" "xp_cmdshell 비활성화됨 (=0)" ;;
+    1) ng "035" "xp_cmdshell 활성화됨 (=1) - 보안 위험" ;;
+    *) mc "035" "xp_cmdshell 설정 조회 실패 - 수동 확인" ;;
+    esac
 
     # DBM-036: Registry Procedure 접근 권한 (MSSQL 전용)
     # 평가기준: 제한 목록 7종 확장 프로시저가 DBA 외 guest/public 에 부여되면 취약 (Linux 인스턴스에도 xp_reg* 존재·기본 public 부여 확인)
     _ms_regpub=$(run_q "SET NOCOUNT ON; SELECT o.name+':'+dp.name+':'+p.state_desc COLLATE DATABASE_DEFAULT FROM master.sys.database_permissions p JOIN master.sys.all_objects o ON o.object_id=p.major_id JOIN master.sys.database_principals dp ON dp.principal_id=p.grantee_principal_id WHERE p.class=1 AND p.type='EX' AND p.state IN ('G','W') AND dp.name IN ('public','guest') AND o.name IN ('xp_regaddmultistring','xp_regdeletekey','xp_regdeletevalue','xp_regenumvalues','xp_regread','xp_regremovemultistring','xp_regwrite')")
-    _ms_regcnt=$(run_q "SET NOCOUNT ON; SELECT COUNT(*) FROM master.sys.all_objects WHERE type='X' AND name LIKE 'xp_reg%'" | tail -1 | tr -d ' ')
+    _ms_regcnt=$(_ms_n "SELECT COUNT(*) FROM master.sys.all_objects WHERE type='X' AND name LIKE 'xp_reg%'")
     evd_q "DBM-036" "레지스트리 확장 프로시저 수 / public·guest 부여" "${_ms_regcnt:-조회 실패} / ${_ms_regpub:-없음}"
-    if [ -z "$_ms_regcnt" ]; then mc "036" "레지스트리 확장 프로시저 조회 실패 - 수동 확인"
+    if [ -z "$_ms_regcnt" ] || _ms_err "$_ms_regpub"; then mc "036" "레지스트리 확장 프로시저 조회 실패 - 수동 확인"
     elif [ -n "$_ms_regpub" ]; then ng "036" "레지스트리 확장 프로시저 public/guest 부여: $(echo "$_ms_regpub" | _csv)"
     else ok "036" "제한 대상 레지스트리 확장 프로시저 public/guest 부여 없음"; fi
+    [ "$_ms_isadm" != "1" ] && _res_downgrade "DBM-001 DBM-003 DBM-004 DBM-005 DBM-006 DBM-007 DBM-008 DBM-009 DBM-011 DBM-015 DBM-017 DBM-020 DBM-024 DBM-028 DBM-031 DBM-032 DBM-033 DBM-035 DBM-036" "점검 계정 sysadmin 아님 - 조회 범위 제한"
+    unset SQLCMDPASSWORD
 }
 
 # ════════════════════════════════════════════════════════════════
