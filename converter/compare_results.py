@@ -12,6 +12,12 @@
   3) 특정 호스트만 비교:
      python compare_results.py diff  이전.xlsx  현재.xlsx  --host WEB-01
 
+[입력]
+  - diff: 컨버터가 만든 보고서(.xlsx). 호스트별 상세 시트의 '점검 항목'·'점검결과'·'현황 및 문제점' 열을 헤더로 찾아 읽음
+    (표지·통계 시트는 제외). 수식 셀은 '검토·수정' 시트 값 → 숨김 원본 판정 열 순으로 대체
+  - trend: logs/audit_*.json (대상 수가 달라도 비교되도록 취약률로 비교)
+  - 판정값: 양호 / 취약 / N-A / 수동확인 / 점검불가
+
 [출력]
   - 콘솔 요약
   - diff → compare_diff_YYYYMMDD_HHMMSS.xlsx
@@ -28,21 +34,28 @@ except ImportError:
     sys.exit(1)
 
 
-RESULTS = {"양호", "취약", "수동확인", "N-A"}
+RESULT_GOOD, RESULT_BAD, RESULT_NA, RESULT_MANUAL, RESULT_UNABLE = "양호", "취약", "N-A", "수동확인", "점검불가"
+RESULTS = {RESULT_GOOD, RESULT_BAD, RESULT_NA, RESULT_MANUAL, RESULT_UNABLE}
 FONT_NAME = "맑은 고딕"
 
-FILL_GOOD   = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-FILL_BAD    = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-FILL_NA     = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-FILL_MANUAL = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-FILL_NEW_VULN = PatternFill(start_color="FF4444", end_color="FF4444", fill_type="solid")
-FILL_RESOLVED = PatternFill(start_color="44BB44", end_color="44BB44", fill_type="solid")
-FILL_HEADER = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+# 색 체계: convert_v4.py 의 FILL_*·RESULT_FONT 와 같게 (취약 행 연빨강 FDECEA, 양호 네이비 굵게, N-A 회색, 수동확인 진회색)
+# 점검불가는 컨버터 쪽 정의를 참고만 하여 노란 계열(주의)로 표시
+FILL_HEADER = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")   # 네이비
+FILL_BAD    = PatternFill(start_color="FDECEA", end_color="FDECEA", fill_type="solid")   # 연한 빨강
+FILL_UNABLE = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")   # 연한 노랑
+FILL_GOOD   = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")   # 연한 초록 (개선 표시 전용)
+FILL_NEW_VULN = PatternFill(start_color="C0392B", end_color="C0392B", fill_type="solid")  # 신규 취약 시트 머리글
+FILL_RESOLVED = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")  # 조치 완료 시트 머리글
+FILL_UNVERIFIED = PatternFill(start_color="7F6000", end_color="7F6000", fill_type="solid")  # 확인불가 전환 시트 머리글
 
-RESULT_FILL = {
-    "양호": FILL_GOOD, "취약": FILL_BAD,
-    "N-A": FILL_NA, "수동확인": FILL_MANUAL,
+RESULT_FONT = {
+    RESULT_GOOD:   Font(name=FONT_NAME, size=9, bold=True, color="1F3864"),
+    RESULT_BAD:    Font(name=FONT_NAME, size=9, bold=True, color="C0392B"),
+    RESULT_NA:     Font(name=FONT_NAME, size=9, color="999999"),
+    RESULT_MANUAL: Font(name=FONT_NAME, size=9, color="333333"),
+    RESULT_UNABLE: Font(name=FONT_NAME, size=9, bold=True, color="7F6000"),
 }
+RESULT_FILL = {RESULT_BAD: FILL_BAD, RESULT_UNABLE: FILL_UNABLE}
 
 BD = Border(
     left=Side(style="thin", color="CCCCCC"),
@@ -50,6 +63,14 @@ BD = Border(
     top=Side(style="thin", color="CCCCCC"),
     bottom=Side(style="thin", color="CCCCCC"),
 )
+
+_RESULT_ALIASES = {"N/A": RESULT_NA, "NA": RESULT_NA, "N-A": RESULT_NA, "해당없음": RESULT_NA}
+
+
+def norm_result(v):
+    """셀 값 → 표준 판정값 (공백 제거, N/A 표기 통일). 알 수 없는 값은 원문 유지"""
+    s = re.sub(r"\s+", "", str(v or ""))
+    return _RESULT_ALIASES.get(s.upper(), s)
 
 
 def read_text(path):
@@ -66,83 +87,156 @@ def read_text(path):
 
 
 # ================================================================
-# 엑셀 파싱: {(hostname, item_code): {"result": str, "reason": str}}
+# 엑셀 파싱: {(hostname, item_code): {"result": str, "reason": str, "sheet": str}}
+#   컨버터 보고서 구조: 호스트(점검대상)별 상세 시트 — 헤더 행에 '점검 항목'(항목코드 열)·'점검결과'·'현황 및 문제점',
+#   상단에 'Host Name' 라벨(값은 오른쪽 칸). 표지·개요·통계 등 다른 시트는 헤더가 없으므로 읽지 않는다.
+#   점검결과·현황 칸이 '검토·수정' 시트를 참조하는 수식이면(캐시값 없음) 그 시트의 값을 따라가고,
+#   그래도 없으면 숨김 원본 판정 열(점검결과 열 +4, 컨버터 S열 = 생성 시 판정)을 사용한다.
 # ================================================================
-def parse_result_excel(xlsx_path):
-    wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
-    ws = wb.active
+_CODE_RE = re.compile(r"^[A-Z]{1,4}-\d{1,4}$")
+_REF_RE = re.compile(r"^=\s*IF\(\s*(?:'((?:[^']|'')+)'|([^'!()]+))!\$?([A-Z]{1,3})\$?(\d+)\s*=\s*\"\"")
+_STRICT_CODE_HDR = ("점검항목",)
+_LOOSE_CODE_HDR = ("점검항목", "평가항목id", "항목id", "항목코드")
+_LOOSE_RESULT_HDR = ("점검결과", "결과", "최종판정")
 
-    header_row = None
-    id_col = result_col = reason_col = host_col = None
 
-    for row_idx in range(1, min(20, ws.max_row + 1)):
-        for col_idx in range(1, ws.max_column + 1):
-            v = ws.cell(row_idx, col_idx).value
-            if not v:
+def _nk(v):
+    return re.sub(r"\s+", "", str(v or "")).lower()
+
+
+def _find_header(rows, code_hdrs, result_hdrs):
+    """rows(list of tuple) 앞 60행에서 (헤더 행 idx, 항목코드 열, 결과 열, 사유 열) 탐색 (0-based). 없으면 None"""
+    for ri, row in enumerate(rows[:60]):
+        code_c = res_c = why_c = None
+        for ci, v in enumerate(row):
+            k = _nk(v)
+            if not k:
                 continue
-            sv = str(v).strip().lower()
-            if "평가항목id" in sv or "항목id" in sv or "항목코드" in sv:
-                header_row = row_idx
-                id_col = col_idx
-                break
-        if header_row:
-            break
+            if code_c is None and k in code_hdrs:
+                code_c = ci
+            elif res_c is None and k in result_hdrs:
+                res_c = ci
+            elif why_c is None and (k.startswith("현황") or "근거" in k):
+                why_c = ci
+        if code_c is not None and res_c is not None:
+            return ri, code_c, res_c, why_c
+    return None
 
-    if not header_row:
-        print(f"  [WARN] 항목ID 헤더를 찾을 수 없음: {xlsx_path}")
-        wb.close()
-        return {}
 
-    for col_idx in range(1, ws.max_column + 1):
-        v = ws.cell(header_row, col_idx).value
-        if not v:
-            continue
-        sv = str(v).strip().lower()
-        if ("점검결과" in sv or "결과" in sv) and result_col is None:
-            result_col = col_idx
-        if ("현황" in sv or "근거" in sv) and reason_col is None:
-            reason_col = col_idx
-        if "호스트" in sv or "장비" in sv or "서버" in sv or "대상" in sv:
-            host_col = col_idx
+def _find_host(rows, upto, sheet_title):
+    """헤더 위쪽의 'Host Name' 라벨 오른쪽 첫 값 → 호스트명. 없으면 시트명"""
+    for row in rows[:upto]:
+        for ci, v in enumerate(row):
+            if _nk(v) in ("hostname", "호스트명", "호스트"):
+                for w in row[ci + 1:]:
+                    if w not in (None, "") and not str(w).startswith("="):
+                        return str(w).strip()
+    return sheet_title
 
-    data = {}
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        code_val = ws.cell(row_idx, id_col).value
-        if not code_val:
-            continue
-        code = str(code_val).strip().upper()
 
-        result_val = ""
-        if result_col:
-            rv = ws.cell(row_idx, result_col).value
-            if rv:
-                result_val = str(rv).strip()
+def parse_result_excel(xlsx_path):
+    wb_v = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)    # 캐시된 계산값
+    wb_f = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=False)   # 수식 원문 (캐시값이 없을 때 참조 추적)
+    try:
+        grids_v, grids_f = {}, {}
+        for name in wb_v.sheetnames:
+            grids_v[name] = [tuple(r) for r in wb_v[name].iter_rows(values_only=True)]
+            grids_f[name] = [tuple(r) for r in wb_f[name].iter_rows(values_only=True)]
+    finally:
+        wb_v.close()
+        wb_f.close()
 
-        reason_val = ""
-        if reason_col:
-            rv = ws.cell(row_idx, reason_col).value
-            if rv:
-                reason_val = str(rv).strip()
+    def cell(grid, r, c):
+        try:
+            return grid[r][c]
+        except IndexError:
+            return None
 
-        hostname = "UNKNOWN"
-        if host_col:
-            hv = ws.cell(row_idx, host_col).value
-            if hv:
-                hostname = str(hv).strip()
-        if hostname == "UNKNOWN" and reason_val:
-            m = re.match(r"\[([^\]]+)\]", reason_val)
+    def follow(name, r, c):
+        """(name,r,c) 셀의 표시값: 캐시값 → 참조 수식이면 대상 시트 값 → None"""
+        v = cell(grids_v[name], r, c)
+        if v not in (None, ""):
+            return v
+        f = cell(grids_f[name], r, c)
+        if isinstance(f, str) and f.startswith("="):
+            m = _REF_RE.match(f)
             if m:
-                hostname = m.group(1)
+                tgt = (m.group(1) or m.group(2)).replace("''", "'")
+                if tgt in grids_v:
+                    col = 0
+                    for ch in m.group(3):
+                        col = col * 26 + ord(ch) - 64
+                    tv = cell(grids_v[tgt], int(m.group(4)) - 1, col - 1)
+                    if tv not in (None, ""):
+                        return tv
+        return None
 
-        data[(hostname, code)] = {"result": result_val, "reason": reason_val}
+    def collect(code_hdrs, result_hdrs):
+        data, seen_hosts = {}, set()
+        for name, rows in grids_v.items():
+            hdr = _find_header(rows, code_hdrs, result_hdrs)
+            if not hdr:
+                continue
+            hr, cc, rc, wc = hdr
+            host = _find_host(rows, hr, name)
+            if host in seen_hosts:
+                host = f"{host}({name})"
+            seen_hosts.add(host)
+            orig_c = rc + 4   # 숨김 원본 판정 열 (컨버터: O → S)
+            for ri in range(hr + 1, len(rows)):
+                code_v = cell(rows, ri, cc)
+                if code_v is None:
+                    continue
+                code = str(code_v).strip().upper()
+                if not _CODE_RE.match(code):
+                    continue
+                rv = norm_result(follow(name, ri, rc))
+                if rv not in RESULTS:
+                    ov = norm_result(cell(rows, ri, orig_c))
+                    if ov in RESULTS:
+                        rv = ov
+                reason = ""
+                if wc is not None:
+                    w = follow(name, ri, wc)
+                    reason = str(w).strip() if w not in (None, "") else ""
+                data[(host, code)] = {"result": rv, "reason": reason, "sheet": name}
+        return data
 
-    wb.close()
+    data = collect(_STRICT_CODE_HDR, ("점검결과",))
+    if not data:   # 컨버터 형식이 아니면 느슨한 헤더로 재시도
+        data = collect(_LOOSE_CODE_HDR, _LOOSE_RESULT_HDR)
+    if not data:
+        print(f"  [WARN] 점검 항목/점검결과 헤더가 있는 시트를 찾을 수 없음: {xlsx_path}")
     return data
 
 
 # ================================================================
 # diff 모드: 이전 vs 현재 비교
 # ================================================================
+_DETERMINATE = (RESULT_GOOD, RESULT_BAD, RESULT_NA)
+
+
+def classify_change(pr, cr):
+    """(이전, 현재) 판정 → 변경 라벨 ('' = 변경 없음)
+       악화: 취약이 아니던 것이 취약으로 / 개선: 취약 → 양호·N-A / 확인불가 전환: 확정 판정 → 수동확인·점검불가
+       판정 확정: 수동확인·점검불가 → 양호·N-A / 그 외 변경"""
+    if pr == cr:
+        return ""
+    if pr == "-":
+        return "신규"
+    if cr == "-":
+        return "삭제"
+    if cr == RESULT_BAD:
+        return "악화"
+    if pr == RESULT_BAD and cr in (RESULT_GOOD, RESULT_NA):
+        return "개선"
+    if pr in _DETERMINATE and cr in (RESULT_MANUAL, RESULT_UNABLE):
+        return "확인불가 전환"
+    if pr in (RESULT_MANUAL, RESULT_UNABLE) and cr in (RESULT_GOOD, RESULT_NA):
+        return "판정 확정"
+    return "변경"
+
+
 def run_diff(prev_path, curr_path, host_filter=None):
     print(f"[비교] 이전: {os.path.basename(prev_path)}")
     print(f"[비교] 현재: {os.path.basename(curr_path)}")
@@ -151,13 +245,20 @@ def run_diff(prev_path, curr_path, host_filter=None):
     curr = parse_result_excel(curr_path)
 
     if host_filter:
-        prev = {k: v for k, v in prev.items() if k[0] == host_filter}
-        curr = {k: v for k, v in curr.items() if k[0] == host_filter}
+        prev = {k: v for k, v in prev.items() if k[0] == host_filter or v.get("sheet") == host_filter}
+        curr = {k: v for k, v in curr.items() if k[0] == host_filter or v.get("sheet") == host_filter}
+
+    if not prev or not curr:
+        print("[ERROR] 비교할 점검 결과를 읽지 못했습니다 (컨버터가 만든 호스트별 상세 시트가 있는 보고서인지, --host 값이 맞는지 확인)")
+        return None
 
     all_keys = sorted(set(prev.keys()) | set(curr.keys()))
+    prev_hosts = {k[0] for k in prev}
+    curr_hosts = {k[0] for k in curr}
 
     new_vulns = []
     resolved = []
+    unverified = []
     changed = []
     unchanged = []
     new_items = []
@@ -175,27 +276,30 @@ def run_diff(prev_path, curr_path, host_filter=None):
         if not p and c:
             new_items.append({"host": hostname, "code": code,
                               "curr_result": c["result"], "curr_reason": c["reason"]})
-            if c["result"] == "취약":
+            if c["result"] == RESULT_BAD:
                 new_vulns.append({"host": hostname, "code": code,
                                   "reason": c["reason"]})
             continue
 
         pr = p["result"]
         cr = c["result"]
+        label = classify_change(pr, cr)
 
-        if pr == cr:
+        if not label:
             unchanged.append({"host": hostname, "code": code, "result": cr})
-        else:
-            entry = {"host": hostname, "code": code,
-                     "prev": pr, "curr": cr,
-                     "prev_reason": p["reason"], "curr_reason": c["reason"]}
-            changed.append(entry)
-            if pr != "취약" and cr == "취약":
-                new_vulns.append({"host": hostname, "code": code,
-                                  "reason": c["reason"]})
-            if pr == "취약" and cr != "취약":
-                resolved.append({"host": hostname, "code": code,
-                                 "new_result": cr, "reason": c["reason"]})
+            continue
+        entry = {"host": hostname, "code": code, "label": label,
+                 "prev": pr, "curr": cr,
+                 "prev_reason": p["reason"], "curr_reason": c["reason"]}
+        changed.append(entry)
+        if label == "악화":
+            new_vulns.append({"host": hostname, "code": code, "reason": c["reason"]})
+        elif label == "개선":
+            resolved.append({"host": hostname, "code": code,
+                             "new_result": cr, "reason": c["reason"]})
+        elif label == "확인불가 전환":
+            unverified.append({"host": hostname, "code": code, "prev": pr,
+                               "new_result": cr, "reason": c["reason"]})
 
     # 콘솔 요약
     print(f"\n{'='*60}")
@@ -206,8 +310,13 @@ def run_diff(prev_path, curr_path, host_filter=None):
     print(f"  결과 변경:       {len(changed):>5}건")
     print(f"  신규 취약:       {len(new_vulns):>5}건  ← 주의")
     print(f"  취약→조치완료:   {len(resolved):>5}건  ← 개선")
+    print(f"  확인불가 전환:   {len(unverified):>5}건  ← 양호/취약이 수동확인·점검불가로 바뀜 (재점검 필요)")
     print(f"  신규 추가 항목:  {len(new_items):>5}건")
     print(f"  삭제된 항목:     {len(removed_items):>5}건")
+    if prev_hosts - curr_hosts:
+        print(f"  이전에만 있는 호스트: {', '.join(sorted(prev_hosts - curr_hosts))}")
+    if curr_hosts - prev_hosts:
+        print(f"  현재에만 있는 호스트: {', '.join(sorted(curr_hosts - prev_hosts))}")
     print(f"{'='*60}")
 
     if new_vulns:
@@ -220,6 +329,11 @@ def run_diff(prev_path, curr_path, host_filter=None):
         for v in resolved:
             print(f"  [{v['host']}] {v['code']} → {v['new_result']}")
 
+    if unverified:
+        print(f"\n? 확인불가 전환 항목 ({len(unverified)}건):")
+        for v in unverified:
+            print(f"  [{v['host']}] {v['code']} {v['prev']} → {v['new_result']} — {v['reason'][:50]}")
+
     # 엑셀 출력
     wb = openpyxl.Workbook()
 
@@ -229,7 +343,7 @@ def run_diff(prev_path, curr_path, host_filter=None):
     _write_summary_sheet(ws_sum, prev_path, curr_path,
                          len(all_keys), len(unchanged), len(changed),
                          len(new_vulns), len(resolved),
-                         len(new_items), len(removed_items))
+                         len(new_items), len(removed_items), len(unverified))
 
     # 시트 2: 신규 취약
     if new_vulns:
@@ -245,11 +359,18 @@ def run_diff(prev_path, curr_path, host_filter=None):
                           [[v["host"], v["code"], v["new_result"], v["reason"]] for v in resolved],
                           FILL_RESOLVED)
 
+    # 시트 3-2: 확인불가 전환
+    if unverified:
+        ws_uv = wb.create_sheet("확인불가 전환")
+        _write_list_sheet(ws_uv, ["호스트", "항목코드", "이전 결과", "현재 결과", "근거"],
+                          [[v["host"], v["code"], v["prev"], v["new_result"], v["reason"]] for v in unverified],
+                          FILL_UNVERIFIED)
+
     # 시트 4: 전체 변경
     if changed:
         ws_ch = wb.create_sheet("결과 변경")
-        _write_list_sheet(ws_ch, ["호스트", "항목코드", "이전 결과", "현재 결과", "이전 근거", "현재 근거"],
-                          [[e["host"], e["code"], e["prev"], e["curr"],
+        _write_list_sheet(ws_ch, ["호스트", "항목코드", "이전 결과", "현재 결과", "변경", "이전 근거", "현재 근거"],
+                          [[e["host"], e["code"], e["prev"], e["curr"], e["label"],
                             e["prev_reason"], e["curr_reason"]] for e in changed])
 
     # 시트 5: 전체 diff (호스트×항목 매트릭스)
@@ -264,8 +385,15 @@ def run_diff(prev_path, curr_path, host_filter=None):
     return out_path
 
 
+def _apply_result_style(cell, val):
+    """판정값 셀 서식 — 컨버터와 같은 글꼴·배경(취약 FDECEA)"""
+    cell.font = RESULT_FONT.get(val, Font(name=FONT_NAME, size=9))
+    if val in RESULT_FILL:
+        cell.fill = RESULT_FILL[val]
+
+
 def _write_summary_sheet(ws, prev_name, curr_name,
-                         total, unchanged, chg, new_v, resolved, new_i, removed):
+                         total, unchanged, chg, new_v, resolved, new_i, removed, unverified=0):
     ws.column_dimensions["A"].width = 20
     ws.column_dimensions["B"].width = 50
 
@@ -279,6 +407,7 @@ def _write_summary_sheet(ws, prev_name, curr_name,
         ("결과 변경", chg),
         ("신규 취약", new_v),
         ("취약→조치완료", resolved),
+        ("확인불가 전환", unverified),
         ("신규 추가 항목", new_i),
         ("삭제된 항목", removed),
     ]
@@ -287,6 +416,8 @@ def _write_summary_sheet(ws, prev_name, curr_name,
         ws.cell(i, 2, val).font = Font(name=FONT_NAME, size=10)
         if label == "신규 취약" and val > 0:
             ws.cell(i, 2).fill = FILL_BAD
+        if label == "확인불가 전환" and val > 0:
+            ws.cell(i, 2).fill = FILL_UNABLE
         if label == "취약→조치완료" and val > 0:
             ws.cell(i, 2).fill = FILL_GOOD
 
@@ -305,11 +436,15 @@ def _write_list_sheet(ws, headers, rows, header_fill=None):
             c.font = Font(name=FONT_NAME, size=9)
             c.border = BD
             c.alignment = Alignment(vertical="center", wrap_text=True)
+            if isinstance(val, str) and val in RESULTS:
+                _apply_result_style(c, val)
 
     for ci in range(1, len(headers) + 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(ci)].width = max(15, len(headers[ci-1]) * 2 + 4)
     if len(headers) >= 3:
         ws.column_dimensions[openpyxl.utils.get_column_letter(len(headers))].width = 60
+        if len(headers) >= 7:   # 결과 변경 시트: 이전·현재 근거 모두 넓게
+            ws.column_dimensions[openpyxl.utils.get_column_letter(len(headers) - 1)].width = 60
 
 
 def _write_full_diff_sheet(ws, all_keys, prev, curr):
@@ -328,50 +463,59 @@ def _write_full_diff_sheet(ws, all_keys, prev, curr):
         c_data = curr.get(key, {})
         pr = p.get("result", "-")
         cr = c_data.get("result", "-")
-
-        if pr == cr:
-            change_label = ""
-        elif pr == "-":
-            change_label = "신규"
-        elif cr == "-":
-            change_label = "삭제"
-        elif pr != "취약" and cr == "취약":
-            change_label = "악화"
-        elif pr == "취약" and cr != "취약":
-            change_label = "개선"
-        else:
-            change_label = "변경"
+        change_label = classify_change(pr, cr)
 
         row_vals = [hostname, code, pr, cr, change_label, c_data.get("reason", "")]
         for ci, val in enumerate(row_vals, 1):
             cell = ws.cell(ri, ci, val)
             cell.font = Font(name=FONT_NAME, size=9)
             cell.border = BD
-            if ci == 3 and val in RESULT_FILL:
-                cell.fill = RESULT_FILL[val]
-            if ci == 4 and val in RESULT_FILL:
-                cell.fill = RESULT_FILL[val]
+            if ci in (3, 4) and val in RESULTS:
+                _apply_result_style(cell, val)
             if ci == 5:
                 if val == "악화":
                     cell.fill = FILL_BAD
-                    cell.font = Font(name=FONT_NAME, size=9, bold=True, color="9C0006")
+                    cell.font = Font(name=FONT_NAME, size=9, bold=True, color="C0392B")
                 elif val == "개선":
                     cell.fill = FILL_GOOD
-                    cell.font = Font(name=FONT_NAME, size=9, bold=True, color="006100")
+                    cell.font = Font(name=FONT_NAME, size=9, bold=True, color="1F3864")
+                elif val == "확인불가 전환":
+                    cell.fill = FILL_UNABLE
+                    cell.font = Font(name=FONT_NAME, size=9, bold=True, color="7F6000")
         ri += 1
 
     ws.column_dimensions["A"].width = 18
     ws.column_dimensions["B"].width = 12
     ws.column_dimensions["C"].width = 12
     ws.column_dimensions["D"].width = 12
-    ws.column_dimensions["E"].width = 8
+    ws.column_dimensions["E"].width = 14
     ws.column_dimensions["F"].width = 60
-    ws.auto_filter.ref = f"A1:F{ri - 1}"
+    ws.auto_filter.ref = f"A1:F{max(ri - 1, 1)}"
 
 
 # ================================================================
-# trend 모드: 감사 로그 기반 추세 분석
+# trend 모드: 감사 로그 기반 추세 분석 (대상 수가 달라도 비교되도록 비율 기준)
+#   취약률 = 취약 / (전체 - N-A)   — N-A 는 평가 대상이 아니므로 분모에서 제외, 수동확인·점검불가는 분모에 포함
+#   호스트당 취약 = 취약 / 대상 수
 # ================================================================
+_UNABLE_KEYS = ("unable", "unavailable", "uncheckable", "점검불가")   # 감사 로그의 점검불가 건수 키 (컨버터 구현에 따라)
+RATE_EPS = 0.001   # 취약률 변화가 0.1%p 이내면 '유지'
+
+
+def _unable_count(d):
+    for k in _UNABLE_KEYS:
+        if isinstance(d.get(k), int):
+            return d[k]
+    return 0
+
+
+def _rate_dir(first, last):
+    if first is None or last is None:
+        return "-"
+    delta = last - first
+    return "악화" if delta > RATE_EPS else "개선" if delta < -RATE_EPS else "유지"
+
+
 def run_trend(log_dir):
     print(f"[추세] 로그 폴더: {log_dir}")
 
@@ -385,8 +529,11 @@ def run_trend(log_dir):
         try:
             text = read_text(lf)
             data = json.loads(text)
+            if not isinstance(data, dict) or not isinstance(data.get("summary"), dict):
+                print(f"  [WARN] 감사 로그 형식이 아님(건너뜀): {lf}")
+                continue
             entries.append(data)
-        except (json.JSONDecodeError, Exception) as e:
+        except Exception as e:
             print(f"  [WARN] 로그 파싱 실패: {lf} — {e}")
 
     if not entries:
@@ -398,8 +545,8 @@ def run_trend(log_dir):
     print(f"\n{'='*60}")
     print(f" 추세 분석 ({len(entries)}건 로그)")
     print(f"{'='*60}")
-    print(f"  {'일시':<22} {'기준':<8} {'카테고리':<8} {'대상':>4} {'양호':>5} {'취약':>5} {'N-A':>5} {'수동':>5} {'취약률':>7}")
-    print(f"  {'-'*22} {'-'*8} {'-'*8} {'-'*4} {'-'*5} {'-'*5} {'-'*5} {'-'*5} {'-'*7}")
+    print(f"  {'일시':<20} {'기준':<5} {'카테고리':<9} {'대상':>4} {'양호':>5} {'취약':>5} {'N-A':>5} {'수동':>5} {'불가':>5} {'취약률':>7} {'호스트당취약':>10}")
+    print(f"  {'-'*20} {'-'*5} {'-'*9} {'-'*4} {'-'*5} {'-'*5} {'-'*5} {'-'*5} {'-'*5} {'-'*7} {'-'*10}")
 
     trend_data = []
     for e in entries:
@@ -407,19 +554,24 @@ def run_trend(log_dir):
         ts = e.get("timestamp", "?")[:19]
         mode = e.get("mode_code", "?")
         cat = e.get("category", "?")
-        tc = e.get("target_count", 0)
+        tc = e.get("target_count", 0) or 0
         good = s.get("good", 0)
         bad = s.get("bad", 0)
         na = s.get("na", 0)
         mc = s.get("manual", 0)
-        total = good + bad + na + mc
-        rate = f"{bad/total*100:.1f}%" if total > 0 else "-"
+        un = _unable_count(s)
+        total = good + bad + na + mc + un
+        base = total - na
+        rate = bad / base if base > 0 else None
+        per_host = bad / tc if tc > 0 else None
 
-        print(f"  {ts:<22} {mode:<8} {cat:<8} {tc:>4} {good:>5} {bad:>5} {na:>5} {mc:>5} {rate:>7}")
+        rate_s = f"{rate*100:.1f}%" if rate is not None else "-"
+        ph_s = f"{per_host:.1f}" if per_host is not None else "-"
+        print(f"  {ts:<20} {mode:<5} {cat:<9} {tc:>4} {good:>5} {bad:>5} {na:>5} {mc:>5} {un:>5} {rate_s:>7} {ph_s:>10}")
         trend_data.append({
             "timestamp": ts, "mode": mode, "category": cat,
-            "targets": tc, "good": good, "bad": bad, "na": na, "manual": mc,
-            "total": total, "rate": rate,
+            "targets": tc, "good": good, "bad": bad, "na": na, "manual": mc, "unable": un,
+            "total": total, "rate": rate, "per_host": per_host,
         })
 
     # 카테고리별 추세
@@ -429,23 +581,28 @@ def run_trend(log_dir):
         cats.setdefault(key, []).append(td)
 
     print(f"\n{'='*60}")
-    print(f" 카테고리별 추세 변화")
+    print(f" 카테고리별 추세 변화 (취약률 기준)")
     print(f"{'='*60}")
     for key, items in cats.items():
         if len(items) < 2:
             continue
         first = items[0]
         last = items[-1]
-        delta_bad = last["bad"] - first["bad"]
-        direction = "↑악화" if delta_bad > 0 else "↓개선" if delta_bad < 0 else "→유지"
-        print(f"  {key}: 취약 {first['bad']}건 → {last['bad']}건 ({direction}, Δ{delta_bad:+d})")
+        direction = _rate_dir(first["rate"], last["rate"])
+        fr = f"{first['rate']*100:.1f}%" if first["rate"] is not None else "-"
+        lr = f"{last['rate']*100:.1f}%" if last["rate"] is not None else "-"
+        dl = f"{(last['rate'] - first['rate'])*100:+.1f}%p" if first["rate"] is not None and last["rate"] is not None else "-"
+        note = f" (대상 수 {first['targets']}→{last['targets']}대, 비율로 비교)" if first["targets"] != last["targets"] else ""
+        print(f"  {key}: 취약률 {fr} → {lr} ({direction}, Δ{dl}) / 취약 {first['bad']}건 → {last['bad']}건{note}")
+        if last["unable"] > first["unable"]:
+            print(f"    ※ 점검불가 {first['unable']}건 → {last['unable']}건: 취약률이 낮아졌어도 미점검 증가분은 확인 필요")
 
     # 엑셀 출력
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "추세 데이터"
 
-    headers = ["일시", "기준", "카테고리", "대상 수", "양호", "취약", "N-A", "수동확인", "전체", "취약률"]
+    headers = ["일시", "기준", "카테고리", "대상 수", "양호", "취약", "N-A", "수동확인", "점검불가", "전체", "취약률", "호스트당 취약"]
     for ci, h in enumerate(headers, 1):
         c = ws.cell(1, ci, h)
         c.font = Font(name=FONT_NAME, size=10, bold=True, color="FFFFFF")
@@ -455,22 +612,28 @@ def run_trend(log_dir):
 
     for ri, td in enumerate(trend_data, 2):
         vals = [td["timestamp"], td["mode"], td["category"], td["targets"],
-                td["good"], td["bad"], td["na"], td["manual"], td["total"], td["rate"]]
+                td["good"], td["bad"], td["na"], td["manual"], td["unable"], td["total"],
+                td["rate"] if td["rate"] is not None else "-",
+                round(td["per_host"], 2) if td["per_host"] is not None else "-"]
         for ci, val in enumerate(vals, 1):
             cell = ws.cell(ri, ci, val)
             cell.font = Font(name=FONT_NAME, size=9)
             cell.border = BD
             if ci == 6 and isinstance(val, int) and val > 0:
                 cell.fill = FILL_BAD
+            if ci == 9 and isinstance(val, int) and val > 0:
+                cell.fill = FILL_UNABLE
+            if ci == 11 and isinstance(val, float):
+                cell.number_format = "0.0%"
 
-    for ci, w in enumerate([22, 10, 10, 8, 8, 8, 8, 8, 8, 10], 1):
+    for ci, w in enumerate([22, 10, 12, 8, 8, 8, 8, 10, 10, 8, 10, 12], 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(ci)].width = w
 
     # 카테고리별 요약 시트
     if cats:
         ws2 = wb.create_sheet("카테고리 추세")
-        headers2 = ["카테고리", "첫 점검일", "마지막 점검일", "점검 횟수",
-                     "첫 취약", "현재 취약", "변화", "방향"]
+        headers2 = ["카테고리", "첫 점검일", "마지막 점검일", "점검 횟수", "첫 대상 수", "현재 대상 수",
+                    "첫 취약률", "현재 취약률", "변화(%p)", "방향", "첫 취약", "현재 취약"]
         for ci, h in enumerate(headers2, 1):
             c = ws2.cell(1, ci, h)
             c.font = Font(name=FONT_NAME, size=10, bold=True, color="FFFFFF")
@@ -482,22 +645,27 @@ def run_trend(log_dir):
         for key, items in cats.items():
             first = items[0]
             last = items[-1]
-            delta = last["bad"] - first["bad"]
-            direction = "악화" if delta > 0 else "개선" if delta < 0 else "유지"
+            fr, lr = first["rate"], last["rate"]
+            delta = round((lr - fr) * 100, 1) if fr is not None and lr is not None else "-"
+            direction = _rate_dir(fr, lr)
             vals = [key, first["timestamp"], last["timestamp"], len(items),
-                    first["bad"], last["bad"], delta, direction]
+                    first["targets"], last["targets"],
+                    fr if fr is not None else "-", lr if lr is not None else "-", delta, direction,
+                    first["bad"], last["bad"]]
             for ci, val in enumerate(vals, 1):
                 cell = ws2.cell(ri2, ci, val)
                 cell.font = Font(name=FONT_NAME, size=9)
                 cell.border = BD
-                if ci == 8:
+                if ci in (7, 8) and isinstance(val, float):
+                    cell.number_format = "0.0%"
+                if ci == 10:
                     if val == "악화":
                         cell.fill = FILL_BAD
                     elif val == "개선":
                         cell.fill = FILL_GOOD
             ri2 += 1
 
-        for ci, w in enumerate([18, 22, 22, 10, 10, 10, 8, 8], 1):
+        for ci, w in enumerate([18, 22, 22, 10, 10, 12, 10, 10, 10, 8, 10, 10], 1):
             ws2.column_dimensions[openpyxl.utils.get_column_letter(ci)].width = w
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

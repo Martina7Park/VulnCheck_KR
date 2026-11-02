@@ -15,9 +15,18 @@
 #   python eos_checker.py amazon-linux 2
 #   python eos_checker.py mssql 2016
 #   python eos_checker.py --no-api postgresql 13.22
+#   python eos_checker.py centos 9-stream      (CentOS Stream)
+#   python eos_checker.py iis 8.5              (IIS 는 호스트 Windows Server 지원 주기를 따름)
 #   python eos_checker.py            (EoS 현황 목록)
 #
 # [반환] check_eos() → (결과, EoS일자, 설명)   결과: 양호 / 취약 / 수동확인
+#
+# [판정 원칙]
+#   - 하위 버전(SP·TL·마이너)을 지정하지 않아 지원 상태가 갈리는 입력(sles 15, ubuntu 22, AIX 7.2, Solaris 11, HP-UX 11)은
+#     하위 주기 전부가 종료일 때만 '취약', 그 외는 '수동확인'(정확한 버전 필요)
+#   - 종료일이 불확실한 값(UNCERTAIN_SNAPSHOT·MANUAL_DB 의 '확인 필요')은 '양호'로 단정하지 않고 '수동확인'
+#     (이미 1년 넘게 지난 날짜는 날짜가 다소 틀려도 결과가 같으므로 '취약' 유지)
+#   - 이 모듈의 날짜는 학습 지식·스냅샷 기준이며 벤더 공지로 재확인해야 한다
 # ================================================================
 import re, sys, os, datetime, json
 try:
@@ -44,30 +53,64 @@ IMMINENT_DAYS = 90   # 종료 임박(수동확인) 기준
 # 입력 제품명 → endoflife.date 제품 식별자
 ALIASES = {
     "rhel": "rhel", "redhat": "rhel", "red hat": "rhel", "centos": "centos", "centos-stream": "centos-stream",
+    "centos stream": "centos-stream", "centosstream": "centos-stream",
     "rocky": "rocky-linux", "rocky-linux": "rocky-linux", "almalinux": "almalinux", "alma": "almalinux",
     "ubuntu": "ubuntu", "debian": "debian", "sles": "sles", "suse": "sles",
     "amazon-linux": "amazon-linux", "amazon": "amazon-linux", "amzn": "amazon-linux",
-    "oracle-linux": "oracle-linux", "ol": "oracle-linux", "aix": "ibm-aix", "ibm-aix": "ibm-aix", "solaris": "solaris",
+    "oracle-linux": "oracle-linux", "ol": "oracle-linux", "aix": "ibm-aix", "ibm-aix": "ibm-aix",
+    "solaris": "solaris", "oracle-solaris": "solaris", "sunos": "solaris",
     "windows-server": "windows-server", "windows": "windows-server",
     "oracle": "oracle-database", "oracle-database": "oracle-database", "mysql": "mysql", "mariadb": "mariadb",
     "postgresql": "postgresql", "postgres": "postgresql", "pgsql": "postgresql",
-    "mssql": "mssqlserver", "sqlserver": "mssqlserver", "mssqlserver": "mssqlserver",
+    "mssql": "mssqlserver", "sqlserver": "mssqlserver", "sql-server": "mssqlserver", "mssqlserver": "mssqlserver",
     "apache": "apache-http-server", "httpd": "apache-http-server", "apache-http-server": "apache-http-server",
     "nginx": "nginx", "tomcat": "tomcat", "cisco-ios-xe": "cisco-ios-xe", "ios-xe": "cisco-ios-xe",
     "redis": "redis", "mongodb": "mongodb", "linux": "linux", "kernel": "linux",
 }
 
-# endoflife.date 미등재 제품 (벤더 공지 기준, 2026-09-28) — 버전 prefix: 종료일 | None(지원 중)
+# endoflife.date 미등재 제품 (벤더 공지 기준 수기 데이터) — 버전 키: (종료일 | None, 확정 여부)
+#   종료일 None  = 종료일을 확인하지 못함 → 수동확인 (기존의 '무기한 지원' 표기를 폐기: 근거가 없으면 양호로 보지 않음)
+#   확정 False   = 일자 불확실('확인 필요') → 종료일이 1년 이내거나 미래면 수동확인, 1년 넘게 지났으면 취약 유지
+#   출처: 각 벤더 공식 수명주기 공지 (HPE HP-UX 11i 로드맵, TmaxSoft 제품 지원 정책, Cisco End-of-Sale/Support 공지,
+#         Juniper EOL 공지) — 모두 학습 지식 기준 수기 입력이라 실제 계약(연장 지원 등)과 다를 수 있음
 MANUAL_DB = {
-    "hp-ux":    {"11i v1": "2012-12-31", "11i v2": "2015-12-31", "11i v3": "2025-12-31", "11.11": "2012-12-31", "11.23": "2015-12-31", "11.31": "2025-12-31"},
-    "jeus":     {"5": "2016-12-31", "6": "2019-12-31", "7": "2022-12-31", "8": None, "9": None},
-    "webtob":   {"3": "2016-12-31", "4": "2019-12-31", "5": None},
-    "tibero":   {"4": "2016-12-31", "5": "2021-12-31", "6": None, "7": None},
-    "cisco-ios": {"12": "2016-04-29", "15.0": "2019-07-31", "15.1": "2022-08-31", "15.2": "2023-03-31", "15.4": "2022-10-31",
-                  "15.5": "2023-06-30", "15.6": "2023-04-29", "15.7": None, "15.8": None, "15.9": None},
-    "cisco-asa": {"9.8": "2022-09-30", "9.12": "2024-03-31", "9.14": "2024-09-30", "9.16": None, "9.18": None, "9.20": None},
-    "junos":    {"18": "2023-10-31", "20": "2024-10-31", "21": "2025-10-31", "22": None, "23": None, "24": None},
+    # HPE: 11i v3 표준 지원 2025-12-31 종료(연장 지원 계약 가능). v1/v2 는 오래전 종료 - 정확한 일자는 확인 필요
+    "hp-ux":    {"11i v1": ("2012-12-31", False), "11i v2": ("2015-12-31", False), "11i v3": ("2025-12-31", True),
+                 "11.11": ("2012-12-31", False), "11.23": ("2015-12-31", False), "11.31": ("2025-12-31", True)},
+    # TmaxSoft: 지원 정책 공지 확인 불가 - 5·6·7 일자는 확인 필요, 8·9 는 종료일 미확인(수동확인)
+    "jeus":     {"5": ("2016-12-31", False), "6": ("2019-12-31", False), "7": ("2022-12-31", False),
+                 "8": (None, False), "9": (None, False)},
+    "webtob":   {"3": ("2016-12-31", False), "4": ("2019-12-31", False), "5": (None, False)},
+    "tibero":   {"4": ("2016-12-31", False), "5": ("2021-12-31", False), "6": (None, False), "7": (None, False)},
+    # Cisco IOS: 열차(train)별 End of SW Maintenance - 일자 확인 필요, 15.7~15.9 는 종료일 미확인
+    "cisco-ios": {"12": ("2016-04-29", False), "15.0": ("2019-07-31", False), "15.1": ("2022-08-31", False),
+                  "15.2": ("2023-03-31", False), "15.4": ("2022-10-31", False), "15.5": ("2023-06-30", False),
+                  "15.6": ("2023-04-29", False), "15.7": (None, False), "15.8": (None, False), "15.9": (None, False)},
+    # Cisco ASA: End of SW Maintenance - 9.8·9.12·9.14 일자 확인 필요, 9.16 이후는 종료일 미확인
+    "cisco-asa": {"9.8": ("2022-09-30", False), "9.12": ("2024-03-31", False), "9.14": ("2024-09-30", False),
+                  "9.16": (None, False), "9.18": (None, False), "9.20": (None, False)},
+    # Juniper Junos: 릴리스별 EOL 일자 확인 필요, 22 이후는 종료일 미확인
+    "junos":    {"18": ("2023-10-31", False), "20": ("2024-10-31", False), "21": ("2025-10-31", False),
+                 "22": (None, False), "23": (None, False), "24": (None, False)},
 }
+
+# endoflife.date 스냅샷·MANUAL_DB 외에 일자가 불확실한 주기 → (제품, cycle): 사유 (온라인 조회 값에는 적용하지 않음)
+#   종료일이 미래이거나 1년 이내에 지났으면 '양호/취약' 대신 수동확인 (확인 필요)
+UNCERTAIN_SNAPSHOT = {}
+for _c in ("19", "21", "23"):
+    UNCERTAIN_SNAPSHOT[("oracle-database", _c)] = "Oracle DB 지원 기간은 연장·변경 이력이 있어 My Oracle Support 공지로 재확인 (확인 필요)"
+for _c in ("7.3.0", "7.3.1", "7.3.2", "7.3.3", "7.3.4", "7.2.5"):
+    UNCERTAIN_SNAPSHOT[("ibm-aix", _c)] = "IBM AIX TL 별 서비스 종료일은 IBM 공지로 재확인 (확인 필요)"
+for _c in ("8.10", "8.8", "8.6", "8.4", "8.2", "8.0", "7.4", "7.2", "6.2"):
+    UNCERTAIN_SNAPSHOT[("redis", _c)] = "Redis 는 공식 EOL 일정이 없어 파생 일자임 (확인 필요)"
+for _c in ("6.18", "6.12", "6.6", "6.1", "5.15", "5.10"):
+    UNCERTAIN_SNAPSHOT[("linux", _c)] = "LTS 커널 종료일은 kernel.org 공지로 재확인 (확인 필요)"
+for _c in ("13.0", "12.3", "12.2", "12.1"):
+    UNCERTAIN_SNAPSHOT[("mariadb", _c)] = "MariaDB 최신 릴리스 지원 일자는 재확인 (확인 필요)"
+for _c in ("17.18", "17.17", "17.16", "17.15", "17.12", "17.9", "26.1"):
+    UNCERTAIN_SNAPSHOT[("cisco-ios-xe", _c)] = "Cisco IOS XE 는 릴리스별 End-of-Support 공지로 재확인 (확인 필요)"
+del _c
+UNCERTAIN_MARGIN_DAYS = 365   # 불확실한 날짜가 이 기간 이상 지났으면 날짜 오차와 무관하게 '종료'로 본다
 
 _ONLINE_CACHE = {}
 LAST_SOURCE = ""
@@ -122,14 +165,33 @@ def _cycle_candidates(slug, version):
             return ["2"]
         if re.match(r"^1(\.|$)", v):
             return ["2018.03"]
+    if slug == "ibm-aix":
+        m = re.match(r"^(\d)(\d)00-0*(\d+)", v)               # oslevel -s: 7200-05-03-2148 → 7.2.5
+        if m:
+            return [f"{m.group(1)}.{m.group(2)}.{m.group(3)}"]
+        m = re.match(r"^(\d+\.\d+)\s*tl\s*0*(\d+)", v)        # 7.2 TL5 → 7.2.5
+        if m:
+            return [f"{m.group(1)}.{m.group(2)}"]
     parts = re.findall(r"\d+", v)
     for n in range(min(len(parts), 3), 0, -1):
         out.append(".".join(parts[:n]))
     return out
 
 
+def _family_rows(slug, rows, version):
+    """하위 버전을 지정하지 않은 입력(sles 15 · ubuntu 22 · AIX 7.2 · mysql 8)의 하위 주기 목록. 해당 없으면 []"""
+    if slug in ("mssqlserver", "windows-server"):
+        return []
+    cands = _cycle_candidates(slug, version)
+    if not cands:
+        return []
+    pre = cands[0] + "."   # 입력이 가진 가장 구체적인 버전의 하위 주기
+    fam = [r for r in rows if r[0].startswith(pre)]
+    return sorted(fam, key=lambda r: [int(x) for x in re.findall(r"\d+", r[0])])
+
+
 def _match(slug, rows, version):
-    """rows 에서 버전에 맞는 (cycle, label, eol) 반환"""
+    """rows 에서 버전에 맞는 (cycle, label, eol) 반환 (정확히 일치하는 주기만; 하위 버전 미지정은 _family_rows)"""
     if slug == "mssqlserver":
         y = re.search(r"(2008|2012|2014|2016|2017|2019|2022|2025)", version)
         if y:
@@ -145,31 +207,109 @@ def _match(slug, rows, version):
     for c in _cycle_candidates(slug, version):
         if c in cmap:
             return cmap[c]
-    # AIX 7.2 → 7.2.x 중 최신 TL
-    m = re.match(r"^(\d+\.\d+)$", version.strip())
-    if m:
-        tl = [r for r in rows if r[0].startswith(m.group(1) + ".")]
-        if tl:
-            return max(tl, key=lambda r: [int(x) for x in re.findall(r"\d+", r[0])])
     return None
 
 
-def _judge(product, version, eol, src, cycle=""):
+def _judge(product, version, eol, src, cycle="", uncertain=""):
+    """종료일 → (결과, EoS일자, 설명). uncertain(사유 문자열)이 있으면 일자가 불확실하므로 양호로 단정하지 않는다"""
     tag = f"{product} {version}" + (f" (주기 {cycle})" if cycle and cycle != version else "")
-    if eol is False or eol is None:
-        return RESULT_GOOD, None, f"{tag} 지원 기간 내 [{src}]"
+    note = f" - {uncertain}" if uncertain else ""
     if eol is True:
         return RESULT_BAD, "종료", f"{tag} 지원 종료 [{src}]"
+    if eol is False or eol is None:
+        if uncertain:
+            return RESULT_MANUAL, None, f"{tag} 종료일 미확인 - 벤더 지원 정책 수동 확인{note} [{src}]"
+        return RESULT_GOOD, None, f"{tag} 지원 기간 내 (종료 일자 미공지) [{src}]"
     try:
         d = datetime.date.fromisoformat(str(eol)[:10])
     except ValueError:
         return RESULT_MANUAL, str(eol), f"{tag} 종료일 형식 확인 필요({eol}) [{src}]"
     days = (d - CHECK_DATE).days
     if days < 0:
+        if uncertain and -days <= UNCERTAIN_MARGIN_DAYS:
+            return RESULT_MANUAL, str(d), f"{tag} EoS {d} ({-days}일 경과)로 알려져 있으나 일자 불확실{note} [{src}]"
         return RESULT_BAD, str(d), f"{tag} EoS {d} ({-days}일 경과) [{src}]"
     if days <= IMMINENT_DAYS:
-        return RESULT_MANUAL, str(d), f"{tag} EoS {d} ({days}일 남음, 임박) [{src}]"
+        return RESULT_MANUAL, str(d), f"{tag} EoS {d} ({days}일 남음, 임박){note} [{src}]"
+    if uncertain:
+        return RESULT_MANUAL, str(d), f"{tag} 지원 기간 내로 알려져 있으나 EoS {d} 일자 불확실{note} [{src}]"
     return RESULT_GOOD, str(d), f"{tag} 지원 기간 내 (EoS {d}) [{src}]"
+
+
+def _row_uncertain(slug, cycle, online):
+    return "" if online else UNCERTAIN_SNAPSHOT.get((slug, cycle), "")
+
+
+def _judge_family(product, version, slug, fam, src, online):
+    """하위 주기가 여럿인 입력 → 전부 종료면 취약, 전부 지원 중이면 양호, 섞여 있으면 수동확인"""
+    judged = []
+    for cyc, lab, eol in fam:
+        r, e, d = _judge(product, version, eol, src, lab or cyc, _row_uncertain(slug, cyc, online))
+        judged.append((cyc, lab, r, e))
+    results = {j[2] for j in judged}
+    unit = "TL" if slug == "ibm-aix" else "하위 버전"
+    brief = " / ".join(f"{j[0]}:{('EoS ' + j[3]) if j[3] else j[2]}" for j in judged[:6]) + (" 외" if len(judged) > 6 else "")
+    if results == {RESULT_BAD}:
+        last = max((j[3] for j in judged if j[3] and j[3][:1].isdigit()), default=None)
+        return RESULT_BAD, last, f"{product} {version} {unit} 미지정이나 모든 {unit}이 지원 종료 ({brief}) [{src}]"
+    if results == {RESULT_GOOD}:
+        first = min((j[3] for j in judged if j[3] and j[3][:1].isdigit()), default=None)
+        return RESULT_GOOD, first, f"{product} {version} {unit} 미지정이나 모든 {unit}이 지원 기간 내 ({brief}) [{src}]"
+    hint = " - oslevel -s 로 TL 확인" if slug == "ibm-aix" else ""
+    return RESULT_MANUAL, None, (f"{product} {version} {unit} 미지정 - {unit}별 지원 상태가 달라 판정 불가 ({brief}) - "
+                                 f"정확한 버전 확인 필요{hint} [{src}]")
+
+
+def _norm_name(p):
+    return re.sub(r"[\s_]+", "-", p.strip().lower())
+
+
+def _find_alias(p):
+    """제품명 → endoflife.date 식별자: 정확 일치 → 가장 긴 별칭 단어 일치 ('oracle solaris' 가 'ol' 로 오인되지 않게 영문 경계 검사)"""
+    pn = _norm_name(p)
+    if p in ALIASES:
+        return ALIASES[p]
+    if pn in ALIASES:
+        return ALIASES[pn]
+    for k in sorted(ALIASES, key=len, reverse=True):
+        kn = _norm_name(k)
+        if re.search(r"(?<![a-z])" + re.escape(kn) + r"(?![a-z])", pn):
+            return ALIASES[k]
+    return None
+
+
+def _find_manual(p):
+    pn = _norm_name(p).replace("hpux", "hp-ux")
+    if pn in MANUAL_DB:
+        return pn
+    for k in sorted(MANUAL_DB, key=len, reverse=True):
+        if re.search(r"(?<![a-z])" + re.escape(k) + r"(?![a-z])", pn):
+            return k
+    return None
+
+
+# IIS 버전 → 기본 탑재 Windows Server (IIS 는 별도 수명주기가 없고 호스트 Windows 지원 주기를 따름)
+IIS_TO_WINDOWS = {"6.0": "2003", "7.0": "2008", "7.5": "2008 R2", "8.0": "2012", "8.5": "2012 R2"}
+
+
+def _check_iis(product, version, use_api):
+    v = version.strip().lower()
+    m = re.search(r"(2003|2008|2012|2016|2019|2022|2025)\s*-?\s*(r2)?", v)
+    if m:   # 'IIS 10.0 / Windows Server 2019' 처럼 OS 가 함께 오면 그 OS 로 판정
+        win = m.group(1) + (" R2" if m.group(2) else "")
+        r, e, d = check_eos("windows-server", win, use_api)
+        return r, e, f"{product} {version}: IIS 는 호스트 Windows Server 지원 주기를 따름 - {d}"
+    mv = re.match(r"\s*v?(\d+)(?:\.(\d+))?", v)
+    if mv:
+        ver = f"{mv.group(1)}.{mv.group(2) or '0'}"
+        if ver in IIS_TO_WINDOWS:
+            win = IIS_TO_WINDOWS[ver]
+            r, e, d = check_eos("windows-server", win, use_api)
+            return r, e, f"{product} {version}: Windows Server {win} 기본 탑재 버전으로 OS 지원 주기를 따름 - {d}"
+        if ver == "10.0":
+            return RESULT_MANUAL, None, (f"{product} {version}: IIS 10.0 은 Windows Server 2016/2019/2022/2025 에 공통 탑재되어 "
+                                         f"OS 버전 없이 판정 불가 - 호스트 Windows Server 버전의 EoS 항목으로 판정")
+    return RESULT_MANUAL, None, f"{product} {version}: IIS 버전을 해석할 수 없음 - 호스트 Windows Server 지원 주기로 수동 확인"
 
 
 def check_eos(product, version, use_api=True):
@@ -179,11 +319,23 @@ def check_eos(product, version, use_api=True):
     v = (version or "").strip()
     if not v:
         return RESULT_MANUAL, None, f"{product} 버전 미확인 - 수동 확인"
-    slug = ALIASES.get(p) or next((s for k, s in ALIASES.items() if k in p), None)
+    if re.search(r"(?<![a-z])iis(?![a-z])", p):
+        return _check_iis(product, v, use_api)
+    slug = _find_alias(p)
+    if slug == "centos" and (re.search(r"stream", v, re.I) or re.match(r"^\D*(?:9|1\d)(?!\d)", v)):
+        slug = "centos-stream"   # CentOS Linux 는 8 에서 종료 - '9-stream'·'stream 9'·9 이상은 CentOS Stream
+    if slug == "solaris":
+        sv = re.match(r"^\s*(?:sunos\s*)?5\.(\d+)\s*$", v, re.I)   # SunOS 5.11 → Solaris 11
+        if sv:
+            v = sv.group(1)
+        if re.fullmatch(r"\s*11\s*", v):
+            return RESULT_MANUAL, None, (f"{product} 11 - Solaris 11 은 업데이트(11.4 지원 중 ~2031-11, 11.3 이하 종료)에 따라 지원 상태가 달라 "
+                                         f"OS 버전 상세 필요 (pkg info entire / uname -v 로 11.x 확인)")
     if slug:
-        rows, src = None, ""
+        rows, src, online = None, "", False
         if use_api:
             rows = fetch_online(slug)
+            online = bool(rows)
             src = "endoflife.date 온라인 조회" if rows else ""
         if not rows:
             rows = EOL_SNAPSHOT.get(slug)
@@ -192,15 +344,31 @@ def check_eos(product, version, use_api=True):
             hit = _match(slug, rows, v)
             if hit:
                 LAST_SOURCE = src
-                return _judge(product, v, hit[2], src, hit[1] or hit[0])
+                res = _judge(product, v, hit[2], src, hit[1] or hit[0], _row_uncertain(slug, hit[0], online))
+                if slug == "centos-stream" and ALIASES.get(p) == "centos":
+                    res = (res[0], res[1], res[2] + " (CentOS Stream 으로 판단)")
+                return res
+            fam = _family_rows(slug, rows, v)
+            if fam:
+                LAST_SOURCE = src
+                return _judge_family(product, v, slug, fam, src, online)
             return RESULT_MANUAL, None, f"{product} {v} 버전 주기 미등재 - 벤더 지원 정책 수동 확인 [{src}]"
-    key = next((k for k in MANUAL_DB if k == p or k in p), None)
+    key = _find_manual(p)
     if key:
         db = MANUAL_DB[key]
         vv = v.lower()
+        if key == "hp-ux":
+            vv = re.sub(r"^b\.", "", vv)                # uname -r: B.11.31
+            vv = re.sub(r"^11i\s*v", "11i v", vv)       # 11iv3 → 11i v3
+            if re.fullmatch(r"11", vv):
+                return RESULT_MANUAL, None, (f"{product} 11 - HP-UX 11i 은 v1(11.11)·v2(11.23)·v3(11.31)별 지원 종료일이 달라 "
+                                             f"세부 버전 필요 (uname -r 의 B.11.xx 확인)")
         for k in sorted(db, key=len, reverse=True):
-            if vv == k or vv.startswith(k + ".") or vv.startswith(k + " ") or vv.startswith(k):
-                return _judge(product, v, db[k] if db[k] else False, f"벤더 공지 수기 데이터 {DATA_DATE}", k)
+            if re.match(re.escape(k) + r"(?![0-9])", vv):   # 구성요소 경계 일치 ('15.1' 이 '15.10' 에 걸리지 않게)
+                eol, confirmed = db[k]
+                src = f"벤더 공지 수기 데이터 {DATA_DATE}"
+                unc = "" if confirmed else ("종료일 미확인 (확인 필요)" if eol is None else "수기 일자 (확인 필요)")
+                return _judge(product, v, eol if eol else None, src, k, unc)
         return RESULT_MANUAL, None, f"{product} {v} 버전 정보 없음 - 벤더 지원 정책 수동 확인"
     return RESULT_MANUAL, None, f"{product} {v} EoS 정보 없음 - 벤더 지원 정책 수동 확인"
 
@@ -224,6 +392,10 @@ def batch_check(items):
 
 
 EOL_SNAPSHOT = {   # endoflife.date /api/<제품>.json 스냅샷 (2026-09-28 수집) - (cycle, releaseLabel, eol[날짜|True=종료|False=지원중])
+    # 기준: 제조사 일반(표준) 지원 종료일 — 유료 연장 지원(RHEL ELS·Ubuntu Pro/ESM·SUSE LTSS·Windows ESU·Solaris Extended 등)은 반영하지 않음
+    #   예) Windows Server 2008/2008 R2 는 일반 지원 2020-01-14 종료(ESU 는 2023-01-10, Azure 는 2024-01-09 종료), 2012/2012 R2 는 ESU 도 2026-10-13 종료
+    # eol=False 는 '종료 일자 미공지(지원 중)'. 일자가 불확실한 주기는 UNCERTAIN_SNAPSHOT 에 표시(수동확인으로 처리)
+    # 이 스냅샷의 미래 일자는 학습 지식으로 검증할 수 없는 값을 포함하므로 중요 판정은 벤더 공지로 재확인
     "almalinux": [
         ('10', '', '2035-05-31'), ('9', '', '2032-05-31'), ('8', '', '2029-05-31'),
     ],
@@ -391,7 +563,7 @@ EOL_SNAPSHOT = {   # endoflife.date /api/<제품>.json 스냅샷 (2026-09-28 수
     ],
     "solaris": [
         ('11.4', '', '2031-11-01'), ('11.3', '', '2021-01-01'), ('11.2', '', True),
-        ('11.1', '', True), ('11', '', True), ('10', '', '2018-01-01'),
+        ('11.1', '', True), ('10', '', '2018-01-01'),   # '11' 단독 행 없음: 11.4 만 지원 중(Premier ~2031-11), 11.3 이하 종료 - 주 버전만 오면 수동확인
         ('9', '', '2011-10-01'), ('8', '', '2009-03-01'),
     ],
     "tomcat": [
@@ -421,7 +593,8 @@ EOL_SNAPSHOT = {   # endoflife.date /api/<제품>.json 스냅샷 (2026-09-28 수
         ('20h2-sac', 'Windows Server 20H2 SAC', '2022-08-09'), ('2004-sac', 'Windows Server 2004 SAC', '2021-12-14'), ('1909-sac', 'Windows Server 1909 SAC', '2021-05-11'),
         ('1903-sac', 'Windows Server 1903 SAC', '2020-12-08'), ('1809-sac', 'Windows Server 1809 SAC', '2020-11-10'), ('2019', '', '2029-01-09'),
         ('1803-sac', 'Windows Server 1803 SAC', '2019-11-12'), ('1709-sac', 'Windows Server 1709 SAC', '2019-04-09'), ('2016', '', '2027-01-12'),
-        ('2012-r2', 'Windows Server 2012 R2', '2023-10-10'), ('2012', '', '2023-10-10'), ('2008-r2-sp1', 'Windows Server 2008 R2 SP1', '2020-01-14'),
+        ('2012-r2', 'Windows Server 2012 R2', '2023-10-10'), ('2012', '', '2023-10-10'), ('2008-r2', 'Windows Server 2008 R2', '2020-01-14'),
+        ('2008', 'Windows Server 2008', '2020-01-14'), ('2008-r2-sp1', 'Windows Server 2008 R2 SP1', '2020-01-14'),
         ('2008-sp2', 'Windows Server 2008 SP2', '2020-01-14'), ('2003-sp2', 'Windows Server 2003 SP2', '2015-07-14'), ('2003-sp1', 'Windows Server 2003 SP1', '2009-04-14'),
         ('2003', '', '2007-04-10'), ('2000', '', '2010-07-13'),
     ],
@@ -436,7 +609,7 @@ if __name__ == "__main__":
     use_api = "--no-api" not in sys.argv
     if len(args) < 2:
         print("사용법: python eos_checker.py [--no-api] <제품> <버전>")
-        print("  예) mysql 8.0.46 / postgresql 13.22 / amazon-linux 2 / rhel 7.9 / mssql 2016 / tomcat 9.0.85 / windows-server 2012r2")
+        print("  예) mysql 8.0.46 / postgresql 13.22 / amazon-linux 2 / rhel 7.9 / mssql 2016 / tomcat 9.0.85 / windows-server 2012r2 / centos 9-stream / iis 8.5")
         print("=" * 70)
         print(f"  EoS 현황 (판정 기준일 {CHECK_DATE}, 내장 데이터 {DATA_DATE}) - 최근 종료·임박 주기")
         print("=" * 70)

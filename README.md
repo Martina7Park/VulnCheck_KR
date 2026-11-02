@@ -18,6 +18,7 @@
 | [`security/`](security) | 보안장비 config 점검 (FortiGate·Palo Alto 등) | 점검자 PC | `check_security.sh` |
 | [`pc/`](pc) | 업무용 PC 점검 (Windows·macOS·iOS) | 사용자 PC | `run_pc.bat` / `run_pc_kisa.bat` / `check_pc_mac*.sh` |
 | [`converter/`](converter) | 결과 → 상세보고서 엑셀 변환, EoS 판정, 결과 비교 | 점검자 PC | `convert_v4.py` |
+| [`tools/`](tools) | 공통 코드 동기화(`sync_common.py`), 결과·증적 검사(`check_evidence.py`) | 저장소 관리 | — |
 
 각 폴더를 열면 파일별 용도가 README 로 정리되어 있습니다. `.sh` 는 Linux/Unix·macOS, `.bat`·`.ps1` 은 Windows 용이며, Windows 는 `run_*.bat` 만 실행하면 됩니다.
 
@@ -44,6 +45,8 @@ python convert_v4.py
 ```
 
 두 기준은 항목코드가 겹쳐도 뜻이 다릅니다(예: PC-01). 스크립트에서 고른 기준과 컨버터에서 고른 기준을 맞추십시오.
+
+판정값은 `양호` / `취약` / `수동확인` / `점검불가` / `N-A` 입니다. `점검불가` 는 권한 부족·조회 실패·설정 미발견 등으로 점검 자체를 못 한 경우이며 근거에 사유가 적힙니다.
 
 ---
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ================================================================
 # 전자금융기반시설 / 주요정보통신기반시설
-# 통합 취약점 점검 컨버터 v4.1
+# 통합 취약점 점검 컨버터 v4.2
 #
 # 기준: 전자금융기반시설 보안 취약점 평가기준 제2026-1호
 #       주요정보통신기반시설 기술적 취약점 분석 평가 방법 상세가이드
@@ -23,17 +23,20 @@
 #   ├── security/output/
 #   ├── pc/output/
 #   └── logs/               ← 감사 로그 (자동 생성)
-#   카테고리별 template.xlsx 는 없으면 기준 엑셀로 자동 생성
+#   각 분야 폴더(server/ 등)에 선택 파일을 둘 수 있음
+#     scope.txt    : 보고서에 넣을 호스트명 또는 IP (한 줄에 하나, # 주석). 없으면 전체
+#     override.csv : 인터뷰 결과 반영 (UTF-8, 헤더 호스트,항목코드,판정,근거) — 재실행만으로 판정 덮어쓰기
 #
 # [점검 스크립트 출력 형식]
-#   항목코드|결과|근거설명
+#   항목코드|결과|근거설명        결과: 양호 / 취약 / N-A / 수동확인 / 점검불가
 #   SRV-026|양호|PermitRootLogin no
 #   SRV-069|취약|PASS_MAX_DAYS=99999 (90일 초과)
 #   SRV-026|N-A|해당 없음 (Windows 전용)
-#   SRV-xxx|수동확인|직접 확인 필요
+#   SRV-xxx|수동확인|직접 확인 필요 (자료는 수집했으나 사람이 판단)
+#   SRV-xxx|점검불가|명령 없음/권한 부족 등 점검 자체를 못 함 (사유 필수)
 # ================================================================
 
-import os, re, sys, datetime, json, hashlib
+import os, re, sys, datetime, json, hashlib, csv
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -42,24 +45,39 @@ from openpyxl.formatting.rule import FormulaRule, CellIsRule
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.chart import RadarChart, BarChart, Reference
 from openpyxl.chart.label import DataLabelList
-from openpyxl.chart.series import SeriesLabel
 
 
 _XL_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")   # 엑셀 셀에 쓸 수 없는 제어 문자 (레지스트리 값 등 증적에 섞임)
 
 
 def read_text(path):
-    """결과·증적 파일 읽기 (인코딩 자동 판별, 엑셀 불가 제어 문자 제거)"""
+    """결과·증적 파일 읽기 (인코딩 자동 판별, 엑셀 불가 제어 문자 제거)
+    UTF-8 이 한두 바이트만 깨진 경우 그 줄만 대체문자(�)로 두고 나머지는 UTF-8 로 읽는다 (latin-1 폴백으로 전체가 깨지지 않게)."""
     with open(path, "rb") as f:
-        bom = f.read(2)
-    encs = ("utf-16",) if bom in (b"\xff\xfe", b"\xfe\xff") else ()   # PowerShell 5.1 '>' 리다이렉트 = UTF-16LE
-    for enc in encs + ("utf-8-sig", "utf-8", "cp949", "euc-kr", "latin-1"):
+        raw = f.read()
+    bom = raw[:2]
+    if bom in (b"\xff\xfe", b"\xfe\xff"):   # PowerShell 5.1 '>' 리다이렉트 = UTF-16LE
         try:
-            with open(path, encoding=enc) as f:
-                return _XL_ILLEGAL.sub("", f.read())
-        except (UnicodeDecodeError, UnicodeError):
+            return _XL_ILLEGAL.sub("", raw.decode("utf-16"))
+        except UnicodeError:
+            pass
+    try:
+        return _XL_ILLEGAL.sub("", raw.decode("utf-8-sig"))
+    except UnicodeDecodeError:
+        pass
+    u8 = raw.decode("utf-8", errors="replace")
+    bad = u8.count("\ufffd")
+    nonascii = sum(1 for ch in u8 if ord(ch) > 127)
+    if bad * 50 <= max(nonascii, 1):   # 비ASCII 문자의 2% 이하만 깨짐 → UTF-8 로 보고 깨진 곳만 대체
+        print(f"[경고] {os.path.basename(path)}: UTF-8 로 해석할 수 없는 바이트 {bad}개 → 해당 위치만 '\ufffd' 로 대체")
+        return _XL_ILLEGAL.sub("", u8)
+    for enc in ("cp949", "euc-kr"):
+        try:
+            return _XL_ILLEGAL.sub("", raw.decode(enc))
+        except UnicodeError:
             continue
-    return _XL_ILLEGAL.sub("", open(path, encoding="latin-1").read())
+    print(f"[경고] {os.path.basename(path)}: 인코딩 판별 실패 → UTF-8 대체문자 모드로 읽음")
+    return _XL_ILLEGAL.sub("", u8)
 
 
 # ================================================================
@@ -76,10 +94,14 @@ def _file_hash(path):
         return "N/A"
 
 
+# 한 번의 변환 실행 동안 모인 부가 기록 (대상 범위·인터뷰 반영·중복 호스트 처리) — 감사 로그에 함께 저장
+_RUN_NOTES = {}
+
+
 def write_audit_log(base_dir, mode, category, targets, output_path):
     """
     변환 실행 내역을 logs/ 폴더에 JSON으로 기록.
-    targets: [{"name": str, "good": int, "bad": int, "na": int, "manual": int, "input_file": str}, ...]
+    targets: [{"name": str, "good": int, "bad": int, "na": int, "manual": int, "unable": int, "input_file": str}, ...]
     """
     log_dir = os.path.join(base_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
@@ -89,7 +111,8 @@ def write_audit_log(base_dir, mode, category, targets, output_path):
     total_bad  = sum(t.get("bad", 0)  for t in targets)
     total_na   = sum(t.get("na", 0)   for t in targets)
     total_mc   = sum(t.get("manual", 0) for t in targets)
-    total_all  = total_good + total_bad + total_na + total_mc
+    total_un   = sum(t.get("unable", 0) for t in targets)
+    total_all  = total_good + total_bad + total_na + total_mc + total_un
 
     entry = {
         "version":     VERSION,
@@ -105,14 +128,22 @@ def write_audit_log(base_dir, mode, category, targets, output_path):
             "bad":     total_bad,
             "na":      total_na,
             "manual":  total_mc,
+            "unable":  total_un,
             "vuln_rate": f"{total_bad/total_all*100:.1f}%" if total_all else "0%",
         },
         "output_file": os.path.basename(output_path) if output_path else None,
         "output_hash": _file_hash(output_path) if output_path and os.path.exists(output_path) else None,
     }
+    for k in ("scope", "override", "duplicates", "evidence_check"):   # 대상 범위 제외·인터뷰 덮어쓰기·중복 호스트 처리 기록
+        if _RUN_NOTES.get(k):
+            entry[k] = _RUN_NOTES[k]
 
     log_name = f"audit_{category}_{ts.strftime('%Y%m%d_%H%M%S')}.json"
     log_path = os.path.join(log_dir, log_name)
+    seq = 1
+    while os.path.exists(log_path):   # 같은 초에 여러 보고서(Unix/Windows 분리 등)를 만들어도 덮어쓰지 않음
+        seq += 1
+        log_path = os.path.join(log_dir, f"audit_{category}_{ts.strftime('%Y%m%d_%H%M%S')}_{seq}.json")
     with open(log_path, "w", encoding="utf-8") as f:
         json.dump(entry, f, ensure_ascii=False, indent=2)
     print(f"[LOG] 감사 로그 저장: {log_path}")
@@ -120,7 +151,7 @@ def write_audit_log(base_dir, mode, category, targets, output_path):
 
 
 # ── 상수 ──────────────────────────────────────────────────────────
-VERSION    = "4.1"
+VERSION    = "4.2"
 BASE_DATE  = "2026-01-01"   # 제2026-1호 기준일
 
 # 결과값
@@ -128,6 +159,31 @@ RESULT_GOOD   = "양호"
 RESULT_BAD    = "취약"
 RESULT_NA     = "N-A"
 RESULT_MANUAL = "수동확인"
+RESULT_UNABLE = "점검불가"   # 점검 자체를 수행하지 못함 (명령·권한 없음, 조회 오류, 타임아웃 등) — 사유는 근거에 기재
+ALL_RESULTS = (RESULT_GOOD, RESULT_BAD, RESULT_NA, RESULT_MANUAL, RESULT_UNABLE)
+# 미판정(보안수준 산정에서 제외, 사람이 확인·재점검 후 확정해야 하는 판정)
+UNDECIDED = (RESULT_MANUAL, RESULT_UNABLE)
+# 여러 결과가 한 항목에 겹칠 때 우선순위 (큰 값 우선): 취약 > 점검불가 > 수동확인 > 양호 > N-A
+RESULT_RANK = {RESULT_BAD: 5, RESULT_UNABLE: 4, RESULT_MANUAL: 3, RESULT_GOOD: 2, RESULT_NA: 1}
+_RESULT_ALIASES = {
+    "해당없음": RESULT_NA, "해당 없음": RESULT_NA, "미해당": RESULT_NA,
+    "점검불가": RESULT_UNABLE, "점검 불가": RESULT_UNABLE, "점검불능": RESULT_UNABLE, "점검 불능": RESULT_UNABLE,
+    "수동확인": RESULT_MANUAL, "수동 확인": RESULT_MANUAL, "양호": RESULT_GOOD, "취약": RESULT_BAD,
+}
+
+
+def _norm_result(val, warn_ctx=None):
+    """결과값 정규화: N/A·NA·해당없음 → N-A, 점검 불가 → 점검불가. 알 수 없는 값은 경고 후 수동확인.
+    반환: (정규화된 값, 알 수 없는 값이었는지)"""
+    v = re.sub(r"\s+", " ", str(val or "")).strip()
+    if v.upper() in ("N/A", "NA", "N-A"):
+        return RESULT_NA, False
+    for k in (v, v.replace(" ", "")):
+        if k in _RESULT_ALIASES:
+            return _RESULT_ALIASES[k], False
+    if warn_ctx:
+        print(f"[경고] {warn_ctx}: 알 수 없는 판정값 '{v}' → 수동확인으로 처리")
+    return RESULT_MANUAL, True
 
 # 기준 엑셀 시트명
 SHEET_MAP = {
@@ -336,10 +392,20 @@ WST_CATEGORY_STYLE = {
 # ================================================================
 # 증적 파일 파싱
 # ================================================================
+_EVD_ESC = "\u200b"
+_EVD_HDR = ("$ ", "# ", "파일: ", _EVD_ESC)
+
+
+def _evd_text(evd):
+    """내부 증적 문자열 → 보고서에 쓸 원문 (출력 줄 보호용 표식 제거)"""
+    return (evd or "").replace(_EVD_ESC, "")
+
+
 def parse_evidence(evd_path):
     """
     *_evidence.txt 파일 파싱 — 항목별 상세 증적 추출
     반환: {"SRV-001": "실행 명령어 및 출력 결과 텍스트", ...}
+      명령은 '$ 명령', 설명은 '# 설명', 파일은 '파일: 경로' 머리줄 + 출력 원문 (잘라내지 않음)
     블록 시작: [CODE] HH:MM:SS $|PS> 명령 / [CODE] HH:MM:SS 설명 / [CODE] 파일: 경로
     블록 종료: [판정] / [참고-평가기준 외] / [평가대상 아님] / 다른 블록 시작
     REF-(평가기준 외 참고) 블록은 버림
@@ -376,7 +442,9 @@ def parse_evidence(evd_path):
             flush()
             continue
         if state["code"] is not None:
-            state["lines"].append(line)
+            # 출력 원문 줄이 '$ '·'# '·'파일: ' 로 시작하면 명령/설명 머리줄과 구분되도록 보이지 않는 표식(ZWSP)을 앞에 붙임
+            # (보고서에 쓸 때 _evd_text 가 제거 → 원문 그대로)
+            state["lines"].append(_EVD_ESC + line if line.startswith(_EVD_HDR) else line)
     flush()
 
     for code in evidence:
@@ -403,11 +471,17 @@ def find_evidence_file(result_path):
         h = pm.group(2)
         candidates += [os.path.join(d, f"{h}_pc_kisa_evidence.txt")] if pm.group(1) else \
                       [os.path.join(d, f"{h}_pc_evidence.txt"), os.path.join(d, f"{h}_pc_mac_evidence.txt")]
+    # check_server.sh 사용법 `> <호스트>_server.txt` 의 결과 ↔ 증적 `<호스트>_srv_evidence.txt` (결과 파일명 접미사 _server/_srv 를 바꿔 탐색)
+    sm = re.match(r"^(.+?)_(?:server|srv)$", base, re.I)
+    if sm:
+        candidates += [os.path.join(d, f"{sm.group(1)}_srv_evidence.txt"), os.path.join(d, f"{sm.group(1)}_server_evidence.txt")]
     for c in candidates:
         if os.path.exists(c):
             return c
-    for f in os.listdir(d):
-        if f.startswith(base) and "evidence" in f.lower() and f.endswith(".txt"):
+    # 폴백: 결과 파일명 뒤에 '_' 구분자 + 'evidence' 가 오는 파일만 (web1 결과에 web10 증적이 붙는 접두 일치 오류 방지)
+    pat = re.compile(r"^" + re.escape(base) + r"_[A-Za-z0-9]*_?evidence[^/\\]*\.txt$", re.I)
+    for f in sorted(os.listdir(d)):
+        if pat.match(f):
             return os.path.join(d, f)
     # 보안장비 스크립트: 증적 파일명이 점검 대상 설정파일명 기준(<config>_iss_evidence.txt) → 결과 헤더 '# 파일:' 로 탐색
     try:
@@ -476,27 +550,6 @@ def _fail_condition(std_text):
     return ""
 
 
-def _condense_evidence(evd_text, max_lines=8, width=60):
-    """증적 원문 → 명령/출력 요약 (출력 없는 명령은 '(출력 없음)' 표기)"""
-    out, pending_cmd = [], False
-    for ln in evd_text.splitlines():
-        if not ln.strip() or ln.startswith("[평가대상 아님]"):
-            continue
-        if ln.startswith(("$ ", "# ", "파일: ")):
-            if pending_cmd:
-                out.append("  (출력 없음)")
-            out.append(ln[:width])
-            pending_cmd = True
-        else:
-            out.append("  " + ln.strip()[:width])
-            pending_cmd = False
-    if pending_cmd:
-        out.append("  (출력 없음)")
-    if len(out) > max_lines:
-        out = out[:max_lines] + ["  … (이하 생략, 증적 파일 참조)"]
-    return "\n".join(out)
-
-
 def _category_mismatch(res, criteria_items, fname):
     """결과 파일 항목코드가 현재 분야 평가기준과 전혀 겹치지 않으면 True (다른 분야 결과가 섞인 경우)"""
     if not res:
@@ -518,32 +571,33 @@ def _category_mismatch(res, criteria_items, fname):
 
 
 def compose_status(res, evidence, criteria_items, sub_key=None):
-    """현황 및 문제점 구성: [현황] 판정 사유 / [문제점] 평가기준 취약 조건 / [확인방법] / [증적] 요약"""
+    """현황 및 문제점 구성: [현황] 판정 사유 / [문제점] 평가기준 취약 조건 / [확인방법] / [증적] 원문 전체
+    증적은 잘라내지 않고 명령 + 출력 원문을 그대로 넣는다 (셀 한도 초과 시 호스트 상세 시트 작성 단계에서 '증적 원문' 시트로 연결)"""
     evidence = evidence or {}
     out = {}
     for code, (rv, why) in res.items():
         item = criteria_items.get(code) or {}
         cb_all = item.get("criteria_by") or {}
         cb = cb_all.get(sub_key) or next((v for v in cb_all.values() if v.get("기준")), {})
+        evd = _evd_text(evidence.get(code, ""))
         if rv == RESULT_NA:
-            out[code] = (rv, why)
+            out[code] = (rv, f"{why}\n[증적]\n{evd}" if evd and why else (f"[증적]\n{evd}" if evd else why))
             continue
         parts = [f"[현황] {why}" if why else "[현황] -"]
         if rv == RESULT_BAD:
             cond = _fail_condition(cb.get("기준", ""))
             if cond:
                 parts.append(f"[문제점] {'가이드 판단기준' if item.get('guide') else '평가기준'}상 '{cond}'에 해당하여 취약")
+        elif rv == RESULT_UNABLE:
+            parts.append("[조치] 점검불가 사유(권한·명령·접속 등)를 해소해 재점검하거나, 수동으로 확인해 판정을 확정하십시오. 확정 전까지 보안수준 산정에서 제외됩니다.")
         elif rv == RESULT_MANUAL and item.get("guide"):
             parts.append("[판단기준]\n" + (cb.get("기준") or "").replace("* ", ""))
         elif rv == RESULT_MANUAL:
             ml = [l.rstrip() for l in (cb.get("방법") or "").splitlines() if l.strip()]
             if ml:
-                if len(ml) > 6:
-                    ml = ml[:6] + ["… (평가기준 판단방법 참조)"]
                 parts.append("[확인방법]\n" + "\n".join(ml))
-        evd = evidence.get(code, "")
         if evd:
-            parts.append("[증적]\n" + _condense_evidence(evd))
+            parts.append("[증적]\n" + evd)
         out[code] = (rv, "\n".join(parts) if len(parts) > 1 else (why or ""))
     return out
 
@@ -551,36 +605,49 @@ def compose_status(res, evidence, criteria_items, sub_key=None):
 # ================================================================
 # 파이프 출력 파싱
 # ================================================================
-def parse_pipe(text):
+_CODE_RE = re.compile(r"^[A-Z]+-\d+$")
+
+
+def parse_pipe(text, fname=""):
     """
     check_server.sh / check_webwas.sh / check_dbms.sh 출력 파싱
     형식: SRV-026|양호|PermitRootLogin no
     반환: {"SRV-026": ("양호", "PermitRootLogin no"), ...}
+    결과값은 _norm_result 로 정규화 (N/A·NA·해당없음 → N-A, 점검 불가 → 점검불가, 그 외 미지의 값 → 경고 후 수동확인)
     """
     result = {}
+    bad_lines = 0
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith('#'): continue
         parts = line.split('|', 2)
         if len(parts) < 2: continue
         code_  = parts[0].strip().upper()
-        res    = parts[1].strip()
         reason = parts[2].strip() if len(parts) > 2 else ""
-        if re.match(r'[A-Z]+-\d+', code_):
-            if code_ in result:
-                # 같은 항목 중복 출력(구버전 스크립트 등) → 가장 나쁜 결과 우선, 사유 병합 (마지막 줄 우선으로 취약이 가려지는 문제 방지)
-                rank = {RESULT_BAD: 4, RESULT_MANUAL: 3, RESULT_GOOD: 2, RESULT_NA: 1}
-                pres, preason = result[code_]
-                if res != pres:  # 세부 판정이 다르면 판정 표지 부착
-                    if not preason.startswith("["):
-                        preason = f"[{pres}] {preason}"
-                    reason = f"[{res}] {reason}"
-                if rank.get(res, 0) > rank.get(pres, 0):
-                    result[code_] = (res, f"{reason} / {preason}")
-                else:
-                    result[code_] = (pres, f"{preason} / {reason}")
+        if not _CODE_RE.match(code_):   # 'SRV-002 foo' 처럼 코드 뒤에 문자가 붙은 줄은 다른 키로 조용히 빠지지 않게 경고
+            if re.match(r'^[A-Z]+-\d+', code_):
+                bad_lines += 1
+                if bad_lines <= 5:
+                    print(f"[경고] {fname or '결과 파일'}: 항목코드 형식 오류로 건너뜀 → {line[:60]}")
+            continue
+        res, unknown = _norm_result(parts[1], f"{fname or '결과 파일'} {code_}")
+        if unknown:
+            reason = f"[원본 판정값 '{parts[1].strip()}'] {reason}".strip()
+        if code_ in result:
+            # 같은 항목 중복 출력(구버전 스크립트 등) → 가장 나쁜 결과 우선, 사유 병합 (마지막 줄 우선으로 취약이 가려지는 문제 방지)
+            pres, preason = result[code_]
+            if res != pres:  # 세부 판정이 다르면 판정 표지 부착
+                if not preason.startswith("["):
+                    preason = f"[{pres}] {preason}"
+                reason = f"[{res}] {reason}"
+            if RESULT_RANK.get(res, 0) > RESULT_RANK.get(pres, 0):
+                result[code_] = (res, f"{reason} / {preason}")
             else:
-                result[code_] = (res, reason)
+                result[code_] = (pres, f"{preason} / {reason}")
+        else:
+            result[code_] = (res, reason)
+    if bad_lines > 5:
+        print(f"[경고] {fname or '결과 파일'}: 항목코드 형식 오류 줄 {bad_lines}건 (처음 5건만 표시)")
     return result
 
 
@@ -639,14 +706,6 @@ def get_webwas_categories(web_type, was_type, os_fam="linux"):
 # ================================================================
 # 네트워크 점검 로직 (기존 config 파싱 방식 유지)
 # ================================================================
-def any_m(lines, pattern):
-    return any(re.search(pattern, l, re.I) for l in lines)
-
-def fline(lines, pattern):
-    for l in lines:
-        if re.search(pattern, l, re.I): return l.strip()
-    return None
-
 def _net_secret_sub(m, keep=0):
     s = m.group("v")
     quoted = len(s) >= 2 and s[0] == '"' and s[-1] == '"'
@@ -693,6 +752,11 @@ def mask_net_secrets(s):
     return s
 
 
+def _any_line(lines, pattern):
+    """설정 줄 중 패턴에 맞는 줄이 있는지 ('!' 주석 줄 제외) — build_net_checks 안의 같은 이름 지역 함수와 구분"""
+    return any(_cfg_line_ok(l, pattern) and re.search(pattern, l, re.I) for l in lines)
+
+
 def detect_net_vendor(text):
     # 자유 문구 줄(description·hostname·banner 등)의 단어로 오판하지 않도록 제외
     t = "\n".join(l for l in text.lower().splitlines()
@@ -702,6 +766,8 @@ def detect_net_vendor(text):
     if re.search(r'\bftos\b|dell networking|force10|dell emc|^boot system stack-unit|^! version \d+\.\d+\(\d+\.\d+\)|^protocol lldp\s*$|^interface managementethernet\b|^interface (?:ten|forty|hundred|twentyfive|fortygig)\w*gigabitethernet \d', t, re.M): return "DELL"
     if re.search(r'^asa version\b|^:\s*hardware:\s+asa', t, re.M) or \
             (re.search(r'^\s*nameif\s+\S+', t, re.M) and re.search(r'^\s*security-level\s+\d+', t, re.M)): return "ASA"
+    if re.search(r'nx-os|^!command: show running-config|^vrf context |^interface mgmt0\b|^vdc \S+ id \d|^version \S+ bios:|^feature (telnet|ssh|bgp|ospf|vpc|lacp|interface-vlan|hsrp|vrrp|tacacs\+|nxapi|lldp|dhcp)\b', t, re.M):
+        return "NXOS"
     dl = sum(bool(re.search(p, t, re.M)) for p in (
         r'^\s*#.*\b(dgs|des|dxs|dws)-\d', r'^config (ports|terminal_line|safeguard_engine|traffic_control|snmp community)\b',
         r'^create account\b', r'^(enable|disable) password[_ ]encryption\b', r'^create vlan\b', r'^config ipif\b',
@@ -714,28 +780,27 @@ def detect_net_vendor(text):
     if re.search(r'^add ns |^set ns |\bnetscaler\b', t, re.M): return "CITRIX"
     if re.search(r'\bbrocade\b|\bfastiron\b|\bnetiron\b', t): return "BROCADE"
     if re.search(r'\bpiolink\b|\bpas-k\b', t): return "PIOLINK"
-    if re.search(r'^version \d|^line (vty|con)|^interface (gigabit|fastethernet|tengig|ethernet|port-channel|vlan|loopback)|^ip (route|access-list|http)|^snmp-server |^feature |\bios\b|nx-os|^asa version', t, re.M):
+    if re.search(r'^version \d|^line (vty|con)|^interface (gigabit|fastethernet|tengig|ethernet|port-channel|vlan|loopback)|^ip (route|access-list|http)|^snmp-server |\bios\b', t, re.M):
         return "CISCO"
     return "UNKNOWN"
 
 
 def _net_os(text):
-    """Cisco 계열 세부 OS: NXOS / ASA / IOSXE / IOS (그 외 벤더는 detect_net_vendor 값)"""
+    """장비 OS 세부: ASA / NXOS / IOSXE / IOS (그 외 벤더는 detect_net_vendor 값)"""
     v = detect_net_vendor(text)
-    if v == "ASA": return "ASA"
-    if v != "CISCO": return v
+    if v != "CISCO":
+        return v
     t = text.lower()
-    if re.search(r'^\s*feature\s+\S+|^vdc\s+\S+\s+id\s+\d|^version \S+\s+bios:|^vrf context\b|^interface mgmt0\b|^!command: show running-config|nx-os', t, re.M):
-        return "NXOS"
     m = re.search(r'^version\s+(\d+)\.', t, re.M)
     if "ios-xe" in t or "ios xe" in t or (m and int(m.group(1)) >= 16):
         return "IOSXE"
     return "IOS"
 
+
 def _l3_capable(lines):
     """라우팅 기능 사용 여부: ip routing / 라우팅 프로토콜 / 물리(비 SVI·관리) 인터페이스에 IP 주소 /
     IP 가 설정된 VLAN 인터페이스(SVI) 2개 이상 (VLAN 간 라우팅 — 관리용 SVI 1개만 있으면 L2)"""
-    if any_m(lines, r'^\s*ip routing\b|^\s*router\s+(ospf|bgp|eigrp|rip|isis)\b|^\s*ipv6 unicast-routing|^\s*feature interface-vlan\b'):
+    if _any_line(lines, r'^\s*ip routing\b|^\s*router\s+(ospf|bgp|eigrp|rip|isis)\b|^\s*ipv6 unicast-routing|^\s*feature interface-vlan\b'):
         return True
     if any(re.match(r'\s*ip route\s+(?!0\.0\.0\.0\s+0\.0\.0\.0)(?!0\.0\.0\.0/0)\S', l, re.I) for l in lines):
         return True
@@ -766,15 +831,11 @@ def _l3_capable(lines):
 def detect_net_dtype(lines):
     """스위치/라우터 구분 — 스위치 포트가 있으면 SW(라우팅 사용 시 L3SW), 없으면 RTR"""
     if detect_net_vendor("\n".join(lines)) == "DLINK":   # D-Link 관리형 스위치 (DGS/DES/DXS)
-        return "L3SW" if any_m(lines, r'^\s*create\s+iproute|^\s*enable\s+(ospf|rip|bgp)\b') else "SW"
-    has_sw = any_m(lines, r'switchport|spanning-tree|^\s*vlan\s+\d+')
+        return "L3SW" if _any_line(lines, r'^\s*create\s+iproute|^\s*enable\s+(ospf|rip|bgp)\b') else "SW"
+    has_sw = _any_line(lines, r'switchport|spanning-tree|^\s*vlan\s+\d+')
     if has_sw:
         return "L3SW" if _l3_capable(lines) else "SW"
     return "RTR"
-
-def ok(s): return (RESULT_GOOD, s)
-def ng(s): return (RESULT_BAD, s)
-def na(s): return (RESULT_NA, s)
 
 def get_vty_blocks(lines):
     blocks = []
@@ -795,6 +856,110 @@ def get_vty_blocks(lines):
                 blk.append(l.strip())
     if blk: blocks.append(blk)
     return blocks
+
+_SECRET_TOKEN = r"[\x21-\x7e]{4,}"   # 비밀값 후보: 인쇄 가능한 ASCII 4자 이상 (한글 문구는 제외)
+
+
+def _mask_cfg(text):
+    """보고서에 쓰는 문구에서 SNMP community·비밀번호 해시·TACACS/RADIUS key 마스킹
+    community 는 앞 2자 + ***, 해시는 암호화 유형(숫자/접두)만 남김"""
+    if not text:
+        return text
+    t = text
+    t = re.sub(r'(snmp-server community\s+(?:\d\s+)?)(\S{2})\S*', r'\1\2***', t, flags=re.I)
+    t = re.sub(r'(snmp\s+community\s+)"?(\S{2})[^\s"]*"?', r'\1\2***', t, flags=re.I)          # D-Link create/config snmp community
+    t = re.sub(r'\b((?:rcomm|wcomm)\s+)"?(\S{2})[^\s"]*"?', r'\1\2***', t, flags=re.I)         # Alteon
+    t = re.sub(r'(set snmp community\s+)(\S{2})\S*', r'\1\2***', t, flags=re.I)                # Juniper
+    t = re.sub(r'(encrypted-password\s+|authentication-key\s+)"?[^\s"]+"?', r'\1***', t, flags=re.I)
+    t = re.sub(r'(\benable\s+(?:secret|password)\s+(?:level\s+\d+\s+)?(?:\d\s+)?)(?!encryption\b)' + _SECRET_TOKEN + r'(?=[\s,;)\]]|$)', r'\1***', t, flags=re.I)
+    t = re.sub(r'(\b(?:secret|password|passwd)\s+(?:\d\s+)?)(?!encryption\b)' + _SECRET_TOKEN + r'(?=[\s,;)\]]|$)', r'\1***', t, flags=re.I)
+    t = re.sub(r'(\bkey\s+(?:\d\s+)?)' + _SECRET_TOKEN + r'(?=[\s,;)\]]|$)', r'\1***', t, flags=re.I)
+    return t
+
+
+def _mask_results(results):
+    """판정 dict {코드: (결과, 문구)} 의 문구에서 비밀값 마스킹"""
+    for k, v in list(results.items()):
+        results[k] = (v[0], _mask_cfg(v[1]))
+    return results
+
+
+def _cfg_line_ok(line, pat):
+    """설정 줄 매칭 대상 여부: '!' 주석 줄 제외, 'no …' 부정형은 패턴이 'no' 를 직접 다룰 때만 허용"""
+    t = line.strip()
+    if not t or t.startswith("!"):
+        return False
+    if re.match(r"no\s", t, re.I) and not re.search(r"(?<![A-Za-z])no(?![A-Za-z])", pat):
+        return False
+    return True
+
+
+def _acl_blocks(lines):
+    """번호/이름 ACL 정의 → {이름: [(permit|deny, 나머지 항목)]}  (remark·주석 제외, 정의 없으면 키 없음)"""
+    out, cur = {}, None
+    for l in lines:
+        s = l.strip()
+        if not s or s.startswith("!"):
+            continue
+        m = re.match(r"access-list\s+(\S+)\s+(?:extended\s+|standard\s+)?(permit|deny)\s+(.*)$", s, re.I)
+        if m:
+            out.setdefault(m.group(1), []).append((m.group(2).lower(), m.group(3)))
+            cur = None
+            continue
+        m = re.match(r"(?:ip|ipv6)\s+access-list\s+(?:(?:standard|extended)\s+)?(\S+)", s, re.I)
+        if m:
+            cur = m.group(1)
+            out.setdefault(cur, [])
+            continue
+        if cur is not None:
+            if re.match(r"^\S", l):
+                cur = None
+                continue
+            m = re.match(r"(?:\d+\s+)?(permit|deny)\s+(.*)$", s, re.I)
+            if m:
+                out[cur].append((m.group(1).lower(), m.group(2)))
+    return out
+
+
+def _snmp_host_comms(lines):
+    """snmp-server host 줄 → [(줄, community 또는 v3 사용자, v3 여부)]  (vrf·traps·informs·version·udp-port 옵션 건너뜀)"""
+    res = []
+    for l in lines:
+        s = l.strip()
+        if s.startswith("!") or not re.match(r"snmp-server host\s+\S+", s, re.I):
+            continue
+        toks = s.split()[3:]
+        v3 = False
+        i = 0
+        while i < len(toks):
+            t = toks[i].lower()
+            if t in ("informs", "traps", "trap", "inform"):
+                i += 1
+            elif t in ("vrf", "udp-port", "port", "use-vrf", "source-interface"):
+                i += 2
+            elif t == "version":
+                nv = toks[i + 1].lower() if i + 1 < len(toks) else ""
+                v3 = nv == "3"
+                i += 2 + (1 if v3 and i + 2 < len(toks) and toks[i + 2].lower() in ("auth", "noauth", "priv") else 0)
+            else:
+                break
+        if i < len(toks):
+            res.append((s, toks[i], v3))
+    return res
+
+
+def _alteon_section(lines, path_pat):
+    """Alteon 구성의 '/c/…' 섹션 하위 줄 (다음 '/' 로 시작하는 줄 전까지)"""
+    out, on_ = [], False
+    for l in lines:
+        t = l.strip()
+        if t.startswith("/"):
+            on_ = bool(re.match(path_pat, t, re.I))
+            continue
+        if on_ and t:
+            out.append(t)
+    return out
+
 
 def build_dlink_checks(lines, text):
     """
@@ -821,7 +986,7 @@ def build_dlink_checks(lines, text):
 
     _net_common_manual(R, "D-Link")
     # ── SNMP ──
-    snmp_st = state(r'enable\s+snmp\b', r'disable\s+snmp\b')
+    snmp_st = state(r'enable\s+snmp\s*$', r'disable\s+snmp\s*$')   # 'disable snmp traps' 는 트랩만 끔
     deleted = {m.group(1).lower() for s in find(r'delete\s+snmp\s+community\s+\S+') for m in [re.match(r'delete\s+snmp\s+community\s+(\S+)', s, re.I)]}
     comms = []
     for s in find(r'(create|config)\s+snmp\s+community\s+\S+'):
@@ -1581,9 +1746,9 @@ def _net_nxos_checks(lines, text):
         R.g('NET-015', "feature telnet 미사용" + (" / feature ssh 활성" if "ssh" in feats else " (SSH 기본 활성)"), "SSH 전용", "Telnet 비활성 (NX-OS 기본)")
     R.n('NET-016', "NX-OS 장비에 AUX 포트 설정 없음", "AUX 포트 비활성화", "해당 없음")
     if first(r'ip\s+source-route\s*$'):
-        R.b('NET-022', "ip source-route 설정", "IP source routing 차단 (NX-OS 기본 비활성)", "IP 소스라우팅 허용 - 경로 우회 공격 위험")
+        R.b('NET-022', "ip source-route 설정", "IP source routing 차단 (소스 라우팅 패킷 폐기)", "IP 소스라우팅 허용 - 경로 우회 공격 위험")
     else:
-        R.g('NET-022', "ip source-route 미설정" + (" (no ip source-route 명시)" if first(r'no\s+ip\s+source-route') else " (NX-OS 기본 비활성)"), "IP source routing 차단", "IP 소스라우팅 차단됨")
+        R.n('NET-022', "NX-OS 는 IP 소스라우팅 패킷을 기본적으로 폐기 (허용 설정 없음)", "IP source routing 차단", "해당 없음")
 
     # ── L3 인터페이스 ──
     ifs = blocks(r'interface\s+\S+')
@@ -2073,13 +2238,16 @@ def _net_checks_ios(lines, text):
 
     dtype  = detect_net_dtype(lines)
 
+    osn = "IOS" if (vendor == "CISCO" and _net_brand(text)[0] != "D-LINK") else "장비"   # 근거 문구에 다른 제조사 OS 명칭을 쓰지 않음
+
+    # 설정 줄 검색: '!' 주석 줄과 'no …' 부정형(패턴이 no 를 다루지 않는 한)은 제외
     def any_m(pat, flags=re.I):
-        return any(re.search(pat, l, flags) for l in lines)
+        return any(_cfg_line_ok(l, pat) and re.search(pat, l, flags) for l in lines)
     def find_lines(pat, flags=re.I):
-        return [l.strip() for l in lines if re.search(pat, l, flags)]
+        return [l.strip() for l in lines if _cfg_line_ok(l, pat) and re.search(pat, l, flags)]
     def fline(pat, flags=re.I):
         for l in lines:
-            if re.search(pat, l, flags): return l.strip()
+            if _cfg_line_ok(l, pat) and re.search(pat, l, flags): return l.strip()
         return None
     def ok(s):  return (RESULT_GOOD,   s)
     def ng(s):  return (RESULT_BAD,    s)
@@ -2399,7 +2567,7 @@ def _net_checks_ios(lines, text):
     if weak:
         results['NET-011'] = ng(fmt("; ".join(weak[:5]), "비밀번호 안전한 알고리즘(type 8/9) 암호화",
                                     f"평문 또는 보안강도 낮은 알고리즘 {len(weak)}건"
-                                    + ("" if pw_enc else " / service password-encryption 미설정")))
+                                    + ("" if (pw_enc or osn != "IOS") else " / service password-encryption 미설정")))
     elif strong:
         results['NET-011'] = ok(fmt("; ".join(strong[:5]), "비밀번호 안전한 알고리즘(type 8/9) 암호화", "모든 비밀번호 type 8/9 적용"))
     elif vendor in ("JUNIPER", "ASA"):
@@ -2428,7 +2596,7 @@ def _net_checks_ios(lines, text):
             blk_str = " ".join(blk)
             if re.search(r'transport input none', blk_str, re.I):
                 continue
-            acl_m = re.search(r'access-class\s+(\S+)\s+in', blk_str, re.I)
+            acl_m = re.search(r'access-class\s+(\S+)(?:\s+in\b|\s+ipv4\b|\s*$|\s+(?=transport|exec|login|password|privilege|line))', blk_str, re.I)
             if acl_m:
                 acl_lines.append(f"{blk[0]}: access-class {acl_m.group(1)} in")
             else:
@@ -2482,7 +2650,7 @@ def _net_checks_ios(lines, text):
                 else:
                     timeout_issues.append(f"{blk[0]}: exec-timeout {total}초 ({total//60}분)")
             else:
-                timeout_ok.append(f"{blk[0]}: exec-timeout 미설정(IOS 기본 10분)")
+                timeout_ok.append(f"{blk[0]}: exec-timeout 미설정({osn} 기본 10분 - 명시 설정 권고, 주요정보 가이드 N-07 은 미설정 취약)")
         if timeout_issues:
             results['NET-014'] = ng(fmt(
                 f"타임아웃 미흡: {'; '.join(timeout_issues)}",
@@ -2584,11 +2752,11 @@ def _net_checks_ios(lines, text):
         # 평가기준: IOS 11 이하만 점검, IOS 12부터 기본 Disable
         _iv = re.search(r'^\s*version\s+(\d+)', text, re.M)
         if _iv and int(_iv.group(1)) >= 12:
-            results['NET-027'] = ok(fmt(f"IOS {_iv.group(1)}.x - 기본 Disable (명시적 활성 설정 없음)", "IOS 12 이상 기본 차단", "Directed Broadcast 비활성(기본값)"))
+            results['NET-027'] = ok(fmt(f"{osn} {_iv.group(1)}.x - 기본 Disable (명시적 활성 설정 없음)", f"{osn} 12 이상 기본 차단", "Directed Broadcast 비활성(기본값)"))
         elif _iv:
-            results['NET-027'] = ng(fmt(f"IOS {_iv.group(1)}.x, no ip directed-broadcast 미설정", "no ip directed-broadcast 설정", "Directed Broadcast 허용 - Smurf 공격 취약"))
+            results['NET-027'] = ng(fmt(f"{osn} {_iv.group(1)}.x, no ip directed-broadcast 미설정", "no ip directed-broadcast 설정", "Directed Broadcast 허용 - Smurf 공격 취약"))
         else:
-            results['NET-027'] = mc(fmt("IOS 버전 미확인, no ip directed-broadcast 미설정", "IOS 11 이하 시 차단 설정", "IOS 버전 확인 필요"))
+            results['NET-027'] = mc(fmt(f"{osn} 버전 미확인, no ip directed-broadcast 미설정", f"{osn} 11 이하 시 차단 설정", "버전 확인 필요"))
 
     # ──────────────────────────────────────────────────────────────
     # NET-030: 불필요 서비스 비활성화
@@ -2844,7 +3012,7 @@ def _net_checks_ios(lines, text):
             if lv in ("emergencies", "alerts", "critical", "0", "1", "2"):
                 results['NET-037'] = ok(fmt(cl, "콘솔 로깅 중지 또는 critical 이상", f"콘솔 로그 레벨 {lv}"))
             else:
-                results['NET-037'] = ng(fmt(cl or "logging console 미설정 (IOS 기본 debugging)", "콘솔 로깅 중지 또는 critical 이상",
+                results['NET-037'] = ng(fmt(cl or f"logging console 미설정 ({osn} 기본 debugging)", "콘솔 로깅 중지 또는 critical 이상",
                                             f"콘솔 로그 레벨 {lv} - 불필요한 콘솔 로깅"))
 
     # ──────────────────────────────────────────────────────────────
@@ -2965,7 +3133,7 @@ def _net_checks_ios(lines, text):
                 else ok(fmt(f"no ip unreachables: {len(l3_if)}개 인터페이스 전체", "인터페이스마다 no ip unreachables", "ICMP Unreachable 차단됨"))
         # 평가기준: 인터페이스에 ip mask-reply 설정이 '존재'할 때만 취약 (IOS 기본 비활성)
         mask_on = [l.strip() for l in find_lines(r'^\s*ip mask-reply')]
-        results['NET-045'] = ng(fmt(f"ip mask-reply 설정: {len(mask_on)}개 인터페이스", "ip mask-reply 미설정", "Subnet Mask 정보 노출 가능")) if mask_on else ok(fmt("ip mask-reply 설정 없음 (IOS 기본 비활성)", "ip mask-reply 미설정", "ICMP Mask Reply 비활성"))
+        results['NET-045'] = ng(fmt(f"ip mask-reply 설정: {len(mask_on)}개 인터페이스", "ip mask-reply 미설정", "Subnet Mask 정보 노출 가능")) if mask_on else ok(fmt(f"ip mask-reply 설정 없음 ({osn} 기본 비활성)", "ip mask-reply 미설정", "ICMP Mask Reply 비활성"))
         results['NET-046'] = mc(fmt("ICMP Timestamp/Information ACL", "해당 유형 차단 ACL", "ACL 내용 수동 확인"))
 
     # NET-047: DDoS/CoPP
@@ -2987,7 +3155,7 @@ def _net_checks_ios(lines, text):
                                         "포트 차단 ACL 미설정 - 상단 DDoS 대응장비·전용회선 여부 확인"))
 
     # NET-048: 보안패치
-    results['NET-048'] = mc(fmt("장비 운영 IOS/펌웨어 버전 확인", "벤더 보안 권고 버전 사용", "version 명령으로 현재 버전 확인 후 벤더 EoL/패치 공지 대조"))
+    results['NET-048'] = mc(fmt("장비 운영체제·펌웨어 버전 확인", "벤더 보안 권고 버전 사용", "버전 확인 명령으로 현재 버전 확인 후 벤더 EoL/패치 공지 대조"))
 
     # ──────────────────────────────────────────────────────────────
     # NET-049: 명령어 권한 제한 → 보류 (수동확인)
@@ -3199,6 +3367,12 @@ def _net_checks_ios(lines, text):
             weak_dis.append(name)
 
     # CDP: IOS 기본 활성 → 'no cdp run' 없으면 구동 중으로 판단 (평가기준 취약 서비스 목록)
+    if vendor == "DELL":   # FTOS: 'protocol lldp' 블록 (하위에 'disable' 이 있으면 비활성)
+        _lb = _cfg_blocks(lines, r'^protocol\s+lldp\b')
+        if _lb and not any(re.fullmatch(r'disable', x, re.I) for _, sub in _lb for x in sub):
+            weak_en.append("LLDP(protocol lldp)")
+        elif _lb:
+            weak_dis.append("LLDP")
     if vendor == "CISCO":
         if any_m(r'^\s*no cdp run\b'):
             weak_dis.append("CDP")
@@ -3312,24 +3486,12 @@ def _net_checks_ios(lines, text):
 # 점검 파일 헤더에서 대상 유형 탐지 (OS/DB/네트워크 세부 분기용)
 # ================================================================
 def _net_brand(text):
-    """config 머리말(주석)의 제조사·모델·펌웨어 — 설정 문법이 IOS 계열이어도 실제 제조사 식별 (예: D-Link DGS-3630),
-    Cisco ASA·NX-OS·Dell FTOS 는 OS 종류를 제조사 표기에 포함 (보고서 OS 열·조치 명령 선택에 사용)"""
+    """config 머리말(주석)의 제조사·모델·펌웨어 — 설정 문법이 IOS 계열이어도 실제 제조사 식별 (예: D-Link DGS-3630)"""
     head = "\n".join(l for l in text.splitlines()[:30] if l.lstrip().startswith(("!", "#")))
     m = re.search(r"\b((?:DGS|DES|DXS|DWS)-[\w-]+)", head, re.I)
     if m or re.search(r"d-link", head, re.I):
         fw = re.search(r"Firmware:\s*(?:Build\s*)?(\S+)", head, re.I)
         return "D-LINK", (m.group(1) if m else ""), (fw.group(1) if fw else "")
-    nos = _net_os(text)
-    if nos == "ASA":
-        v = re.search(r"^ASA Version\s+(\S+)", text, re.M)
-        hw = re.search(r"Hardware:\s*(ASA\w+)", text)
-        return "CISCO ASA", (hw.group(1) if hw else ""), (v.group(1) if v else "")
-    if nos == "NXOS":
-        v = re.search(r"^version\s+(\S+)", text, re.M)
-        return "CISCO NX-OS", "", (v.group(1) if v else "")
-    if nos == "DELL":
-        v = re.search(r"^!\s*Version\s+(\S+)", text, re.M | re.I)
-        return "DELL FTOS", "", (v.group(1) if v else "")
     return "", "", ""
 
 
@@ -3349,32 +3511,33 @@ def _cfg_blocks(lines, pat):
     return out
 
 
-def _net_acl_entries(lines, name):
-    """번호/이름 ACL 의 (permit|deny, 본문) 목록 — 정의가 없으면 None"""
-    out, found, in_named = [], False, False
-    for l in lines:
-        s = l.strip()
-        m = re.match(r'access-list\s+(\S+)\s+(permit|deny)\s+(.*)$', s, re.I)
-        if m and m.group(1) == name:
-            found = True; out.append((m.group(2).lower(), m.group(3))); continue
-        m = re.match(r'ip(?:v4)? access-list\s+(?:(?:standard|extended)\s+)?(\S+)', s, re.I)
-        if m and re.match(r'^\S', l):
-            in_named = (m.group(1) == name); found = found or in_named; continue
-        if in_named:
-            if re.match(r'^\S', l):
-                in_named = False; continue
-            m = re.match(r'(?:(?:seq\s+)?\d+\s+)?(permit|deny)\s+(.*)$', s, re.I)
-            if m: out.append((m.group(1).lower(), m.group(2)))
-    return out if found else None
+def build_dlink_kisa_checks(lines, text):
+    """주요정보 N-xx 중 D-Link xStack(DGS/DES) 고유 CLI 로 직접 판정하는 항목
+    (EF 항목 NET-030/NET-057 이 여러 N-xx 를 통합 점검해 한 서비스의 취약이 다른 N-xx 로 번지는 것을 막음)"""
+    def hit(pat):
+        return next((l.strip() for l in lines if l.strip() and not l.strip().startswith(("#", "!")) and re.search(pat, l, re.I)), "")
+    dev = "D-Link xStack"
+    r = {}
+    snmp_dis = bool(hit(r"^\s*disable\s+snmp\s*$"))   # 'disable snmp traps' 등은 트랩만 끔
+    comms = [l.strip() for l in lines if re.match(r"\s*(create|config)\s+snmp\s+community\s+\S+", l, re.I)]
+    if snmp_dis or not comms:
+        r["N-17"] = (RESULT_GOOD, f"{dev}: SNMP 미사용 (" + ("disable snmp" if snmp_dis else "community 설정 없음") + ")")
+    else:
+        r["N-17"] = (RESULT_MANUAL, f"{dev}: SNMP 사용 중({len(comms)}개 community) - 업무상 필요 여부 확인 (불필요 시 disable snmp)")
+    web = hit(r"^\s*enable\s+web\b")
+    r["N-27"] = (RESULT_BAD, f"{dev}: 웹 관리 서비스 활성: {web} (접속 IP 제한은 create trusted_host 로 확인)") if web else \
+        (RESULT_GOOD, f"{dev}: 웹 관리 서비스 비활성 (enable web 없음 / disable web)")
+    lldp = hit(r"^\s*enable\s+lldp\b") and not hit(r"^\s*disable\s+lldp\b")
+    r["N-30"] = (RESULT_BAD, f"CDP 미지원 장비 - 유사 프로토콜 LLDP 활성: enable lldp (불필요 시 disable lldp)") if lldp else \
+        (RESULT_GOOD, f"CDP 미지원 장비({dev}), LLDP 활성 설정 없음")
+    for code, what in (("N-09", "AUX 포트 없음"), ("N-21", "TFTP 서버 기능 없음(클라이언트만 지원)"), ("N-25", "TCP keepalive 설정 명령 없음"),
+                       ("N-26", "finger 서비스 없음"), ("N-28", "TCP/UDP small 서비스 설정 명령 없음"), ("N-29", "BOOTP 서버 설정 명령 없음"),
+                       ("N-35", "identd 서비스 없음"), ("N-36", "domain lookup 설정 명령 없음"), ("N-37", "PAD 서비스 없음")):
+        r[code] = (RESULT_NA, f"{dev}: {what} - 해당 없음")
+    return r
 
 
 def build_net_kisa_checks(lines, text):
-    """주요정보(MI) N-xx 직접 판정 + 결과 문구의 community·비밀번호·해시·키 마스킹"""
-    raw = _build_net_kisa_checks_raw(lines, text)
-    return {k: (v[0], mask_net_secrets(v[1])) for k, v in raw.items()}
-
-
-def _build_net_kisa_checks_raw(lines, text):
     """
     주요정보(MI) 2026 상세가이드 N-xx 항목 직접 판정 (IOS 계열 문법 장비)
     - 평가기준 NET-030/NET-057 등이 여러 가이드 항목을 통합 점검 → 서비스별 분리 판정
@@ -3382,7 +3545,11 @@ def _build_net_kisa_checks_raw(lines, text):
     - 제조사(D-Link 등) 기본값 차이 반영, L3 인터페이스 보유 여부로 인터페이스 항목 적용
     """
     vendor = detect_net_vendor(text)
-    if vendor != "CISCO" or _net_os(text) == "NXOS":   # ASA·NX-OS·Juniper·Dell 등은 IOS 문법 판정을 쓰지 않고 전자금융 항목(NET-)의 벤더별 판정에서 변환
+    if vendor in ("ASA", "NXOS"):
+        return _mask_results(_build_net_kisa_asa_nxos(vendor, lines, text))
+    if vendor == "DLINK":
+        return _mask_results(build_dlink_kisa_checks(lines, text))
+    if vendor != "CISCO":
         return {}
     brand, model, _ = _net_brand(text)
     dlink = brand == "D-LINK"
@@ -3400,9 +3567,10 @@ def _build_net_kisa_checks_raw(lines, text):
 
     r = {}
     ifs = _cfg_blocks(lines, r"^interface\s+\S+")
+    # IP 가 설정된 활성 L3 인터페이스: ip address <주소|dhcp|negotiated> / ip unnumbered 포함, shutdown 인터페이스 제외
     l3_ifs = [h.split(None, 1)[1] for h, sub in ifs
-              if any(re.match(r"ip address\s+(\d|dhcp|negotiated)|ip unnumbered\s", x, re.I) for x in sub)
-              and not any(re.match(r"shutdown\s*$", x, re.I) for x in sub)
+              if any(re.match(r"ip address\s+(\d|dhcp|negotiated)|ip unnumbered\s+\S", x, re.I) for x in sub)
+              and not any(x.lower() == "shutdown" for x in sub)
               and not re.match(r"(?i)(mgmt|management|loopback|null)", h.split(None, 1)[1])]
     routing = bool(on(r"^\s*(ip routing|router\s+(ospf|bgp|eigrp|rip|isis))\b"))
     switch = bool(on(r"^\s*(vlan\s+\d|spanning-tree)")) or any(re.match(r"(?i)vlan", n) for n in l3_ifs) \
@@ -3414,37 +3582,55 @@ def _build_net_kisa_checks_raw(lines, text):
     remote = _cfg_blocks(lines, r"^line\s+(vty|telnet|ssh)\b")
     rnames = ", ".join(h for h, _ in remote)
     if remote:
-        act = [(h, sub) for h, sub in remote if not any(re.fullmatch(r"(?i)transport input none|no exec", x) for x in sub)]
-        noacl = [h for h, sub in act if not any(x.lower().startswith("access-class") for x in sub)]
-        gacl = on(r"^\s*(ip\s+)?(ssh|telnet)\s+.*access-class\b|^\s*ip\s+(ssh|telnet)\s+acl\b")
-        names = [x.split()[1] for _, sub in act for x in sub if x.lower().startswith("access-class") and len(x.split()) > 1]
-        anyacl = [n for n in names if _net_acl_entries(lines, n) is not None
-                  and any(a_ == "permit" and re.match(r"(?i)(ip\s+|tcp\s+)?any\b", r_) for a_, r_ in _net_acl_entries(lines, n))]
+        # 활성 원격 접속 라인(transport input none 제외) 모두에 access-class 가 있어야 함 + ACL 에 permit any 가 없어야 함 (NET-013 과 같은 기준)
+        _acls_k = _acl_blocks(lines)
+        act = [(h, sub) for h, sub in remote if not any(x.lower() == "transport input none" for x in sub)]
+        no_acl_l, acl_l, any_l, unk_l = [], [], [], []
+        for h, sub in act:
+            am = next((re.match(r"access-class\s+(\S+)", x, re.I) for x in sub if x.lower().startswith("access-class")), None)
+            if not am:
+                no_acl_l.append(h)
+                continue
+            nm = am.group(1)
+            acl_l.append(f"{h}: access-class {nm}")
+            ent = _acls_k.get(nm)
+            if ent is None:
+                unk_l.append(nm)
+            elif any(a == "permit" and re.match(r"(ip\s+|tcp\s+)?any\b", rr, re.I) for a, rr in ent):
+                any_l.append(nm)
+        alt = on(r"^\s*(ip\s+)?(ssh|telnet)\s+.*access-class\b|^\s*ip\s+(ssh|telnet)\s+acl\b|.*trusted-host")
         if not act:
-            r["N-06"] = (RESULT_GOOD, f"원격 접속 라인({rnames}) 모두 접속 차단(transport input none / no exec)")
-        elif noacl and not gacl:
-            r["N-06"] = (RESULT_BAD, f"원격 접속 라인({', '.join(noacl)})에 접근 제한 ACL(access-class) 미설정")
-        elif anyacl:
-            r["N-06"] = (RESULT_BAD, f"원격 접속 ACL({', '.join(sorted(set(anyacl)))})에 permit any - 접속 IP 제한 효과 없음")
+            r["N-06"] = (RESULT_GOOD, f"모든 원격 접속 라인({rnames}) transport input none - 원격 접속 차단")
+        elif no_acl_l and not alt:
+            r["N-06"] = (RESULT_BAD, f"원격 접속 라인({', '.join(no_acl_l)})에 접근 제한 ACL(access-class) 미설정" + (f" (설정된 라인: {'; '.join(acl_l)})" if acl_l else ""))
+        elif any_l:
+            r["N-06"] = (RESULT_BAD, f"원격 접속 ACL 에 permit any 포함: {', '.join(sorted(set(any_l)))} (모든 IP 허용)")
+        elif unk_l:
+            r["N-06"] = (RESULT_MANUAL, f"{'; '.join(acl_l)} - ACL 정의 없음({', '.join(sorted(set(unk_l)))}) 허용 IP 수동 확인")
         else:
-            r["N-06"] = (RESULT_GOOD, f"원격 접속 접근 제한 설정: {gacl or ', '.join(sorted(set(names)))} (라인 {len(act)}개)")
+            r["N-06"] = (RESULT_GOOD, f"원격 접속 접근 제한 설정: {'; '.join(acl_l) or alt}")
         tos = []
-        for h, sub in remote:
+        for h, sub in act:
             m = next((re.match(r"exec-timeout\s+(\d+)(?:\s+(\d+))?", x, re.I) for x in sub
                       if re.match(r"exec-timeout\s+\d", x, re.I)), None)
             tos.append((h, None if m is None else int(m.group(1)) + int(m.group(2) or 0) / 60))
         unset = [h for h, t in tos if t is None]
         over = [f"{h}({t:g}분)" for h, t in tos if t is not None and (t == 0 or t > 10)]
-        if unset or over:
+        if not tos:
+            r["N-07"] = (RESULT_GOOD, "모든 원격 접속 라인 transport input none - 원격 접속 차단")
+        elif unset or over:
             r["N-07"] = (RESULT_BAD, "Session Timeout " + " / ".join(
                 x for x in ((f"미설정: {', '.join(unset)}" if unset else ""),
                             (f"10분 초과 또는 무제한: {', '.join(over)}" if over else "")) if x))
         else:
             r["N-07"] = (RESULT_GOOD, "Session Timeout 10분 이하: " + ", ".join(f"{h}({t:g}분)" for h, t in tos))
         telnet_off = bool(on(r"^\s*no\s+ip\s+telnet\s+server\b"))
-        vty = [(h, sub) for h, sub in remote if h.lower().startswith("line vty")]
+        vty_all = [(h, sub) for h, sub in remote if h.lower().startswith("line vty")]
+        vty = [(h, sub) for h, sub in vty_all if not any(x.lower() == "transport input none" for x in sub)]   # transport input none = 정상 잠금
         ti = [x for _, sub in vty for x in sub if x.lower().startswith("transport input")]
-        if vty and ti and all(re.fullmatch(r"(?i)transport input ssh", x) for x in ti) and len(ti) == len(vty):
+        if vty_all and not vty:
+            r["N-08"] = (RESULT_GOOD, "모든 VTY transport input none - 원격 접속 차단")
+        elif vty and ti and all(re.fullmatch(r"(?i)transport input ssh", x) for x in ti) and len(ti) == len(vty):
             r["N-08"] = (RESULT_GOOD, "VTY 접속 프로토콜 SSH만 허용 (transport input ssh)")
         elif any(re.search(r"(?i)\b(telnet|all)\b", x) for x in ti):
             r["N-08"] = (RESULT_BAD, f"VTY 접속 시 평문 프로토콜 허용: {', '.join(ti)}")
@@ -3586,7 +3772,14 @@ def _build_net_kisa_checks_raw(lines, text):
     else:
         r["N-27"] = (RESULT_GOOD, "웹 서비스(ip http server) 비활성")
     r.update(svc("N-28", "TCP/UDP small 서비스", r"^\s*service (tcp|udp)-small-servers?\b"))
-    r.update(svc("N-29", "BOOTP 서버", r"^\s*ip bootp server\b"))
+    # BOOTP 서버 기본값은 IOS 버전에 따라 다름(구버전 활성) → 명시 설정이 없으면 수동확인 (N-36 과 같이 '설정 없음=임의 가정' 금지)
+    if on(r"^\s*ip bootp server\b"):
+        bootp_line = on(r'^\s*ip bootp server\b')
+        r["N-29"] = (RESULT_BAD, f"BOOTP 서버 활성: {bootp_line}")
+    elif on(r"^\s*no ip bootp server\b"):
+        r["N-29"] = (RESULT_GOOD, "BOOTP 서버 비활성: no ip bootp server")
+    else:
+        r["N-29"] = (RESULT_MANUAL, f"{dev}: ip bootp server 설정 없음 - 장비·OS 버전별 기본값이 달라 확인 필요 (show ip sockets / show running-config all)")
     if dlink:
         lldp = on(r"^\s*lldp run\b")
         r["N-30"] = ((RESULT_BAD, f"CDP 미지원 장비 - 유사 프로토콜 LLDP 활성: {lldp} (불필요 시 비활성화)") if lldp
@@ -3606,25 +3799,34 @@ def _build_net_kisa_checks_raw(lines, text):
                      else (RESULT_MANUAL, f"{dev}: Domain Lookup 설정 없음 - 장비 기본값 확인 필요"))
     else:
         r["N-36"] = (RESULT_BAD, "Domain Lookup 기본 활성 (no ip domain-lookup 미설정)")
-    r.update(svc("N-37", "PAD", r"^\s*service pad\b"))
+    if on(r"^\s*service pad\b"):
+        pad_line = on(r'^\s*service pad\b')
+        r["N-37"] = (RESULT_BAD, f"PAD 서비스 활성: {pad_line}")
+    elif on(r"^\s*no service pad\b"):
+        r["N-37"] = (RESULT_GOOD, "PAD 서비스 비활성: no service pad")
+    else:
+        r["N-37"] = (RESULT_MANUAL, f"{dev}: service pad 설정 없음 - 장비·OS 버전별 기본값이 달라 확인 필요")
 
     # ── 기능 관리: L3 인터페이스 ──
-    if not l3_ifs:   # IP 가 설정된 인터페이스가 하나도 없음 → 해당 기능이 동작할 인터페이스 없음
-        for code in ("N-31", "N-32", "N-33", "N-34", "N-38"):
-            r[code] = (RESULT_GOOD, f"IP 가 설정된 인터페이스 없음({dtype}) - 해당 기능이 동작할 인터페이스 없음")
+    # N-32(ip source-route)는 전역 설정이므로 L3 인터페이스 유무와 무관하게 판정
+    def _n32():
+        if on(r"^\s*no ip source-route\b"):
+            r["N-32"] = (RESULT_GOOD, "Source Routing 차단 (no ip source-route)")
+        elif dlink:
+            r["N-32"] = (RESULT_MANUAL, f"{dev}: Source Routing 차단 설정 명령 없음" + (f" ({DGS_REF} 전체 확인, DoS 방어 유형에도 없음)" if dgs3630 else "")
+                                        + " - 소스 라우팅 패킷 처리 방식은 제조사 확인 필요")
+        else:
+            r["N-32"] = (RESULT_BAD, "Source Routing 기본 허용 (no ip source-route 미설정)")
+    _n32()
+    if not l3_ifs:   # IP 가 설정된 활성 인터페이스가 하나도 없음 → 인터페이스 단위 기능은 점검 대상 없음(N-A)
+        for code in ("N-31", "N-33", "N-34", "N-38"):
+            r[code] = (RESULT_NA, f"IP 가 설정된 활성 인터페이스 없음({dtype}) - 인터페이스 단위 설정 점검 대상 없음")
         return r   # 관리용 SVI 등 IP 인터페이스가 있으면 L2 스위치도 해당 인터페이스 기준으로 판정
     ifn = ", ".join(l3_ifs)
     l3sub = {h.split(None, 1)[1]: [x.lower() for x in sub] for h, sub in ifs if h.split(None, 1)[1] in l3_ifs}
     dbc = [n for n, sub in l3sub.items() if "ip directed-broadcast" in sub]
     r["N-31"] = ((RESULT_BAD, f"Directed Broadcast 허용 인터페이스: {', '.join(dbc)}") if dbc
                  else (RESULT_GOOD, f"L3 인터페이스({ifn})에 ip directed-broadcast 설정 없음 (기본 차단)"))
-    if on(r"^\s*no ip source-route\b"):
-        r["N-32"] = (RESULT_GOOD, "Source Routing 차단 (no ip source-route)")
-    elif dlink:
-        r["N-32"] = (RESULT_MANUAL, f"{dev}: Source Routing 차단 설정 명령 없음" + (f" ({DGS_REF} 전체 확인, DoS 방어 유형에도 없음)" if dgs3630 else "")
-                                    + " - 소스 라우팅 패킷 처리 방식은 제조사 확인 필요")
-    else:
-        r["N-32"] = (RESULT_BAD, "Source Routing 기본 허용 (no ip source-route 미설정)")
     if dlink:
         pa = [n for n, sub in l3sub.items() if "ip proxy-arp" in sub or "ip local-proxy-arp" in sub]
         r["N-33"] = ((RESULT_BAD, f"Proxy ARP 활성 인터페이스: {', '.join(pa)}") if pa
@@ -3647,6 +3849,114 @@ def _build_net_kisa_checks_raw(lines, text):
     return r
 
 
+def _build_net_kisa_asa_nxos(vendor, lines, text):
+    """주요정보 N-xx 항목 중 Cisco ASA / NX-OS 고유 명령으로 판정해야 하는 항목 (IOS 문법으로는 거짓 취약이 나는 항목)"""
+    nm = "Cisco ASA" if vendor == "ASA" else "Cisco NX-OS"
+    r = {}
+
+    def on(pat):
+        return next((l.strip() for l in lines if _cfg_line_ok(l, pat) and re.match(pat, l, re.I)), "")
+
+    users = [l.strip() for l in lines if _cfg_line_ok(l, "username") and re.match(r"^\s*username\s+\S+", l, re.I)
+             and not re.search(r"\battributes\b", l, re.I)]
+    nopw = [u.split()[1] for u in users if re.search(r"\bnopassword\b", u, re.I) or not re.search(r"\bpassword\s+\S", u, re.I)]
+    weak_def = r"(cisco|admin|password|default|1234|12345|123456|manager|root|switch|router)"
+    plain_def = [u.split()[1] for u in users if re.search(r"\bpassword\s+(0\s+)?" + weak_def + r"\s*$", u, re.I)]
+    aaa = on(r"^\s*aaa authentication (?:login|ssh|telnet|enable)\s+(?:default|console)\s+\S+")
+    if nopw or plain_def:
+        r["N-01"] = (RESULT_BAD, f"{nm}: " + " / ".join(x for x in ((f"비밀번호 없는 계정: {', '.join(nopw)}" if nopw else ""),
+                                                          (f"기본값으로 추정되는 비밀번호: {', '.join(plain_def)} (값 비공개)" if plain_def else "")) if x))
+    elif users or on(r"^\s*enable password\s+\S+") or aaa:
+        r["N-01"] = (RESULT_GOOD, f"{nm}: 계정 비밀번호 설정 (계정 {len(users)}개" + (f", AAA: {aaa}" if aaa else "") + ")")
+    elif vendor == "ASA":
+        r["N-01"] = (RESULT_BAD, f"{nm}: 로컬 계정·enable password·AAA 인증 모두 없음 - 제조사 기본 상태(enable 비밀번호 빈 값)")
+    else:
+        r["N-01"] = (RESULT_MANUAL, f"{nm}: 로컬 계정 없음 - AAA 인증 서버 사용 여부 확인")
+
+    if vendor == "ASA":
+        mg = [l.strip() for l in lines if _cfg_line_ok(l, "ssh") and re.match(r"^\s*(ssh|telnet)\s+\S+\s+\S+\s+\S+", l, re.I)
+              and not re.match(r"^\s*(ssh|telnet)\s+(timeout|version|key-exchange|cipher|scopy)\b", l, re.I)]
+        anyh = [x for x in mg if re.search(r"\s0\.0\.0\.0\s+0\.0\.0\.0\s|\s0\s+0\s|0\.0\.0\.0/0\s", x + " ")]
+        if not mg:
+            r["N-06"] = (RESULT_GOOD, f"{nm}: ssh/telnet 허용 호스트 설정 없음 - 원격 관리 접속 기본 차단")
+        elif anyh:
+            r["N-06"] = (RESULT_BAD, f"{nm}: 원격 접속에 전체 IP 허용: {anyh[0]}")
+        else:
+            r["N-06"] = (RESULT_GOOD, f"{nm}: 원격 접속 허용 호스트 제한 ({len(mg)}건: {'; '.join(mg[:3])})")
+        t = {}
+        for k, d in (("ssh", 5), ("telnet", 5), ("console", 0)):
+            m = re.search(r"^\s*" + k + r"\s+timeout\s+(\d+)", text, re.I | re.M)
+            t[k] = (int(m.group(1)), True) if m else (d, False)
+        tel = [x for x in mg if re.match(r"^\s*telnet\b", x, re.I)]
+        chk = [k for k in ("ssh", "console") + (("telnet",) if tel else ())]
+        over = [f"{k} timeout {t[k][0]}분{'' if t[k][1] else '(기본값)'}" + (" 무제한" if t[k][0] == 0 else "") for k in chk if t[k][0] == 0 or t[k][0] > 10]
+        r["N-07"] = (RESULT_BAD, f"{nm}: Session Timeout 10분 초과 또는 무제한: {', '.join(over)}") if over else \
+            (RESULT_GOOD, f"{nm}: Session Timeout 10분 이하: " + ", ".join(f"{k} {t[k][0]}분" for k in chk))
+        r["N-08"] = (RESULT_BAD, f"{nm}: 평문 프로토콜 Telnet 접속 허용: {tel[0]}") if tel else \
+            (RESULT_GOOD, f"{nm}: telnet 허용 호스트 없음 - SSH 만 허용")
+        r["N-09"] = (RESULT_NA, f"{nm}: AUX 포트 없음")
+        r["N-25"] = (RESULT_NA, f"{nm}: tcp-keepalives 명령 미지원")
+        r["N-26"] = (RESULT_NA, f"{nm}: finger 서비스 미지원")
+        r["N-28"] = (RESULT_NA, f"{nm}: TCP/UDP small 서비스 미지원")
+        r["N-29"] = (RESULT_NA, f"{nm}: BOOTP 서버 기능 없음")
+        r["N-30"] = (RESULT_NA, f"{nm}: CDP 미지원")
+        r["N-35"] = (RESULT_NA, f"{nm}: identd 미지원")
+        r["N-36"] = (RESULT_NA, f"{nm}: domain lookup 기능 해당 없음(name-server 사용)")
+        r["N-37"] = (RESULT_NA, f"{nm}: PAD 미지원")
+        r["N-31"] = (RESULT_NA, f"{nm}: directed broadcast 미지원")
+        r["N-32"] = (RESULT_NA, f"{nm}: IP source routing 패킷 항상 폐기")
+        r["N-38"] = (RESULT_NA, f"{nm}: ICMP mask reply 미응답")
+        http = on(r"^\s*http server enable")
+        hhs = [l.strip() for l in lines if _cfg_line_ok(l, "http") and re.match(r"^\s*http\s+\d+\.\d+\.\d+\.\d+\s+\d+\.\d+\.\d+\.\d+\s+\S+", l, re.I)]
+        hh_any = [x for x in hhs if re.match(r"^http\s+0\.0\.0\.0\s+0\.0\.0\.0\s", x, re.I)]
+        r["N-27"] = (((RESULT_BAD, f"{nm}: HTTP 서버(ASDM) 에 전체 IP 허용: {hh_any[0]}") if hh_any else
+                      (RESULT_GOOD, f"{nm}: HTTP 서버(ASDM) 접속 IP 제한 ({len(hhs)}건: {'; '.join(hhs[:3])})")) if hhs else
+                     (RESULT_BAD, f"{nm}: http server enable 이나 http 허용 호스트 제한 없음")) if http else \
+            (RESULT_GOOD, f"{nm}: HTTP 서버(ASDM) 비활성")
+    else:   # NX-OS
+        remote = _cfg_blocks(lines, r"^line\s+(vty|console)\b")
+        vty = [(h, sub) for h, sub in remote if h.lower().startswith("line vty") and not any(x.lower() == "transport input none" for x in sub)]
+        acl_missing = [h for h, sub in vty if not any(x.lower().startswith("access-class") for x in sub)]
+        if not vty:
+            r["N-06"] = (RESULT_MANUAL, f"{nm}: line vty 설정 없음 - 원격 접속 ACL 수동 확인")
+        elif acl_missing:
+            r["N-06"] = (RESULT_BAD, f"{nm}: VTY 접근 ACL(access-class) 미설정: {', '.join(acl_missing)}")
+        else:
+            r["N-06"] = (RESULT_GOOD, f"{nm}: VTY 접근 ACL 설정: " + "; ".join(f"{h}: {next(x for x in sub if x.lower().startswith('access-class'))}" for h, sub in vty))
+        tos = []
+        for h, sub in remote:
+            if any(x.lower() == "transport input none" for x in sub):
+                continue
+            m = next((re.match(r"exec-timeout\s+(\d+)", x, re.I) for x in sub if re.match(r"exec-timeout\s+\d", x, re.I)), None)
+            tos.append((h, int(m.group(1)) if m else None))
+        bad = [f"{h}({'미설정, NX-OS 기본 0=무제한' if t is None else str(t) + '분'})" for h, t in tos if t is None or t == 0 or t > 10]
+        r["N-07"] = (RESULT_BAD, f"{nm}: Session Timeout 미설정 또는 10분 초과: {', '.join(bad)}") if bad else \
+            ((RESULT_GOOD, f"{nm}: Session Timeout 10분 이하: " + ", ".join(f"{h}({t}분)" for h, t in tos)) if tos else (RESULT_MANUAL, f"{nm}: line 설정 없음"))
+        tel = on(r"^feature telnet\b")
+        r["N-08"] = (RESULT_BAD, f"{nm}: feature telnet 활성 - 평문 접속 허용") if tel else \
+            (RESULT_GOOD, f"{nm}: feature telnet 미사용" + (" / feature ssh" if on(r"^feature ssh\b") else ""))
+        r["N-09"] = (RESULT_NA, f"{nm}: AUX 포트 설정 없음")
+        r["N-25"] = (RESULT_NA, f"{nm}: tcp-keepalives 명령 미지원")
+        r["N-26"] = (RESULT_NA, f"{nm}: finger 서비스 미지원")
+        r["N-28"] = (RESULT_NA, f"{nm}: TCP/UDP small 서비스 미지원")
+        r["N-29"] = (RESULT_NA, f"{nm}: BOOTP 서버 기능 없음")
+        r["N-35"] = (RESULT_NA, f"{nm}: identd 미지원")
+        r["N-37"] = (RESULT_NA, f"{nm}: PAD 미지원")
+        r["N-32"] = (RESULT_NA, f"{nm}: IP source routing 미지원(폐기)")
+        r["N-38"] = (RESULT_NA, f"{nm}: ICMP mask reply 미지원")
+        r["N-30"] = (RESULT_GOOD, f"{nm}: CDP 비활성 (no cdp enable)") if on(r"^no cdp enable\b") else (RESULT_BAD, f"{nm}: CDP 기본 활성 (no cdp enable 미설정)")
+        r["N-27"] = (RESULT_BAD, f"{nm}: feature nxapi 활성 (HTTP/HTTPS 관리 인터페이스)") if on(r"^feature nxapi\b") else (RESULT_GOOD, f"{nm}: 웹 관리(nxapi) 비활성")
+        r["N-36"] = (RESULT_GOOD, f"{nm}: Domain Lookup 비활성: no ip domain-lookup") if on(r"^no ip domain-lookup\b") else \
+            (RESULT_BAD, f"{nm}: Domain Lookup 기본 활성 (no ip domain-lookup 미설정)")
+    snmp = on(r"^\s*snmp-server\s+(community|user|host|group)\b")
+    r["N-17"] = ((RESULT_MANUAL, f"SNMP 사용 중: {snmp} - 업무상 필요 여부 확인 (불필요 시 비활성화)") if snmp
+                 else (RESULT_GOOD, "SNMP 미사용 (community/user/host 설정 없음)"))
+    if not snmp:
+        r["N-19"] = (RESULT_GOOD, "SNMP 미사용 - 가이드상 SNMP 비활성화 시 양호")
+        r["N-20"] = (RESULT_GOOD, "SNMP 미사용 - RW 권한 커뮤니티 없음")
+    return r
+
+
 def detect_srv_os(text):
     """서버 파이프 출력 헤더 → OS_COLS_SRV 키 반환 (None = 탐지 실패)"""
     for line in text.splitlines()[:15]:
@@ -3659,7 +3969,8 @@ def detect_srv_os(text):
             if "AIX"     in v: return "AIX"
             if "SOLARIS" in v or "SUNOS" in v: return "SOL"
             if "HPUX"    in v or "HP-UX" in v: return "HPUX"
-            if "WINDOWS" in v or "WIN"   in v: return "WIN"
+            if "DARWIN" in v or "MACOS" in v or "MAC OS" in v: return "LINUX"   # macOS(Darwin)는 Unix 계열 — 'WIN' 부분문자열(Darwin)로 Windows 오분류 금지
+            if "WINDOWS" in v or re.search(r"(?<![A-Z])WIN(?:\d|SERVER|[ _-])", v): return "WIN"
             return "LINUX"
     return None
 
@@ -3685,26 +3996,54 @@ def _infer_srv_os(res, evd_path=None):
     return None
 
 
+# 관리형 DBMS 환경(헤더 '# DBMS 환경: 관리형 (RDS-MySQL)') → 기준 엑셀 DB_COLS 의 RDS/Aurora/Azure 열 키
+_DB_MANAGED_KEYS = {
+    ("Oracle", "RDS"): "RDS-Oracle",
+    ("MSSQL", "RDS"): "RDS-MSSQL",
+    ("MySQL", "RDS"): "RDS-MySQL", ("MySQL", "AURORA"): "Aurora-MySQL", ("MySQL", "AZURE"): "Azure-MySQL",
+    ("MariaDB", "RDS"): "RDS-MariaDB", ("MariaDB", "AURORA"): "Aurora-MySQL", ("MariaDB", "AZURE"): "Azure-MySQL",
+    ("PostgreSQL", "RDS"): "RDS-PgSQL", ("PostgreSQL", "AURORA"): "Aurora-PgSQL", ("PostgreSQL", "AZURE"): "Azure-PgSQL",
+}
+
+
+def _dbms_managed_key(base, env):
+    """설치형 키(base) + DBMS 환경 문자열 → 관리형이면 RDS-*/Aurora-*/Azure-* 키, 아니면 base.
+    기준 엑셀에 열이 없는 조합(Azure SQL 등)은 base 유지"""
+    e = (env or "").upper()
+    if not e or "설치형" in e and "관리형" not in e:
+        return base
+    if "관리형" not in e and not re.search(r"RDS|AURORA|AZURE", e):
+        return base
+    kind = "AURORA" if "AURORA" in e else "RDS" if "RDS" in e else "AZURE" if "AZURE" in e else ""
+    return _DB_MANAGED_KEYS.get((base, kind), base)
+
+
 def detect_dbms_vendor(text):
-    """DBMS 파이프 출력 헤더 → DB_COLS 키 반환 (None = 탐지 실패)"""
-    head = [l for l in text.splitlines()[:25] if l.startswith("#")]
+    """DBMS 파이프 출력 헤더 → DB_COLS 키 반환 (None = 탐지 실패)
+    헤더 '# DBMS 환경:' 이 관리형(RDS/Aurora/Azure)이면 RDS-MySQL·Aurora-PgSQL 등 관리형 열 키를 반환"""
+    head = [l for l in text.splitlines()[:40] if l.startswith("#")]
+    env = ""
+    for l in head:
+        m = re.match(r"#\s*DBMS\s*환경\s*:\s*(.+)$", l)
+        if m:
+            env = m.group(1)
     if any(re.search(r"\d[\w.]*-mariadb|mariadb\s+\d|:\s*mariadb\b", l, re.I) for l in head):   # 버전 값이 MariaDB(예: 11.8.9-MariaDB) → MariaDB 기준 ('MySQL/MariaDB 버전' 머리말 문구는 제외)
-        return "MariaDB"
-    for line in text.splitlines()[:20]:
+        return _dbms_managed_key("MariaDB", env)
+    for line in text.splitlines()[:40]:
         s = line.strip().lstrip("#").strip()
         kv = s.split(":", 1)
         if len(kv) < 2: continue
         k = kv[0].strip().lower()
         v = kv[1].strip().lower()
         if k in ("dbms 종류", "dbms", "db", "db type", "db_type"):
-            if "oracle"     in v: return "Oracle"
-            if "mariadb"    in v: return "MariaDB"
-            if "mysql"      in v: return "MySQL"
-            if "mssql"      in v or "sql server" in v: return "MSSQL"
-            if "postgresql" in v or "pgsql" in v: return "PostgreSQL"
+            if "oracle"     in v: return _dbms_managed_key("Oracle", env)
+            if "mariadb"    in v: return _dbms_managed_key("MariaDB", env)
+            if "mysql"      in v: return _dbms_managed_key("MySQL", env)
+            if "mssql"      in v or "sql server" in v or "sqlserver" in v: return _dbms_managed_key("MSSQL", env)
+            if "postgresql" in v or "pgsql" in v or "postgres" in v: return _dbms_managed_key("PostgreSQL", env)
             if "tibero"     in v: return "Tibero"
         elif k.startswith("sql server"):   # 구버전 check_dbms_mssql.ps1 결과: 'DBMS 종류' 없이 '# SQL Server 버전:' 만 출력
-            return "MSSQL"
+            return _dbms_managed_key("MSSQL", env)
     return None
 
 
@@ -3715,7 +4054,7 @@ def detect_net_subtypes(text, lines):
     subs   = []
     if dtype in ("SW",  "L3SW"): subs.append("SW")
     if dtype in ("RTR", "L3SW"): subs.append("RTR")
-    vendor_map = {"CISCO": "CISCO", "A10": "A10", "ALTEON": "ALTEON", "BIGIP": "ALTEON", "CITRIX": "ALTEON", "BROCADE": "ALTEON", "PIOLINK": "ALTEON", "JUNIPER": "JUNIPER"}
+    vendor_map = {"CISCO": "CISCO", "ASA": "CISCO", "NXOS": "CISCO", "A10": "A10", "ALTEON": "ALTEON", "BIGIP": "ALTEON", "CITRIX": "ALTEON", "BROCADE": "ALTEON", "PIOLINK": "ALTEON", "JUNIPER": "JUNIPER"}
     if vendor in vendor_map:
         subs.append(vendor_map[vendor])
     return subs
@@ -3731,7 +4070,7 @@ def net_applicable(item, text, lines):
     dtype = detect_net_dtype(lines)
     dev = [t for t, d in (("SW", ("SW", "L3SW")), ("RTR", ("RTR", "L3SW"))) if dtype in d]
     dev_ok = any(ap.get(t) for t in dev)
-    grp = {"CISCO": "CISCO", "A10": "A10", "ALTEON": "ALTEON", "BIGIP": "ALTEON", "CITRIX": "ALTEON", "BROCADE": "ALTEON", "PIOLINK": "ALTEON", "JUNIPER": "JUNIPER"}.get(detect_net_vendor(text))  # C그룹: BROCADE·ALTEON·NORTEL·BIGIP·CITRIX·PIOLINK
+    grp = {"CISCO": "CISCO", "ASA": "CISCO", "NXOS": "CISCO", "A10": "A10", "ALTEON": "ALTEON", "BIGIP": "ALTEON", "CITRIX": "ALTEON", "BROCADE": "ALTEON", "PIOLINK": "ALTEON", "JUNIPER": "JUNIPER"}.get(detect_net_vendor(text))  # C그룹: BROCADE·ALTEON·NORTEL·BIGIP·CITRIX·PIOLINK
     return dev_ok and (grp is None or bool(ap.get(grp)))
 
 
@@ -3902,7 +4241,7 @@ KISA_GUIDE_ITEMS = {
     "WEB-14": ("상", "서비스 관리", "웹 서비스 경로 내 파일의 접근 통제"),
     "WEB-15": ("상", "서비스 관리", "웹 서비스의 불필요한 스크립트 매핑 제거"),
     "WEB-16": ("중", "서비스 관리", "웹 서비스 헤더 정보 노출 제한"),
-    "WEB-17": ("중", "서비스 관리", "웹 서비스 가상 디렉로리 삭제"),
+    "WEB-17": ("중", "서비스 관리", "웹 서비스 가상 디렉터리 삭제"),
     "WEB-18": ("상", "서비스 관리", "웹 서비스 WebDAV 비활성화"),
     "WEB-19": ("중", "보안 설정", "웹 서비스 SSI(Server Side Includes) 사용 제한"),
     "WEB-20": ("상", "보안 설정", "SSL/TLS 활성화"),
@@ -4138,7 +4477,7 @@ KISA_GUIDE_CRITERIA = {
              "불필요한 r 계열 서비스가 활성화된 경우",
              "불필요한 r 계열 서비스 중지 및 비활성화 설정 ※ NET Backup 등 특별한 용도로 사용하지 않는다면 shell(514), login(513), exec(512) 서비스 중 지 ※ rlogin, rsh, rexec 서비스는 backup, 클러스터링 등의 용도로 종종 사용되고 있으므로 해당 서비 스 사용 유무를 확인하여 미사용시 서비스 중지 ※ /etc/hosts.equiv 또는 $HOME/.rhosts 파일을 통해 해당 서비스 사용 여부 확인 (파일이 존재 하지 않거나 해당 파일 내에 설정이 없다면 사용하지 않는 것으로 간주)"),
     "U-37": ("crontab 및 at 명령어에 일반 사용자 실행 권한이 제거되어 있으며, cron 및 at 관련 파일 권한이 640 이하인 경우",
-             "crontab 및 at 명령어에 일반 사용자 실행 권한이 부여되어 있으며, cron 및 at 관련 파일 권한이 640 이상인 경우",
+             "crontab 및 at 명령어에 일반 사용자 실행 권한이 부여되어 있거나, cron 및 at 관련 파일 권한이 640 초과인 경우",
              "crontab 및 at 명령어 파일 권한 750 이하, cron 및 at 관련 파일 소유자 및 파일 권한 640 이하 설정"),
     "U-38": ("DoS 공격에 취약한 서비스가 비활성화된 경우",
              "DoS 공격에 취약한 서비스가 활성화된 경우",
@@ -4792,7 +5131,7 @@ KISA_GUIDE_CRITERIA = {
              "DBA 계정의 Role이 Public으로 설정된 경우",
              "DBA 계정의 Role 설정에서 Public 그룹 권한 취소"),
     "D-19": ("OS_ROLES, REMOTE_OS_AUTHENTICATION, REMOTE_OS_ROLES 설정이 FALSE로 설정된 경우",
-             "OS_ROLES, REMOTE_OS_AUTHENTICATION, REMOTE_OS_ROLES 설정이 TRUE로 설정되지 않은 경우",
+             "OS_ROLES, REMOTE_OS_AUTHENTICATION, REMOTE_OS_ROLES 설정이 FALSE로 설정되지 않은 경우",
              "OS_ROLES, REMOTE_OS_AUTHENTICATION, REMOTE_OS_ROLES 설정을 FALSE로 변경"),
     "D-20": ("Object Owner가 SYS, SYSTEM, 관리자 계정 등으로 제한된 경우",
              "Object Owner가 일반 사용자에게도 존재하는 경우",
@@ -4988,8 +5327,8 @@ KISA_EF_SOURCES = {   # 2026 상세가이드 항목 → 판정 근거로 참조�
     "W-63": ['SRV-175', 'WST-118'],
     "W-64": ['SRV-027', 'WST-024'],
     "WEB-01": ['WST-044'],
-    "WEB-02": ['WST-044'],
-    "WEB-03": ['WST-061'],
+    # WEB-02(취약한 비밀번호 사용 제한)는 WST-044(기본 계정 변경)와 판단 대상이 달라 연계하지 않음 → 수동확인
+    # WEB-03(웹 비밀번호 파일 권한)은 WST-061(OS 시스템 주요 파일 권한)과 대상이 달라 연계하지 않음 → 수동확인
     "WEB-04": ['WST-031'],
     "WEB-05": ['WST-032'],
     "WEB-06": ['WST-033'],
@@ -5004,7 +5343,7 @@ KISA_EF_SOURCES = {   # 2026 상세가이드 항목 → 판정 근거로 참조�
     "WEB-15": ['WST-042'],
     "WEB-16": ['WST-102'],
     "WEB-17": ['WST-037'],
-    "WEB-18": ['WST-028'],
+    # WEB-18(WebDAV)은 WST-028(OS 불필요 서비스)과 대상이 달라 연계하지 않음 → 수동확인
     "WEB-19": ['WST-122'],
     "WEB-22": ['WST-123'],
     "WEB-23": ['WST-124'],
@@ -5018,7 +5357,7 @@ KISA_EF_SOURCES = {   # 2026 상세가이드 항목 → 판정 근거로 참조�
     "D-05": ['DBM-019'],
     "D-06": ['DBM-020'],
     "D-07": ['DBM-034'],
-    "D-08": ['DBM-005'],
+    # D-08(비밀번호 해시 알고리즘)에 해당하는 전자금융 DBM 항목 없음 (DBM-005 는 '중요정보 암호화') → 연계 제거, 가이드 전용 판정/수동확인
     "D-09": ['DBM-006'],
     "D-10": ['DBM-013'],
     "D-11": ['DBM-017'],
@@ -5076,7 +5415,7 @@ KISA_EF_SOURCES = {   # 2026 상세가이드 항목 → 판정 근거로 참조�
     "N-37": ['NET-030'],
     "N-38": ['NET-045'],
     "S-01": ['ISS-017'],
-    "S-02": ['ISS-018'],
+    # S-02(비밀번호 관리정책)는 ISS-018(Default 비밀번호 변경 여부)과 판단 대상이 달라 연계하지 않음 → 수동확인
     "S-03": ['ISS-020'],
     "S-04": ['ISS-019'],
     "S-05": ['ISS-023'],
@@ -5092,7 +5431,7 @@ KISA_EF_SOURCES = {   # 2026 상세가이드 항목 → 판정 근거로 참조�
     "S-15": ['ISS-028', 'ISS-029', 'ISS-033', 'ISS-034', 'ISS-035', 'ISS-036', 'ISS-037', 'ISS-038', 'ISS-039', 'ISS-040'],
     "S-16": ['ISS-004'],
     "S-17": ['ISS-003'],
-    "S-18": ['ISS-030', 'ISS-031', 'ISS-032', 'ISS-041'],
+    # S-18(장비 자체 최소 서비스)은 ISS-030~041(방화벽 허용 정책)과 판단 대상이 달라 연계하지 않음 → 수동확인
     "S-19": ['ISS-007'],
     "S-20": ['ISS-006'],
     "S-21": ['ISS-014'],
@@ -5159,7 +5498,16 @@ def _kisa_criteria(family, criteria_items=None):
 
 
 # 연계 전자금융 항목 '취약'을 그대로 준용할 수 없는 항목 (가이드: 존재 시 설정 이유 인지 / 불필요 여부 판단)
-_KISA_JUDGE_MANUAL = {"U-09", "U-25"}
+_KISA_JUDGE_MANUAL = {"U-09", "U-25", "W-34"}   # W-34: 가이드는 Telnet 구동이어도 인증 방법이 NTLM 이면 양호 → 연계 결과만으로 취약 확정 불가
+
+# 연계 전자금융 항목이 가이드 하위 기준 전체를 확인하지 않는 항목 — 연계 결과가 양호여도 하위 기준은 수동확인 (가이드 상세 원문 기준)
+_KISA_PARTIAL = {
+    "W-08": "계정 잠금 기간·원래대로 설정 기간 60분 이상",
+    "W-33": "HTTP/FTP/SMTP 배너 모두 차단 (연계 결과에 없는 서비스의 배너)",
+    "W-42": "이벤트 로그 90일 이상 보존 설정",
+    "W-49": "원격 강제 종료 권한이 Administrators 그룹만 부여",
+    "W-63": "Kerberos 허용 시간 오차 5분 이하 (도메인 컨트롤러)",
+}
 
 
 # 가이드가 N/A(해당 없음)를 명시한 항목과 사유 (2026 상세가이드 원문)
@@ -5185,14 +5533,14 @@ def _kisa_na_allowed(code, why):
     return bool(pat and re.search(pat, why))
 
 
-def _kisa_result(res, criteria_items, kisa_items, family):
+def _kisa_result(res, criteria_items, kisa_items, family, have_evd=None):
     """
     판정 결과(res) → 가이드 항목 판정
     - 가이드 항목코드 결과(주요정보 전용 스크립트·가이드 기준 재판정) 우선
-    - 없으면 연계 전자금융 항목 판정 준용 (여러 개: N-A 제외 가장 나쁜 판정, 취약 > 수동확인 > 양호)
+    - 없으면 연계 전자금융 항목 판정 준용 (여러 개: N-A 제외 가장 나쁜 판정, 취약 > 점검불가 > 수동확인 > 양호)
     - 연계 항목도 없음: 수동확인
     """
-    rank = {RESULT_BAD: 4, RESULT_MANUAL: 3, RESULT_GOOD: 2, RESULT_NA: 1}
+    rank = RESULT_RANK
     out = {}
     for k, it in kisa_items.items():
         if k in res:
@@ -5216,23 +5564,25 @@ def _kisa_result(res, criteria_items, kisa_items, family):
         if rv == RESULT_BAD and k in _KISA_JUDGE_MANUAL:   # 가이드상 담당자 인지·필요성 판단 항목
             rv = RESULT_MANUAL
             notes.append(f"※ 가이드 판단기준: '{KISA_GUIDE_CRITERIA.get(k, ('',))[0]}' - 담당자 확인 후 판정")
+        if rv == RESULT_BAD and shared and have_evd is not None and not any(x in have_evd for x in live) and k not in _KISA_JUDGE_MANUAL:
+            # 한 점검 항목(예: NET-030)이 여러 가이드 항목을 통합 점검 + 증적 없음 → 취약이 다른 가이드 항목으로 번지지 않게 수동확인
+            rv = RESULT_MANUAL
+            notes.append(f"※ 연계 점검 항목이 {', '.join(shared)} 등 여러 가이드 항목을 통합 점검하고 증적이 없어, 이 항목에 해당하는 취약인지 수동 확인 필요")
+        if rv == RESULT_GOOD and k in _KISA_PARTIAL:   # 연계 항목이 가이드 하위 기준을 못 덮음 → 양호 확정 불가
+            rv = RESULT_MANUAL
+            notes.append(f"※ 연계 점검 항목은 가이드 하위 기준 전체를 확인하지 않음 - 수동 확인 필요: {_KISA_PARTIAL[k]}")
         out[k] = (rv, "\n".join(parts + notes))
-    # 가이드 N/A 기준: N/A 는 ① 가이드 '점검 대상'에 해당 제품·OS 가 없는 경우 ② 가이드가 명시한 항목만 허용
-    #   그 외 N-A(서비스 미사용·파일 없음 등) → 양호(가이드 조치 방법상 미사용=중지·비활성화 상태) / 근거 불명 → 수동확인
+    # 가이드 N/A 기준: N/A 는 ① 가이드 '점검 대상'에 해당 제품·OS 가 없는 경우 ② 가이드가 명시한 항목만 허용.
+    #   가이드가 '미사용 시 양호'를 명시한 항목(U-35·U-47·U-48, 아래 판단기준 문구 항목)만 양호로 전환하고,
+    #   그 외의 N-A(서비스 미사용·파일 없음 등)는 N-A 그대로 유지한다 (임의로 양호로 바꾸지 않음).
     for k, (rv, why) in list(out.items()):
         if rv == RESULT_NA and k in _KISA_NA_OR_GOOD and re.search(r"미사용|미실행|미설치|미존재|없음", why or ""):
             # 가이드: '서비스를 사용하지 않는 경우 양호 또는 N/A' → 점검 스크립트(양호)와 판정 통일
             out[k] = (RESULT_GOOD, f"{why}\n※ 가이드 참고: {_KISA_NA_OR_GOOD[k]} 사용하지 않는 경우 양호 또는 N/A - 점검 스크립트 판정과 통일해 양호")
             continue
-        if rv != RESULT_NA or _kisa_na_allowed(k, why):
-            continue
-        if re.match(r"평가대상 아님", why or ""):   # 전자금융 평가기준의 대상 구분 - 가이드 U·W 는 해당 OS 전체가 대상
+        if rv == RESULT_NA and not _kisa_na_allowed(k, why) and re.match(r"평가대상 아님", why or ""):
+            # 전자금융 평가기준의 대상 구분 - 가이드 U·W 는 해당 OS 전체가 대상이라 근거 없음 → 수동확인
             out[k] = (RESULT_MANUAL, f"{why}\n※ 전자금융 평가기준상 평가대상 외 항목이라 판정 근거 없음 - 가이드 판단기준으로 수동 확인")
-            continue
-        if re.search(r"미사용|미실행|미설치|미존재|없음|사용하지 않|비활성", why or ""):
-            out[k] = (RESULT_GOOD, f"{why}\n※ 가이드 N/A 기준(점검 대상 제외·가이드 명시 항목)에 해당하지 않아 양호 - 점검 대상 서비스·파일 미사용/미존재")
-        else:
-            out[k] = (RESULT_MANUAL, f"{why}\n※ 가이드 N/A 기준(점검 대상 제외·가이드 명시 항목)에 해당하지 않음 - 가이드 판단기준으로 수동 확인")
     # 가이드 양호 기준에 '서비스 미사용'이 포함된 항목: 미사용(N-A) → 양호
     for k, (rv, why) in out.items():
         g = KISA_GUIDE_CRITERIA.get(k, ("",))[0]
@@ -5246,7 +5596,7 @@ def _kisa_result(res, criteria_items, kisa_items, family):
 def _kisa_groups(category, all_results, hosts_info, criteria_items, evidences=None):
     """
     주요정보(MI) 모드: 판정 결과 → 2026 상세가이드 항목 체계로 변환
-    반환: [(구분 라벨, all_results, hosts_info, criteria_items), ...]  ※ 서버 Unix/Windows 혼재 시 항목군별 분리
+    반환: [(구분 라벨, all_results, hosts_info, criteria_items, 호스트별 원본 증적), ...]  ※ 서버 Unix/Windows 혼재 시 항목군별 분리
     """
     fams = {}
     for host, (res, sub) in all_results.items():
@@ -5255,11 +5605,13 @@ def _kisa_groups(category, all_results, hosts_info, criteria_items, evidences=No
     for fam, hosts in fams.items():
         items = _kisa_criteria(fam, criteria_items)
         g_res = {}
+        g_evd = {}
         legacy_n = 0
         for h in hosts:
             raw, sub = all_results[h]
             raw = dict(raw)
             ev = dict((evidences or {}).get(h) or {})
+            g_evd[h] = dict(ev)   # 원본 증적 전체 (증적 원문 시트용 — 가이드 판정에 쓴 부분 발췌와 별개로 보존)
             direct = any(k in raw for k in items)
             if fam == "U" and not direct:   # 전자금융 스크립트 증적 → 가이드 기준 재판정
                 for k, (rv, why, evd) in _kisa_unix_legacy(ev).items():
@@ -5284,7 +5636,7 @@ def _kisa_groups(category, all_results, hosts_info, criteria_items, evidences=No
                 for k in items:
                     if _kisa_db_target(k, sub) is False:
                         raw[k] = (RESULT_NA, f"가이드 점검 대상({re.sub(r'^[^A-Za-z가-힣]+', '', KISA_GUIDE_TARGET.get(k, ''))})에 {sub} 미포함")
-            kres = _kisa_result(raw, criteria_items, items, fam)
+            kres = _kisa_result(raw, criteria_items, items, fam, {c for c, v in ev.items() if v})
             if evidences is not None:   # 현황 및 문제점: 가이드 판단기준으로 구성
                 kev = {k: (ev.get(k) or "\n".join(ev[x] for x in it["sources"] if ev.get(x))) for k, it in items.items()}
                 kres = compose_status(kres, kev, items, "GENERIC")
@@ -5294,7 +5646,7 @@ def _kisa_groups(category, all_results, hosts_info, criteria_items, evidences=No
               f"{len(items)}개 항목 / 대상 {len(hosts)}대"
               + (f" / 전자금융 스크립트 증적 → 가이드 기준 재판정 {legacy_n}건" if legacy_n else ""))
         label = KISA_FAMILY_SHORT[fam] if len(fams) > 1 else ""
-        groups.append((label, g_res, g_hosts, items))
+        groups.append((label, g_res, g_hosts, items, g_evd))
     return groups
 
 
@@ -5328,12 +5680,23 @@ def _ev_cmds(evidence):
     for text in (evidence or {}).values():
         cur = None
         for ln in text.splitlines():
-            if ln.startswith(("$ ", "# ")):   # 명령($) 또는 설명·SQL(#) 블록
+            if ln.startswith(("$ ", "# ")):   # 명령($) 또는 설명·SQL(#) 블록 머리줄 (출력 원문 줄은 parse_evidence 가 ZWSP 로 표시해 구분)
                 cur = (ln[2:], [])
                 out.append(cur)
             elif cur is not None and ln.strip():
-                cur[1].append(ln.rstrip())
+                cur[1].append(ln[1:].rstrip() if ln.startswith(_EVD_ESC) else ln.rstrip())
     return out
+
+
+def _ev_incomplete(blocks):
+    """증적이 잘렸거나 일부만 수집됐을 가능성: 명령이 head/tail/cut/substr 로 자르거나 '이하 생략' 표시가 있으면 True
+    (불완전한 증적으로는 '양호' 를 확정하지 않는다 — 점검 스크립트의 판정을 우선)"""
+    for cmd, lines in blocks:
+        if re.search(r"\|\s*(head|tail)\b|\bcut\s+-[cf]|sed -n '1,\d+p'", cmd):
+            return True
+        if any(re.search(r"이하 \d*\s*줄?\s*생략|\(이하 .*생략|truncated", l) for l in lines):
+            return True
+    return False
 
 
 class _UEv:
@@ -5361,11 +5724,13 @@ class _UEv:
         return any(path in cmd for cmd, _ in self.cmds)
 
     @staticmethod
-    def show(blocks, limit=12):
+    def show(blocks, limit=None):
+        """판정에 쓴 증적 블록 원문 (명령 + 출력 전체, limit 지정 시에만 자름)"""
         out = []
         for cmd, lines in blocks:
             out.append(f"$ {cmd}")
-            out += (lines[:limit] + (["  … (이하 생략)"] if len(lines) > limit else [])) if lines else ["  (출력 없음)"]
+            if lines:
+                out += lines if not limit or len(lines) <= limit else lines[:limit] + [f"  … (이하 {len(lines) - limit}줄 생략)"]
         return "\n".join(out)
 
 
@@ -5458,7 +5823,10 @@ def _kisa_unix_legacy(evidence):
                 t = live(l)
                 if t is not None:
                     deny += [int(x) for x in re.findall(r"\bdeny\s*=\s*(\d+)", t)]
-        if not deny:
+        faillock_on = any(re.search(r"pam_faillock", live(l) or "") for cmd, lines in blks for l in lines)
+        if not deny and faillock_on:   # pam_faillock 은 deny 미지정 시 기본값 3 (faillock.conf 기본 deny = 3)
+            put("U-03", RESULT_GOOD, "pam_faillock 사용 - deny 미지정(기본값 3회, 10회 이하)", blks)
+        elif not deny:
             put("U-03", RESULT_BAD, "계정 잠금 임계값(deny) 미설정", blks)
         elif 0 < min(deny) <= 10:
             put("U-03", RESULT_GOOD, f"계정 잠금 임계값 deny={min(deny)} (10회 이하)", blks)
@@ -5466,6 +5834,8 @@ def _kisa_unix_legacy(evidence):
             put("U-03", RESULT_BAD, f"계정 잠금 임계값 deny={min(deny)} ({'잠금 없음' if min(deny) == 0 else '10회 초과'})", blks)
 
     # ── U-04 비밀번호 파일 보호 / U-13 암호화 알고리즘(SHA-2 이상) ──
+    #   증적이 잘렸거나(head/substr/'이하 생략') 일부 계정만 있으면 '양호' 를 확정하지 않고 점검 스크립트 판정을 따른다.
+    #   (취약 알고리즘 계정이 증적에 보이면 일부만 있어도 취약은 유효)
     blks = ev.find(r"/etc/shadow", r"^\S+\s+(\$\w*\$?|\*|!+\S*|[A-Za-z0-9./]{2,})\s*$")
     hashes = {}
     for cmd, lines in blks:
@@ -5480,18 +5850,26 @@ def _kisa_unix_legacy(evidence):
             m = re.match(r"^\s*ENCRYPT_METHOD\s+(\S+)", l)
             if m: meth = m.group(1).upper()
     if hashes:
-        put("U-04", RESULT_GOOD, f"쉐도우 비밀번호 사용 (/etc/shadow 에 해시 저장, 계정 {len(hashes)}개 확인)", blks)
-        real = {u: h for u, h in hashes.items() if h.startswith("$") or re.match(r"^[A-Za-z0-9./]{13}$", h)}
-        weak = [u for u, h in real.items() if not re.match(r"^\$(5|6|y|gy|7|2[aby]?)\$", h)]
+        real = {u: h for u, h in hashes.items()
+                if h.startswith("$") or re.match(r"^[A-Za-z0-9./]{13}$", h) or re.match(r"(?i)^(DES|CRYPT|MD5|SHA-?\d*|YESCRYPT|BCRYPT|BLOWFISH|SCRYPT)\b", h)}
+        strong_re = r"(?i)^(\$(5|6|y|gy|7|2[aby]?)\$|SHA-?(256|512)|YESCRYPT|BCRYPT|BLOWFISH|SCRYPT)"
+        weak = [u for u, h in real.items() if not re.match(strong_re, h)]
+        # 알고리즘을 알 수 없는 짧은 토큰(예: 앞 4자 샘플의 DES 해시)이 있으면 증적만으로 알고리즘을 확정할 수 없음
+        unk = [u for u, h in hashes.items() if u not in real and not re.match(r"^(\*|!|x$|NP$|LK$|\*LK\*)", h)]
+        complete = (not _ev_incomplete(blks)) and (not acc or set(acc) <= set(hashes)) and not unk
+        if complete:
+            put("U-04", RESULT_GOOD, f"쉐도우 비밀번호 사용 (/etc/shadow 에 해시 저장, 계정 {len(hashes)}개 확인)", blks)
         if weak:
-            put("U-13", RESULT_BAD, f"SHA-2 미만 알고리즘 사용 계정: {', '.join(f'{u}({real[u][:3]})' for u in weak[:10])}", blks + enc)
-        elif real:
+            put("U-13", RESULT_BAD, f"SHA-2 미만 알고리즘 사용 계정: {', '.join(f'{u}({real[u][:3]})' for u in weak[:10])}"
+                + ("" if complete else " (증적이 일부 계정만 포함 - 전체 확인 필요)"), blks + enc)
+        elif complete and real:
             algs = sorted({real[u][:3] for u in real})
             put("U-13", RESULT_GOOD, f"비밀번호 해시 {', '.join(algs)} 사용 ($5$=SHA-256, $6$=SHA-512, $y$=yescrypt)"
                 + (f", ENCRYPT_METHOD {meth}" if meth else ""), blks + enc)
-        elif meth:
+        elif complete and meth:
             put("U-13", RESULT_GOOD if meth in ("SHA256", "SHA512", "YESCRYPT") else RESULT_BAD,
                 f"비밀번호 설정 계정 없음 - 기본 알고리즘 ENCRYPT_METHOD {meth}", enc)
+        # complete 가 아니면 U-04/U-13 을 내지 않음 → 점검 스크립트(SRV-070) 판정이 그대로 사용됨
 
     # ── 계정 목록 기반: U-05 UID 0 / U-11 사용자 shell / U-55 FTP 계정 shell ──
     if acc:
@@ -5509,10 +5887,14 @@ def _kisa_unix_legacy(evidence):
             put("U-11", RESULT_BAD if bad else RESULT_GOOD,
                 (f"로그인 불필요 계정에 쉘 부여: {', '.join(bad)}" if bad else
                  "로그인 불필요 계정(daemon·bin·sys·adm·listen·nobody·operator·games 등)에 nologin/false 부여") + note, src)
-            if "ftp" in shells:
-                put("U-55", RESULT_GOOD if _NOLOGIN.search(shells["ftp"]) else RESULT_BAD, f"ftp 계정 쉘: {shells['ftp']}", src)
+            ftp_acc = {u: sh for u, sh in shells.items() if re.search(r"ftp", u, re.I) or u.lower() == "anonymous"}   # ftp·vsftpd·ftpuser·anonymous 등 FTP 용 계정
+            if ftp_acc:
+                badf = {u: sh for u, sh in ftp_acc.items() if not _NOLOGIN.search(sh)}
+                put("U-55", RESULT_BAD if badf else RESULT_GOOD,
+                    (f"FTP 계정에 로그인 쉘 부여: {', '.join(f'{u}({sh})' for u, sh in badf.items())}" if badf else
+                     f"FTP 계정 쉘 제한: {', '.join(f'{u}({sh})' for u, sh in ftp_acc.items())}"), src)
             else:
-                put("U-55", RESULT_GOOD, "ftp 계정 없음", src)
+                put("U-55", RESULT_GOOD, "FTP 계정(ftp·vsftpd·anonymous 등) 없음", src)
 
     # ── U-12 세션 종료 시간 (600초 이하) ──
     blks = ev.find(r"TMOUT|autologout")
@@ -5606,6 +5988,12 @@ def _kisa_unix_legacy(evidence):
             m = re.match(r"^(\S+)\s+(/\S*)\s+d([rwxsStT-]{9})[.+@]?\s+\d+\s+(\S+)\s+(\S+)", l)
             if m:
                 homes[m.group(1)] = (m.group(2), _ls_mode(m.group(3)), m.group(4))
+    if not homes and acc:   # 'ls -ld <홈>' 일반 형식 증적 (사용자 접두 없는 ls 출력) → 홈 경로로 계정과 대응
+        for u, (uid, sh, hd) in acc.items():
+            if hd and hd in ev.ls and ev.ls[hd][0] == "d":
+                typ, mode, own, grp, _ln = ev.ls[hd]
+                homes[u] = (hd, mode, own)
+        blks = blks or ev.find(r"ls -ld")
     if homes and acc:
         login = {u for u, (uid, sh, _) in acc.items() if sh and not _NOLOGIN.search(sh)}
         tgt = {u: v for u, v in homes.items() if u in login}
@@ -5626,16 +6014,39 @@ def _kisa_unix_legacy(evidence):
 
     # ── 서비스: U-34 Finger / U-36 r 계열 / U-38 DoS / U-41 automountd ──
     def svc_chk(code, cmd_pat, hit_pat, name):
+        """서비스 활성 여부: 서비스 이름이 보인다고 활성으로 보지 않고, 실행 상태를 나타내는 줄만 근거로 삼는다
+        - '<서비스>: ... 실행 판정=실행중' / ActiveState=active / ps 프로세스 줄 / LISTEN 줄 / xinetd 'disable = no'
+        - xinetd.d 파일명 목록, 'automount -V' 버전 줄, 'disable = yes', inactive·masked·static 줄은 제외"""
         blks = ev.find(cmd_pat)
         if not blks:
             return
         hits = []
         for cmd, lines in blks:
+            single_unit = re.findall(r"is-active\s+(\S+)", cmd)
             for l in lines:
-                if l.strip() == "active" or (re.search(hit_pat, l) and not re.search(r"\bgrep\b", l)
-                                             and not l.strip().startswith("#")
-                                             and not re.search(r"\b(disabled|masked|static|inactive|unknown)\b", l)):
-                    hits.append(l.strip())
+                t = l.strip()
+                if not t or t.startswith("#") or re.search(r"\bgrep\b", t):
+                    continue
+                if re.fullmatch(r"[\w.@-]+", t) and t != "active":   # 파일명 목록(예: ls /etc/xinetd.d) 한 단어 줄
+                    continue
+                if re.search(r"\bversion\b|Linux automount", t, re.I):   # 'automount -V' 버전 출력은 실행 중 근거가 아님
+                    continue
+                if "실행 판정=" in t:   # _svc_state 형식: '<서비스>: 프로세스 N개, 실행 판정=실행중|미실행'
+                    if re.search(hit_pat, t) and "실행 판정=실행중" in t:
+                        hits.append(t)
+                    continue
+                if re.search(r"\b(inactive|failed|masked|static|unknown|not-found|disabled)\b|disable\s*=\s*yes|ActiveState=inactive", t):
+                    continue
+                if t == "active":   # systemctl is-active 단일 서비스 질의일 때만 인정 (여러 서비스 반복문의 'active' 는 귀속 불가)
+                    if len(single_unit) == 1 and re.search(hit_pat, single_unit[0]):
+                        hits.append(f"{single_unit[0]}: active")
+                    continue
+                if re.search(r"ActiveState=active", t) and re.search(hit_pat, t):
+                    hits.append(t)
+                elif re.search(r"disable\s*=\s*no", t):
+                    hits.append(t)
+                elif re.search(hit_pat, t) and re.search(r"\bLISTEN\b|\b(root|\d+)\s+\d+\s|/usr/|/sbin/|\bstream\s+(tcp|udp)", t):
+                    hits.append(t)
         put(code, RESULT_BAD if hits else RESULT_GOOD,
             f"{name} 활성: {' / '.join(hits[:5])}" if hits else f"{name} 비활성 (실행 중인 프로세스·활성 서비스 없음)", blks)
 
@@ -5765,16 +6176,18 @@ def _kisa_win_legacy(evidence):
             parts = [x.strip() for x in l.split("/")]
             if len(parts) == 3:
                 cpx = parts[2] or None
+    hist = num(na_val(r"password history|암호 기록|비밀번호 기록"))   # 최근 암호 기억 개수 (가이드: 4개 이상)
     if mx is not None or ln is not None:
         bad = []
         if mx is None or mx <= 0 or mx > 90: bad.append(f"최대 사용 기간 {mx if mx and mx > 0 else '제한 없음'}{'일' if mx and mx > 0 else ''}")
         if mn is None or mn < 1: bad.append(f"최소 사용 기간 {mn}일")
         if ln is None or ln < 8: bad.append(f"최소 길이 {ln}자")
         if cpx == "0": bad.append("복잡성 사용 안 함")
-        cur = f"최대 {mx}일, 최소 {mn}일, 최소 길이 {ln}자, 복잡성={cpx or '확인 불가'}"
+        if hist is not None and hist < 4: bad.append(f"암호 기록 {hist}개(4개 미만)")
+        cur = f"최대 {mx}일, 최소 {mn}일, 최소 길이 {ln}자, 복잡성={cpx or '확인 불가'}, 암호 기록={hist if hist is not None else '확인 불가'}"
         blocks = _UEv.show(na_blk + ev.find(r"PasswordComplexity"))
         if bad: r["W-09"] = (RESULT_BAD, f"비밀번호 관리 정책 미흡: {', '.join(bad)} ({cur})", blocks)
-        elif cpx is None: r["W-09"] = (RESULT_MANUAL, f"{cur} - 복잡성 정책 확인 필요(관리자 권한)", blocks)
+        elif cpx is None or hist is None: r["W-09"] = (RESULT_MANUAL, f"{cur} - " + ("복잡성 정책(관리자 권한)" if cpx is None else "암호 기록 개수") + " 확인 필요", blocks)
         else: r["W-09"] = (RESULT_GOOD, f"비밀번호 관리 정책 적용 ({cur})", blocks)
     # W-36 원격터미널 접속 타임아웃 30분 이하
     mi = [num(l.split(":", 1)[1]) for c, ls in ev.find(r"MaxIdleTime") for l in ls if re.match(r"^\s*MaxIdleTime\s*:", l)]
@@ -5793,10 +6206,11 @@ def _kisa_win_legacy(evidence):
                 m = re.match(r"^\s*(EnableForcedLogoff|AutoDisconnect)\s*:\s*(-?\d+)", l, re.I)
                 if m:
                     vals[m.group(1).lower()] = int(m.group(2))
-        ef, ad = vals.get("enableforcedlogoff"), vals.get("autodisconnect", 15)
+        # EnableForcedLogOff 레지스트리 값이 없으면 Windows 기본값은 '사용(1)', AutoDisconnect 기본값은 15분
+        ef, ad = vals.get("enableforcedlogoff", 1), vals.get("autodisconnect", 15)
         ok_ = ef == 1 and 0 <= ad <= 15
         r["W-56"] = ((RESULT_GOOD if ok_ else RESULT_BAD),
-                     f"로그온 시간 만료 시 연결 끊기={ef}, 유휴 시간 {ad}분{'(기본값)' if 'autodisconnect' not in vals else ''} (기준: 사용, 15분 이하)", _UEv.show(sb))
+                     f"로그온 시간 만료 시 연결 끊기={ef}{'(키 없음, 기본값 사용)' if 'enableforcedlogoff' not in vals else ''}, 유휴 시간 {ad}분{'(기본값)' if 'autodisconnect' not in vals else ''} (기준: 사용, 15분 이하)", _UEv.show(sb))
     return r
 
 
@@ -5819,7 +6233,7 @@ def _kisa_db_legacy(evidence, vendor):
             rv, why = ((RESULT_BAD, f"SHA-256 미만 비밀번호 해시 사용 계정(mysql_native_password=SHA-1): {', '.join(weak[:10])}")
                          if weak else (RESULT_GOOD, f"전 계정 인증 플러그인 {', '.join(strong)} (SHA-256 이상)"))
             r["D-08"] = (rv, why, _UEv.show(blks))
-    elif "postgre" in v:
+    elif "postgre" in v or "pgsql" in v:
         blks = ev.find(r"password_encryption")
         enc = ""
         for c, ls in blks:
@@ -5827,10 +6241,24 @@ def _kisa_db_legacy(evidence, vendor):
                 m = re.search(r"\b(scram-sha-256|md5)\b", l, re.I)
                 if m:
                     enc = m.group(1).lower()
-        if enc:
-            rv, why = ((RESULT_GOOD, "password_encryption=scram-sha-256 (SHA-256)") if enc == "scram-sha-256"
-                         else (RESULT_BAD, "password_encryption=md5 (SHA-256 미만)"))
-            r["D-08"] = (rv, why, _UEv.show(blks))
+        # 설정값(password_encryption)은 새 비밀번호에만 적용 → 이미 저장된 md5 해시는 pg_authid 로 확인 (rolpassword 분류 SCRAM/MD5)
+        roles = {}
+        rblks = ev.find(r"pg_authid|rolpassword")
+        for c, ls in rblks:
+            for l in ls:
+                m = re.match(r"^([^|\s]+)\|[tf]\|[tf]\|[tf]\|(NULL|SCRAM|MD5|OTHER)\b", l.strip())
+                if m:
+                    roles[m.group(1)] = m.group(2)
+        md5_roles = sorted(u for u, k in roles.items() if k == "MD5")
+        allb = blks + rblks
+        if md5_roles:
+            r["D-08"] = (RESULT_BAD, f"SHA-256 미만(md5) 비밀번호 해시 사용 계정: {', '.join(md5_roles[:10])}" + (f" (password_encryption={enc})" if enc else ""), _UEv.show(allb))
+        elif enc == "md5":
+            r["D-08"] = (RESULT_BAD, "password_encryption=md5 (SHA-256 미만)", _UEv.show(allb))
+        elif enc == "scram-sha-256" and roles and not _ev_incomplete(rblks):
+            r["D-08"] = (RESULT_GOOD, f"password_encryption=scram-sha-256, 저장된 해시 전부 SCRAM (계정 {len(roles)}개 확인)", _UEv.show(allb))
+        elif enc == "scram-sha-256":
+            r["D-08"] = (RESULT_MANUAL, "password_encryption=scram-sha-256 이나 기존 계정의 저장 해시(pg_authid.rolpassword) 증적이 없어 md5 해시 잔존 여부 확인 필요", _UEv.show(allb))
     return r
 
 
@@ -5846,6 +6274,13 @@ def load_criteria(excel_path, sheet_name, mode):
       criteria_by : {"LINUX": {"기준": "...", "방법": "..."}, ...}  ← 세부 판단기준
     """
     wb = load_workbook(excel_path, read_only=True)
+    try:
+        return _load_criteria_ws(wb, sheet_name, mode)
+    finally:
+        wb.close()   # read_only 통합문서는 열린 파일 핸들을 유지하므로 반드시 닫는다
+
+
+def _load_criteria_ws(wb, sheet_name, mode):
     ws = wb[sheet_name]
     items = {}
     col_filter = COL_EF if mode == "EF" else COL_MI
@@ -5940,6 +6375,9 @@ FILL_SUBHEADER = PatternFill("solid", fgColor="2E4057")   # 다크 네이비
 FILL_ODD       = PatternFill("solid", fgColor="FFFFFF")   # 흰색
 FILL_EVEN      = PatternFill("solid", fgColor="F5F5F5")   # 연한 회색
 FILL_VULN_ROW  = PatternFill("solid", fgColor="FDECEA")   # 연한 빨강
+# 조건부 서식(dxf)은 Excel 이 bgColor 를 배경으로 쓰므로 fgColor·bgColor 를 함께 지정한 채우기를 사용
+DXF_VULN_ROW   = PatternFill("solid", start_color="FDECEA", end_color="FDECEA")
+DXF_UNABLE     = PatternFill("solid", start_color="FFF2CC", end_color="FFF2CC")   # 점검불가 배경 (compare_results 와 동일)
 FILL_SUMMARY   = PatternFill("solid", fgColor="D6DCE4")   # 연한 네이비
 FONT_HEADER    = Font(name=FONT_NAME, size=9, bold=True, color="FFFFFF")
 FONT_TITLE     = Font(name=FONT_NAME, size=13, bold=True, color="FFFFFF")
@@ -5947,7 +6385,8 @@ FONT_DATA      = Font(name=FONT_NAME, size=9, color="333333")
 FONT_GOOD      = Font(name=FONT_NAME, size=9, bold=True, color="1F3864")
 FONT_BAD       = Font(name=FONT_NAME, size=9, bold=True, color="C0392B")
 FONT_NA        = Font(name=FONT_NAME, size=9, color="999999")
-FONT_MANUAL    = Font(name=FONT_NAME, size=9, color="333333")
+FONT_MANUAL    = Font(name=FONT_NAME, size=9, color="C55A11")   # 수동확인: 일반 글자색(333333)과 구분되는 주황
+FONT_UNABLE    = Font(name=FONT_NAME, size=9, bold=True, color="7F6000")   # 점검불가: 굵은 갈색 + 연노랑 배경(FFF2CC)
 FONT_RISK_HIGH = Font(name=FONT_NAME, size=9, bold=True, color="C0392B")
 FONT_RISK_MID  = Font(name=FONT_NAME, size=9, color="333333")
 
@@ -5956,7 +6395,9 @@ RESULT_FONT = {
     RESULT_BAD:    FONT_BAD,
     RESULT_NA:     FONT_NA,
     RESULT_MANUAL: FONT_MANUAL,
+    RESULT_UNABLE: FONT_UNABLE,
 }
+FILL_UNABLE = PatternFill("solid", fgColor="FFF2CC")
 
 FONT_SECTION = Font(name=FONT_NAME, size=12, bold=True, color="1F3864")
 FONT_LABEL   = Font(name=FONT_NAME, size=10, bold=True, color="333333")
@@ -5975,7 +6416,7 @@ CAT_LABEL = {
 def _parse_header_info(text):
     """결과 파일 헤더에서 호스트명, OS, 점검일시 등 추출"""
     info = {"hostname": "", "os": "", "date": "", "standard": ""}
-    for line in text.splitlines()[:16]:
+    for line in text.splitlines()[:40]:
         if not line.lstrip("\ufeff \t").startswith("#"):   # 머리말(#) 줄만 - 판정 줄의 '점검 대상(…)' 문구 오인 방지
             continue
         s = line.strip().lstrip("\ufeff").lstrip("#").strip()
@@ -5985,7 +6426,19 @@ def _parse_header_info(text):
         k = kv[0].strip()
         v = kv[1].strip()
         kl = k.lower()
-        if "점검 대상" in k or "hostname" in kl:
+        # 점검 스크립트 헤더 메타데이터: # IP: / # 실행 계정: / # 클라우드: / # DBMS 환경: / # 실행 호스트:
+        if kl in ("ip", "ip 주소", "ip address", "ip addr"):
+            info["ip"] = "" if v in ("미확인", "-", "N/A") else v
+            info["ips"] = [x for x in re.findall(r"\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]{2,}:[0-9a-fA-F:]+", v) if x]
+        elif k == "실행 계정":
+            info["run_user"] = v
+        elif k == "클라우드":
+            info["cloud"] = v
+        elif k.replace(" ", "") == "DBMS환경":
+            info["dbms_env"] = v
+        elif k == "실행 호스트":
+            info["run_host"] = v
+        elif "점검 대상" in k or "hostname" in kl:
             info["hostname"] = v
         elif kl == "os 상세":
             info["os_detail"] = v
@@ -6060,6 +6513,7 @@ def _group_by_control_area(criteria_items):
 
 
 def _cf_font(color, bold):
+    # 조건부 서식 글꼴은 색·굵기만 지정 (openpyxl Color 객체/문자열 모두 허용)
     return Font(color=color, bold=bold)
 
 
@@ -6073,10 +6527,10 @@ def _add_result_cf(ws, first, last):
         ws.conditional_formatting.add(
             o_rng, FormulaRule(formula=[f'$O{first}="{val}"'],
                                font=_cf_font(fnt.color, fnt.bold),
-                               fill=FILL_VULN_ROW if val == RESULT_BAD else None))
+                               fill=DXF_VULN_ROW if val == RESULT_BAD else (DXF_UNABLE if val == RESULT_UNABLE else None)))
     ws.conditional_formatting.add(
         f"C{first}:Q{last}",
-        FormulaRule(formula=[f'$O{first}="{RESULT_BAD}"'], fill=FILL_VULN_ROW))
+        FormulaRule(formula=[f'$O{first}="{RESULT_BAD}"'], fill=DXF_VULN_ROW))
 
 
 def _add_bad_count_cf(ws, rng):
@@ -6089,7 +6543,9 @@ def _qsheet(name):
     return "'" + name.replace("'", "''") + "'"
 
 
-_FIXED_SHEETS = {"표지", "개요", "개정이력", "점검대상", "보안수준 통계", "요약 통계", "취약점 목록", "취약점_계산", "검토·수정", "보안가이드"}
+EVIDENCE_SHEET = "증적 원문"
+_FIXED_SHEETS = {"표지", "개요", "개정이력", "점검대상", "보안수준 통계", "요약 통계", "취약점 목록", "취약점_계산", "검토·수정", "보안가이드",
+                 "통계_계산", EVIDENCE_SHEET}
 _SHEET_NAME_MAP = {}
 
 
@@ -6098,7 +6554,7 @@ def _init_sheet_names(hostnames):
     _SHEET_NAME_MAP.clear()
     used = {n.lower() for n in _FIXED_SHEETS}
     for h in hostnames:
-        base = re.sub(r"[\[\]:*?/\\]", "_", str(h)).strip("'") or "host"
+        base = _safe_sheet_name(h)
         name, i = base[:31], 1
         while name.lower() in used:
             i += 1
@@ -6108,8 +6564,14 @@ def _init_sheet_names(hostnames):
         _SHEET_NAME_MAP[h] = name
 
 
+def _safe_sheet_name(name):
+    """엑셀 시트명 규칙: 금지문자([]:*?/\\) 치환, 앞뒤 작은따옴표 제거, 31자"""
+    return (re.sub(r"[\[\]:*?/\\]", "_", str(name)).strip("'")[:31]) or "host"
+
+
 def _host_sheet_name(hostname):
-    return _SHEET_NAME_MAP.get(hostname) or hostname[:31]
+    # _init_sheet_names 이전에 호출돼도(개요 시트 수식 등) 금지문자가 든 호스트명이 같은 정규화 결과를 얻도록 함
+    return _SHEET_NAME_MAP.get(hostname) or _safe_sheet_name(hostname)
 
 
 def _sheet_link(hostname, cell="A1"):
@@ -6195,7 +6657,7 @@ _KISA_ENV_RULES = [
     (r"APACHE", r"^Apache"), (r"NGINX", r"^Nginx"), (r"TOMCAT", r"^Tomcat"), (r"JEUS", r"^JEUS"), (r"WEBTOB", r"^WebtoB"), (r"\bIIS\b", r"^IIS"),
     (r"MYSQL|MARIADB", r"^MySQL"), (r"POSTGRE|PGSQL", r"^PostgreSQL"), (r"\bORACLE\b(?! LINUX)", r"^Oracle DB"),
     (r"MSSQL|SQL ?SERVER", r"^MSSQL"), (r"TIBERO", r"^Tibero"), (r"ALTIBASE", r"^Altibase"), (r"CUBRID", r"^Cubrid"),
-    (r"CISCO", r"^Cisco"), (r"JUNIPER|JUNOS", r"^Juniper"), (r"ALTEON|RADWARE", r"Alteon"), (r"PIOLINK", r"^Piolink"), (r"PASSPORT", r"^Passport"),
+    (r"CISCO|\bASA\b|NX-?OS", r"^Cisco"), (r"JUNIPER|JUNOS", r"^Juniper"), (r"ALTEON|RADWARE", r"Alteon"), (r"PIOLINK", r"^Piolink"), (r"PASSPORT", r"^Passport"),
 ]
 
 
@@ -6258,7 +6720,7 @@ SECURITY_GUIDE_SHEET = "보안가이드"
 
 
 def _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items):
-    """주요정보: 취약·수동확인 항목의 명령어 수준 조치 가이드 (중요도 순, 대상 환경별로 묶음)"""
+    """주요정보: 취약·수동확인·점검불가 항목의 명령어 수준 조치 가이드 (중요도 순, 대상 환경별로 묶음)"""
     if not any((criteria_items.get(k) or {}).get("guide") for k in criteria_items):
         return
     if not KISA_CASES:   # 데이터 파일 누락 - 조용히 빠지지 않도록 경고
@@ -6271,7 +6733,7 @@ def _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items):
         env = _kisa_env(sub, hinfo.get(host, {}))
         for code, (rv, _why) in res.items():
             item = criteria_items.get(code) or {}
-            if not item.get("guide") or rv not in (RESULT_BAD, RESULT_MANUAL):
+            if not item.get("guide") or rv not in (RESULT_BAD, RESULT_MANUAL, RESULT_UNABLE):
                 continue
             secs = _kisa_cmd_sections(code, env)
             key = (code, tuple(l for l, _ in secs))
@@ -6285,7 +6747,7 @@ def _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items):
     ws.sheet_view.showGridLines = False
     ws.cell(1, 1).value = "▣ 보안가이드 (명령어 수준 조치 방법)"
     ws.cell(1, 1).font = Font(name=FONT_NAME, size=14, bold=True)
-    ws.cell(2, 1).value = ("보고서 생성 시점의 취약·수동확인 항목을 중요도 순(상→중→하)으로 정리했습니다. 조치 명령은 대상 환경(OS·제품)에 맞는 "
+    ws.cell(2, 1).value = ("보고서 생성 시점의 취약·수동확인·점검불가 항목을 중요도 순(상→중→하)으로 정리했습니다. 조치 명령은 대상 환경(OS·제품)에 맞는 "
                            "2026 상세가이드 '점검 및 조치 사례' 원문이며, 가이드에 절차가 없는 제품은 제조사 문서 기반입니다. "
                            "적용 전 테스트 환경에서 서비스 영향을 확인하십시오. 중요도 '상' 항목을 우선 조치하십시오.")
     ws.cell(2, 1).font = Font(name=FONT_NAME, size=10, color="555555")
@@ -6343,7 +6805,7 @@ def _fix_text_for(item, detected_sub):
 
 def _detail_layout(area_groups):
     """호스트 상세 시트 행 배치 사전계산 (통계 수식이 아래쪽 상세 영역을 참조하므로)"""
-    stat_start = 13
+    stat_start = 14   # 시스템 현황(6~9행: Host/OS, IP/용도, 실행계정/클라우드, DBMS환경/실행호스트) 아래 통계표
     stat_total_row = stat_start + len(area_groups)
     detail_start = stat_total_row + 2
     hdr_row = detail_start + 2
@@ -6359,10 +6821,12 @@ def _detail_layout(area_groups):
 
 
 def _calc_host_stats(res, criteria_items, area_codes=None):
-    """호스트 결과에 대한 통계 계산"""
+    """호스트 결과에 대한 통계 계산
+    전체점수 A = 양호+취약 항목의 위험도값 합 (수동확인·점검불가·N-A 제외), 취약점수 B = 취약 항목 위험도값 합
+    보안수준 = (A-B)/A*100, A=0(판정 가능한 항목 없음)이면 None(산정불가)"""
     codes = area_codes if area_codes else list(criteria_items.keys())
     total_items = len(codes)
-    good = bad = na_c = mc = 0
+    good = bad = na_c = mc = un = 0
     total_score = 0.0
     vuln_score = 0.0
     for code in codes:
@@ -6380,14 +6844,15 @@ def _calc_host_stats(res, criteria_items, area_codes=None):
             vuln_score += score
         elif result_val == RESULT_NA:
             na_c += 1
+        elif result_val == RESULT_UNABLE:
+            un += 1
         else:
             mc += 1
-            total_score += score
     checked = total_items - na_c
-    sec_level = ((total_score - vuln_score) / total_score * 100) if total_score > 0 else 100.0
+    sec_level = ((total_score - vuln_score) / total_score * 100) if total_score > 0 else None
     return {
         "total": total_items, "checked": checked,
-        "good": good, "bad": bad, "na": na_c, "manual": mc,
+        "good": good, "bad": bad, "na": na_c, "manual": mc, "unable": un, "undecided": mc + un,
         "total_score": total_score, "vuln_score": vuln_score,
         "sec_level": sec_level,
     }
@@ -6487,7 +6952,7 @@ def _create_cover_sheet(wb, mode, category, hosts_info):
 
 
 def _create_overview_sheet(wb, mode, category, hosts_info, criteria_items=None, example_host=None):
-    """개요 시트 (레퍼런스 양식: 목적/평가정의/취약점 제거 방안)"""
+    """개요 시트 (목적 / 평가 정의 / 취약점 제거 방안)"""
     ws = wb.create_sheet("개요")
     ws.sheet_properties.tabColor = "1F3864"
     for c in range(1, 18):
@@ -6579,8 +7044,8 @@ def _create_overview_sheet(wb, mode, category, hosts_info, criteria_items=None, 
         return " / ".join(f"{x:g}점" for x in sorted(v, reverse=True)) if v else "-"
 
     r = 11
-    score_headers = ["중요도", "위험도값(w)", "취약", "양호", "수동확인", "해당없음(N-A)"]
-    col_spans = [(3, 4), (5, 6), (7, 9), (10, 11), (12, 14), (15, 16)]
+    score_headers = ["중요도", "위험도값(w)", "취약", "양호", "수동확인", "점검불가", "해당없음(N-A)"]
+    col_spans = [(3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16)]
     for (cs, ce), hdr in zip(col_spans, score_headers):
         ws.merge_cells(start_row=r, start_column=cs, end_row=r, end_column=ce)
         c = ws.cell(r, cs)
@@ -6593,8 +7058,8 @@ def _create_overview_sheet(wb, mode, category, hosts_info, criteria_items=None, 
     for i, grade in enumerate(("상", "중", "하")):
         dr = r + 1 + i
         vals = [grade, _fmt_scores(grade_scores[grade]),
-                "w점 (A·B 모두 반영)", "0점 (A에만 반영)",
-                "0점 (A에만 반영, 확인 후 재판정)", "산정 제외"]
+                "w점 (A·B 모두 반영)", "w점 (A에만 반영)",
+                "산정 제외 (확인 후 재판정)", "산정 제외 (재점검 후 재판정)", "산정 제외"]
         fill = FILL_ODD if i % 2 == 0 else FILL_EVEN
         for (cs, ce), v in zip(col_spans, vals):
             ws.merge_cells(start_row=dr, start_column=cs, end_row=dr, end_column=ce)
@@ -6616,37 +7081,42 @@ def _create_overview_sheet(wb, mode, category, hosts_info, criteria_items=None, 
     _sub(r, "2.1.2  기술적 취약점 점수 계산")
     r += 1
     defs = [
-        "• 모든 취약점이 식별되었을 경우의 점수 합(전체점수) : A  —  해당없음(N-A)을 제외한 점검 항목 위험도값의 합",
+        "• 모든 취약점이 식별되었을 경우의 점수 합(전체점수) : A  —  '양호'+'취약'으로 판정된 항목의 위험도값 합 (수동확인·점검불가·N-A 제외)",
         "• 식별된 취약점들의 점수 합(취약점수) : B  —  '취약' 판정 항목 위험도값의 합",
         "• 자산의 수 : N,   자산별 보안수준 : Sₙ (n = 1, 2, …, N)",
     ]
     for d in defs:
-        _line(r, d)
+        _line(r, d, height=30)
         r += 1
     r += 1
     _equation(r, "전체점수 · 취약점수", "A = Σᵢ∈P wᵢ ,   B = Σᵢ∈V wᵢ",
-              "P : N-A 제외 점검 항목 집합\nV : 취약 판정 항목 집합 (V ⊆ P)")
+              "P : 양호·취약 판정 항목 집합 (수동확인·점검불가·N-A 제외)\nV : 취약 판정 항목 집합 (V ⊆ P)")
     r += 1
     _equation(r, "자산별 보안수준", "Sₙ = (A − B) / A × 100",
-              "A = 0 이면 100%\n소수점 첫째 자리 반올림")
+              "A = 0 이면 '산정불가' (100% 아님, 평균에서 제외)\n소수점 첫째 자리 반올림")
     r += 1
     _equation(r, "전체 보안수준", "S = (1/N) · Σₙ₌₁ᴺ Sₙ",
-              "자산별 보안수준의 단순 평균\n(자산 간 동일 가중)")
+              "산정 가능한 자산별 보안수준의 단순 평균\n(산정불가 자산은 N에서 제외)")
     r += 1
     _equation(r, "영역별 보안수준", "Sₐ = (1/N) · Σₙ₌₁ᴺ Sₙ,ₐ",
               "각 자산의 영역 a 보안수준 평균\n(Sₙ,ₐ = 영역 a 항목만으로 계산)")
     r += 2
     if example_host:
         q = _qsheet(_host_sheet_name(example_host))
-        tr = 13 + len(_group_by_control_area(criteria_items))
+        tr = _detail_layout(_group_by_control_area(criteria_items))["stat_total_row"]
+        ex_h = example_host.replace('"', "'")
         _line(r, "", Font(name=FONT_NAME, size=9, color="333333"))
         ws.cell(r, 3).value = (
-            f'="  예) {example_host} : A = "&TEXT({q}!J{tr},"0.#")&", B = "&TEXT({q}!K{tr},"0.#")'
-            f'&"  →  S = ("&TEXT({q}!J{tr},"0.#")&" − "&TEXT({q}!K{tr},"0.#")&") / "&TEXT({q}!J{tr},"0.#")'
-            f'&" × 100 = "&TEXT({q}!L{tr},"0.0")&"%"')
+            f'=IF(ISNUMBER({q}!M{tr}),"  예) {ex_h} : A = "&TEXT({q}!K{tr},"0.#")&", B = "&TEXT({q}!L{tr},"0.#")'
+            f'&"  →  S = ("&TEXT({q}!K{tr},"0.#")&" − "&TEXT({q}!L{tr},"0.#")&") / "&TEXT({q}!K{tr},"0.#")'
+            f'&" × 100 = "&TEXT({q}!M{tr},"0.0")&"%",'
+            f'"  예) {ex_h} : 양호·취약으로 판정된 항목이 없어(A = 0) 보안수준 산정불가")')
         r += 1
     _line(r, "• 보안수준이 높을수록 식별된 취약점의 위험도 총량이 적은(안전한) 상태를 의미",
           Font(name=FONT_NAME, size=9, color="333333"))
+    r += 1
+    _line(r, "• 미판정(수동확인·점검불가) 항목은 A·B 에 반영되지 않으므로 판정 확정 전까지 보안수준은 잠정치이며, 건수는 통계 시트의 '미판정' 열에 표시",
+          Font(name=FONT_NAME, size=9, color="C0392B"), height=30)
 
     # ── 3. 취약점 제거 방안 ──
     r += 3
@@ -6783,7 +7253,9 @@ def _create_target_sheet(wb, hosts_info, all_results):
 
 def _create_security_stats_sheet(wb, all_results, criteria_items,
                                   hosts_info=None, category="server"):
-    """보안수준 통계 시트 — 레퍼런스 양식 매칭 (2단 병합 헤더, 차트, 장비별 섹션)"""
+    """보안수준 통계 시트 — 영역별/장비별 표(2단 병합 헤더), 차트
+    열: C 전체 D 점검 E 양호 F 취약 G N-A H 수동확인 I 점검불가 J 전체점수 K 취약점수 L 보안수준 M 미판정(수동확인+점검불가)
+    호스트 시트 통계표(D~N)와 한 칸씩 어긋난 같은 순서이며, 보안수준 평균은 산정 가능한 자산만 대상(산정불가 제외)"""
     ws = wb.create_sheet("보안수준 통계")
     ws.sheet_properties.tabColor = "1F3864"
 
@@ -6800,33 +7272,33 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
 
     col_widths = {"A": 12.5, "B": 13.0, "C": 9.5, "D": 13.0, "E": 13.0,
                   "F": 13.0, "G": 13.0, "H": 13.0, "I": 13.0, "J": 13.0,
-                  "K": 13.0, "L": 9.0}
+                  "K": 13.0, "L": 9.0, "M": 9.5}
     for col_letter, w in col_widths.items():
         ws.column_dimensions[col_letter].width = w
 
     # ════════════════════════════════════════════════════════════════
     # Section 1: 영역별 보안수준
     # ════════════════════════════════════════════════════════════════
-    ws.merge_cells("A1:K1")
+    ws.merge_cells("A1:M1")
     t1 = ws.cell(1, 1)
     t1.value = "■ 영역별/장비별 보안수준 통계"
     t1.font = Font(name=FONT_NAME, size=13, bold=True, color="1F3864")
     t1.alignment = lft
     ws.row_dimensions[1].height = 26
 
-    ws.merge_cells("A2:K2")
+    ws.merge_cells("A2:M2")
     c2 = ws.cell(2, 1)
     c2.value = "1) 영역별 보안수준"
     c2.font = sec_hdr_font
     c2.alignment = lft
     ws.row_dimensions[2].height = 17.25
 
-    ws.merge_cells("A3:K3")
+    ws.merge_cells("A3:M3")
     ws.row_dimensions[3].height = 4.5
 
     # 2단 헤더 — R4~R5 전체 셀에 fill/font/alignment 적용 후 merge
     for rr in (4, 5):
-        for ci in range(1, 12):
+        for ci in range(1, 14):
             c = ws.cell(rr, ci)
             c.fill = hdr_fill
             c.font = hdr_font
@@ -6835,24 +7307,28 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
     ws.merge_cells("A4:B5")
     ws.cell(4, 1).value = "구분"
 
-    ws.merge_cells("C4:H4")
+    ws.merge_cells("C4:I4")
     ws.cell(4, 3).value = "점검 결과"
 
-    ws.merge_cells("I4:K4")
-    ws.cell(4, 9).value = "점검 점수"
+    ws.merge_cells("J4:L4")
+    ws.cell(4, 10).value = "점검 점수"
+
+    ws.merge_cells("M4:M5")
+    ws.cell(4, 13).value = "미판정"
 
     sub_hdrs = {3: "전체항목", 4: "점검항목", 5: "양호", 6: "취약",
-                7: "N-A", 8: "수동확인", 9: "전체점수", 10: "취약점수", 11: "보안수준"}
+                7: "N-A", 8: "수동확인", 9: "점검불가", 10: "전체점수", 11: "취약점수", 12: "보안수준"}
     for ci, txt in sub_hdrs.items():
         ws.cell(5, ci).value = txt
     ws.row_dimensions[5].height = 14.25
-    _apply_border(ws, 4, 5, 1, 11)
+    _apply_border(ws, 4, 5, 1, 13)
 
     # 영역별 데이터 행 (R6~)
     area_data_start = 6
     r = 6
     host_refs = [_qsheet(_host_sheet_name(h)) for h in all_results.keys()]
-    host_stat_total_row = 13 + len(area_groups)
+    _lay = _detail_layout(area_groups)
+    host_stat_total_row = _lay["stat_total_row"]
 
 
     # 호스트 × 영역 참조 행렬(숨김 '통계_계산' 시트) → 영역별 합계/평균을 범위 함수로 계산
@@ -6866,10 +7342,10 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
         mat.cell(1, 1).value = "호스트명"
         for hi, hname in enumerate(all_results.keys()):
             mat.cell(2 + hi, 1).value = hname
-        src_rows = [13 + ai for ai in range(len(area_groups))] + [host_stat_total_row]
+        src_rows = [_lay["stat_start"] + ai for ai in range(len(area_groups))] + [host_stat_total_row]
         for bi, hrow in enumerate(src_rows):
-            for k, hc in enumerate("DEFGHIJKL"):
-                col = 2 + bi * 9 + k
+            for k, hc in enumerate("DEFGHIJKLMN"):
+                col = 2 + bi * 11 + k
                 mcol[(hrow, hc)] = get_column_letter(col)
                 mat.cell(1, col).value = f"{hc}{hrow}"
                 for hi, q in enumerate(host_refs):
@@ -6877,11 +7353,11 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
         mlast = 1 + len(host_refs)
 
     def _host_avg(host_row):
-        # 자산별 보안수준(Sn) 단순 평균 = (S1+…+SN)/N  (레퍼런스 산식)
+        # 자산별 보안수준(Sn) 단순 평균 = (S1+…+SN)/N — 산정불가(텍스트)는 AVERAGE 가 건너뜀, 전부 산정불가면 '산정불가'
         if not host_refs:
-            return 100
-        L = mcol[(host_row, "L")]
-        return f"=ROUND(AVERAGE({MQ}!${L}$2:${L}${mlast}),1)"
+            return "산정불가"
+        L = mcol[(host_row, "M")]
+        return f'=IFERROR(ROUND(AVERAGE({MQ}!${L}$2:${L}${mlast}),1),"산정불가")'
 
     def _cross_sum(host_col, host_row):
         if not host_refs:
@@ -6892,7 +7368,7 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
     for ai, (area_name, codes) in enumerate(area_groups):
 
         fill = FILL_ODD if (r - area_data_start) % 2 == 0 else FILL_EVEN
-        for ci in range(1, 12):
+        for ci in range(1, 14):
             c = ws.cell(r, ci)
             c.fill = fill
             c.font = data_font
@@ -6902,12 +7378,13 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
         ws.cell(r, 1).font = data_bold
         ws.cell(r, 2).font = data_bold
 
-        # 보안수준통계 C..J ↔ 호스트 D..K (각 호스트 시트 동일 행 합산)
-        vals = {ci: _cross_sum(get_column_letter(ci + 1), 13 + ai) for ci in range(3, 11)}
-        vals[11] = _host_avg(13 + ai)
+        # 보안수준통계 C..K ↔ 호스트 D..L (각 호스트 시트 동일 행 합산), L(보안수준) = 호스트 M 평균, M(미판정) = 호스트 N 합산
+        vals = {ci: _cross_sum(get_column_letter(ci + 1), _lay["stat_start"] + ai) for ci in range(3, 12)}
+        vals[12] = _host_avg(_lay["stat_start"] + ai)
+        vals[13] = _cross_sum("N", _lay["stat_start"] + ai)
         for ci, v in vals.items():
             ws.cell(r, ci).value = v
-            if ci == 11:
+            if ci == 12:
                 ws.cell(r, ci).number_format = '0.0"%"'
                 ws.cell(r, ci).font = data_bold
         ws.merge_cells(f"A{r}:B{r}")
@@ -6916,9 +7393,9 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
 
     # "계" 합계 행
     tot_vals = {ci: f"=SUM({get_column_letter(ci)}{area_data_start}:{get_column_letter(ci)}{area_data_end})"
-                for ci in range(3, 11)}
-    tot_vals[11] = _host_avg(host_stat_total_row)
-    for ci in range(1, 12):
+                for ci in list(range(3, 12)) + [13]}
+    tot_vals[12] = _host_avg(host_stat_total_row)
+    for ci in range(1, 14):
         c = ws.cell(r, ci)
         c.fill = FILL_SUMMARY
         c.font = data_bold
@@ -6927,7 +7404,7 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
     ws.cell(r, 1).value = "계"
     for ci, v in tot_vals.items():
         ws.cell(r, ci).value = v
-        if ci == 11:
+        if ci == 12:
             ws.cell(r, ci).number_format = '0.0"%"'
     ws.merge_cells(f"A{r}:B{r}")
     ws.cell(r, 2).border = THIN_BORDER
@@ -6936,16 +7413,17 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
     r += 1
 
     # ════════════════════════════════════════════════════════════════
-    # Section 2: 보안수준 그래프 — 레퍼런스 매칭 (전폭 바 차트 + 레이더)
+    # Section 2: 보안수준 그래프 (바 차트 + 레이더)
     # ════════════════════════════════════════════════════════════════
 
-    # 차트 데이터: 표 행 참조 수식 ("계" 행 포함, 레퍼런스 동일)
+    # 차트 데이터: 표 행 참조 수식 ("계" 행 포함). 산정불가(보안수준이 숫자가 아닌 영역)·점검항목 0 영역은 #N/A 로 두어
+    # 차트에서 값 없음(공백)으로 표시 — 100% 나 0% 로 찍히지 않게 한다 (숨김 차트 데이터 영역에만 사용)
     chart_areas = []
     for cr in list(range(area_data_start, area_data_end + 1)) + [totals_row]:
         label = ws.cell(cr, 1).value
         chart_areas.append((label,
-                            f"=IF(D{cr}=0,0,ROUND(E{cr}/D{cr}*100,1))",
-                            f"=K{cr}", f"=E{cr}", f"=F{cr}"))
+                            f"=IF(D{cr}=0,NA(),ROUND(E{cr}/D{cr}*100,1))",
+                            f"=IF(ISNUMBER(L{cr}),L{cr},NA())", f"=E{cr}", f"=F{cr}"))
 
     if chart_areas:
         n = len(chart_areas)
@@ -6977,7 +7455,7 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
         cats_ref = Reference(ws, min_col=1, min_row=cdr + 1, max_row=cdr + n)
         str_cat = AxDataSource(strRef=ChartStrRef(f=f"'{sn}'!$A${cdr+1}:$A${cdr+n}"))
 
-        # ── 1) BarChart: 영역별 보안수준(%) — 레퍼런스 메인 차트 ──
+        # ── 1) BarChart: 영역별 보안수준(%) ──
         group_label = CAT_LABEL.get(category, category)
         bar = BarChart()
         bar.type = "col"
@@ -7071,7 +7549,7 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
     # Section 3: ▣ 장비별 보안수준
     # ════════════════════════════════════════════════════════════════
     r += 1
-    ws.merge_cells(f"A{r}:K{r}")
+    ws.merge_cells(f"A{r}:M{r}")
     hb = ws.cell(r, 1)
     hb.value = "2) 장비별 보안수준"
     hb.font = sec_hdr_font
@@ -7079,7 +7557,7 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
     ws.row_dimensions[r].height = 17.25
     r += 1
 
-    ws.merge_cells(f"A{r}:K{r}")
+    ws.merge_cells(f"A{r}:M{r}")
     ws.row_dimensions[r].height = 4.5
     r += 1
 
@@ -7087,7 +7565,7 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
     hdr_r1 = r
     hdr_r2 = r + 1
     for rr in (hdr_r1, hdr_r2):
-        for ci in range(1, 12):
+        for ci in range(1, 14):
             c = ws.cell(rr, ci)
             c.fill = hdr_fill
             c.font = hdr_font
@@ -7097,11 +7575,14 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
     ws.merge_cells(f"A{hdr_r1}:B{hdr_r2}")
     ws.cell(hdr_r1, 1).value = "Host 명"
 
-    ws.merge_cells(f"C{hdr_r1}:H{hdr_r1}")
+    ws.merge_cells(f"C{hdr_r1}:I{hdr_r1}")
     ws.cell(hdr_r1, 3).value = "점검 결과"
 
-    ws.merge_cells(f"I{hdr_r1}:K{hdr_r1}")
-    ws.cell(hdr_r1, 9).value = "점검 점수"
+    ws.merge_cells(f"J{hdr_r1}:L{hdr_r1}")
+    ws.cell(hdr_r1, 10).value = "점검 점수"
+
+    ws.merge_cells(f"M{hdr_r1}:M{hdr_r2}")
+    ws.cell(hdr_r1, 13).value = "미판정"
 
     for ci, txt in sub_hdrs.items():
         ws.cell(hdr_r2, ci).value = txt
@@ -7120,7 +7601,7 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
         hq = host_refs[idx]
 
         fill = FILL_ODD if idx % 2 == 0 else FILL_EVEN
-        for ci in range(1, 12):
+        for ci in range(1, 14):
             c = ws.cell(r, ci)
             c.fill = fill
             c.font = data_font
@@ -7131,10 +7612,10 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
         ws.cell(r, 2).value = hostname
         ws.cell(r, 2).font = data_bold
 
-        vals = {ci: f"={hq}!{get_column_letter(ci + 1)}{host_stat_total_row}" for ci in range(3, 12)}
+        vals = {ci: f"={hq}!{get_column_letter(ci + 1)}{host_stat_total_row}" for ci in range(3, 14)}
         for ci, v in vals.items():
             ws.cell(r, ci).value = v
-            if ci == 11:
+            if ci == 12:
                 ws.cell(r, ci).number_format = '0.0"%"'
                 ws.cell(r, ci).font = data_bold
         r += 1
@@ -7150,29 +7631,29 @@ def _create_security_stats_sheet(wb, all_results, criteria_items,
     grp.alignment = ctr
 
     # "계" 합계 행 — fill/border 먼저, merge 나중
-    for ci in range(1, 12):
+    for ci in range(1, 14):
         c = ws.cell(r, ci)
         c.fill = FILL_SUMMARY
         c.font = data_bold
         c.alignment = ctr
         c.border = THIN_BORDER
     ws.cell(r, 1).value = "계"
-    for ci in range(3, 11):
+    for ci in list(range(3, 12)) + [13]:
         L = get_column_letter(ci)
         ws.cell(r, ci).value = f"=SUM({L}{host_data_start}:{L}{host_data_end})"
-    ws.cell(r, 11).value = f"=ROUND(AVERAGE(K{host_data_start}:K{host_data_end}),1)"
-    ws.cell(r, 11).number_format = '0.0"%"'
+    ws.cell(r, 12).value = f'=IFERROR(ROUND(AVERAGE(L{host_data_start}:L{host_data_end}),1),"산정불가")'
+    ws.cell(r, 12).number_format = '0.0"%"'
     ws.merge_cells(f"A{r}:B{r}")
     ws.cell(r, 2).border = THIN_BORDER
     ws.row_dimensions[r].height = 14.25
 
-    ws.merge_cells(f"A{r + 1}:K{r + 1}")
-    ws.cell(r + 1, 1).value = (f'=IF(H{r}>0,"※ 수동확인 "&H{r}&"건 미판정 — 판정 확정 전까지 보안수준은 잠정치'
-                               f' (수동확인 항목은 전체점수에만 반영)","")')
+    ws.merge_cells(f"A{r + 1}:M{r + 1}")
+    ws.cell(r + 1, 1).value = (f'=IF(M{r}>0,"※ 미판정 "&M{r}&"건(수동확인 "&H{r}&" · 점검불가 "&I{r}&") — 보안수준 산정(전체점수·취약점수)에서 제외, 판정 확정 전까지 잠정치","")'
+                               f'&IF(COUNTIF(L{host_data_start}:L{host_data_end},"산정불가")>0,"  ※ 산정불가 "&COUNTIF(L{host_data_start}:L{host_data_end},"산정불가")&"대: 양호·취약 판정 항목이 없어 평균에서 제외","")')
     ws.cell(r + 1, 1).font = Font(name=FONT_NAME, size=8, color="C0392B")
     ws.cell(r + 1, 1).alignment = Alignment(horizontal="left", vertical="center")
     # 인쇄: 표·차트 영역만(하단 숨김 차트 데이터 제외), 가로·폭 맞춤
-    ws.print_area = f"A1:K{r + 1}"
+    ws.print_area = f"A1:M{r + 1}"
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
@@ -7188,13 +7669,14 @@ def _create_summary_stats_sheet(wb, all_results, criteria_items):
     area_groups = _group_by_control_area(criteria_items)
     hostnames = list(all_results.keys())
 
-    # 고정 열: 분류/항목코드/점검항목/위험도/위험도값/전체항목/점검항목/양호/취약/N-A/수동확인
+    # 고정 열: 분류/항목코드/점검항목/위험도/위험도값/전체항목/점검항목/양호/취약/N-A/수동확인/점검불가 (호스트 열은 M 부터)
     fixed_hdrs = ["분류", "항목코드", "점검항목", "위험도", "위험도값",
-                  "전체", "점검", "양호", "취약", "N-A", "수동확인"]
-    fixed_widths = [15, 12, 35, 7, 9, 7, 7, 7, 7, 7, 9]
+                  "전체", "점검", "양호", "취약", "N-A", "수동확인", "점검불가"]
+    fixed_widths = [15, 12, 35, 7, 9, 7, 7, 7, 7, 7, 9, 9]
+    NF = len(fixed_hdrs)
 
     r = 2
-    ws.merge_cells(f"A{r}:{get_column_letter(11 + len(hostnames))}{r}")
+    ws.merge_cells(f"A{r}:{get_column_letter(NF + max(len(hostnames), 1))}{r}")
     ws.cell(r, 1).value = "▣ 요약 통계"
     ws.cell(r, 1).font = FONT_SECTION
     ws.row_dimensions[r].height = 22
@@ -7208,7 +7690,7 @@ def _create_summary_stats_sheet(wb, all_results, criteria_items):
         c.alignment = ctr
         ws.column_dimensions[get_column_letter(ci)].width = w
     for hi, hname in enumerate(hostnames):
-        ci = 12 + hi
+        ci = NF + 1 + hi
         c = ws.cell(hdr_row, ci)
         c.value = hname
         c.hyperlink = _sheet_link(hname)
@@ -7218,7 +7700,7 @@ def _create_summary_stats_sheet(wb, all_results, criteria_items):
         ws.column_dimensions[get_column_letter(ci)].width = 12
     if hostnames:
         ws.row_dimensions[hdr_row].height = 45 if max(len(h) for h in hostnames) > 12 else 22
-    total_cols = 11 + len(hostnames)
+    total_cols = NF + len(hostnames)
     _apply_border(ws, hdr_row, hdr_row, 1, total_cols)
 
     # 호스트 시트 O열 참조 수식 → 호스트 시트 수정 시 즉시 반영
@@ -7235,12 +7717,12 @@ def _create_summary_stats_sheet(wb, all_results, criteria_items):
             hrow = host_first + idx
             idx += 1
             r = data_row
-            hr = f"$L{r}:${last_col}{r}"
+            hr = f"$M{r}:${last_col}{r}"
             risk_disp = _risk_grade(item)
             vals = [area_name, code, item.get("name", ""), risk_disp, score,
                     len(hostnames), f"=F{r}-J{r}",
                     f'=COUNTIF({hr},"{RESULT_GOOD}")', f'=COUNTIF({hr},"{RESULT_BAD}")',
-                    f'=COUNTIF({hr},"{RESULT_NA}")', f"=F{r}-H{r}-I{r}-J{r}"]
+                    f'=COUNTIF({hr},"{RESULT_NA}")', f"=F{r}-H{r}-I{r}-J{r}-L{r}", f'=COUNTIF({hr},"{RESULT_UNABLE}")']
             fill = FILL_ODD if (data_row - hdr_row) % 2 else FILL_EVEN
             for ci, v in enumerate(vals, 1):
                 c = ws.cell(data_row, ci)
@@ -7249,7 +7731,7 @@ def _create_summary_stats_sheet(wb, all_results, criteria_items):
                 c.font = FONT_DATA
                 c.alignment = ctr
             for hi, q in enumerate(host_refs):
-                c = ws.cell(data_row, 12 + hi)
+                c = ws.cell(data_row, NF + 1 + hi)
                 c.value = f'=IF({q}!O{hrow}="","",{q}!O{hrow})'
                 c.fill = fill
                 c.font = FONT_DATA
@@ -7261,22 +7743,22 @@ def _create_summary_stats_sheet(wb, all_results, criteria_items):
 
     first, last = hdr_row + 1, data_row - 1
     if last >= first:
-        h_rng = f"L{first}:{last_col}{last}"
+        h_rng = f"M{first}:{last_col}{last}"
         for val, fnt in RESULT_FONT.items():
             ws.conditional_formatting.add(
-                h_rng, FormulaRule(formula=[f'L{first}="{val}"'],
+                h_rng, FormulaRule(formula=[f'M{first}="{val}"'],
                                    font=_cf_font(fnt.color, fnt.bold),
-                                   fill=FILL_VULN_ROW if val == RESULT_BAD else None))
+                                   fill=DXF_VULN_ROW if val == RESULT_BAD else (DXF_UNABLE if val == RESULT_UNABLE else None)))
         ws.conditional_formatting.add(
             f"I{first}:I{last}",
-            FormulaRule(formula=[f"$I{first}>0"], fill=FILL_VULN_ROW,
+            FormulaRule(formula=[f"$I{first}>0"], fill=DXF_VULN_ROW,
                         font=_cf_font(FONT_BAD.color, True)))
         ws.conditional_formatting.add(
-            f"A{first}:K{last}",
-            FormulaRule(formula=[f"$I{first}>0"], fill=FILL_VULN_ROW))
+            f"A{first}:L{last}",
+            FormulaRule(formula=[f"$I{first}>0"], fill=DXF_VULN_ROW))
         ws.auto_filter.ref = f"A{hdr_row}:{last_col}{last}"
         ws.print_area = f"A1:{last_col}{last}"
-    ws.freeze_panes = "L5"
+    ws.freeze_panes = "M5"
     # 인쇄: 가로, 머리글 행·항목 열 반복 (호스트 10대 이하는 폭 맞춤)
     ws.print_title_rows = f"{hdr_row}:{hdr_row}"
     ws.print_title_cols = "A:C"
@@ -7288,8 +7770,8 @@ def _create_summary_stats_sheet(wb, all_results, criteria_items):
 
 
 def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_info,
-                         target_row=None):
-    """호스트별 상세 시트 (레퍼런스 양식: 17열 A-Q)"""
+                         target_row=None, evd_rows=None):
+    """호스트별 상세 시트 (17열 A-Q).  evd_rows: {항목코드: '증적 원문' 시트 행} — 항목코드 칸에 증적 시트 링크를 건다"""
     sheet_name = _host_sheet_name(hostname)
     ws = wb.create_sheet(sheet_name)
     ws.sheet_properties.tabColor = "1F3864"
@@ -7355,29 +7837,47 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
     _apply_border(ws, 7, 7, 1, 12)
     ws.row_dimensions[7].height = 18
 
-    # ── R9: 영역별 점검 결과 ──
-    ws.merge_cells("A9:O9")
-    ws.cell(9, 1).value = "▣ 영역별 점검 결과"
-    ws.cell(9, 1).font = FONT_SECTION
-    ws.row_dimensions[9].height = 22
+    # R8: 실행 계정 / 클라우드 (결과 파일 헤더 '# 실행 계정:' '# 클라우드:'), R9: DBMS 환경 / 실행 호스트
+    for rr, (l1, k1, l2, k2) in ((8, ("실행 계정", "run_user", "클라우드", "cloud")), (9, ("DBMS 환경", "dbms_env", "실행 호스트", "run_host"))):
+        ws.merge_cells(f"A{rr}:B{rr}"); ws.merge_cells(f"C{rr}:F{rr}")
+        ws.merge_cells(f"G{rr}:H{rr}"); ws.merge_cells(f"I{rr}:L{rr}")
+        for col, lab, key in ((1, l1, k1), (7, l2, k2)):
+            c = ws.cell(rr, col)
+            c.value = lab
+            c.fill = FILL_LIGHT_BLUE; c.font = FONT_LABEL; c.alignment = ctr
+            v = ws.cell(rr, col + 2)
+            v.value = host_info.get(key, "") or ("" if rr == 9 and not host_info.get(key) else "미확인")
+            v.font = FONT_DATA; v.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        _apply_border(ws, rr, rr, 1, 12)
+        ws.row_dimensions[rr].height = 30 if len(str(host_info.get("cloud", ""))) > 40 else 18
+    if not (host_info.get("dbms_env") or host_info.get("run_host")):   # DBMS 가 아니면 9행은 숨김
+        ws.row_dimensions[9].hidden = True
+
+    # ── R10: 영역별 점검 결과 ──
+    ws.merge_cells("A10:O10")
+    ws.cell(10, 1).value = "▣ 영역별 점검 결과"
+    ws.cell(10, 1).font = FONT_SECTION
+    ws.row_dimensions[10].height = 22
 
     area_groups = _group_by_control_area(criteria_items)
 
-    # 통계 헤더 (2행)
-    ws.merge_cells("A11:C12"); ws.merge_cells("D11:I11"); ws.merge_cells("J11:L11")
-    ws.cell(11, 1).value = "분류"
-    ws.cell(11, 1).fill = FILL_SUBHEADER; ws.cell(11, 1).font = FONT_HEADER; ws.cell(11, 1).alignment = ctr
-    ws.cell(11, 4).value = "항목 통계"
-    ws.cell(11, 4).fill = FILL_SUBHEADER; ws.cell(11, 4).font = FONT_HEADER; ws.cell(11, 4).alignment = ctr
-    ws.cell(11, 10).value = "점검 점수"
-    ws.cell(11, 10).fill = FILL_SUBHEADER; ws.cell(11, 10).font = FONT_HEADER; ws.cell(11, 10).alignment = ctr
+    # 통계 헤더 (2행): 항목 통계 D~J(7열: 전체·점검·양호·취약·N-A·수동확인·점검불가), 점검 점수 K~M, 미판정 N
+    ws.merge_cells("A12:C13"); ws.merge_cells("D12:J12"); ws.merge_cells("K12:M12"); ws.merge_cells("N12:N13")
+    ws.cell(12, 1).value = "분류"
+    ws.cell(12, 1).fill = FILL_SUBHEADER; ws.cell(12, 1).font = FONT_HEADER; ws.cell(12, 1).alignment = ctr
+    ws.cell(12, 4).value = "항목 통계"
+    ws.cell(12, 4).fill = FILL_SUBHEADER; ws.cell(12, 4).font = FONT_HEADER; ws.cell(12, 4).alignment = ctr
+    ws.cell(12, 11).value = "점검 점수"
+    ws.cell(12, 11).fill = FILL_SUBHEADER; ws.cell(12, 11).font = FONT_HEADER; ws.cell(12, 11).alignment = ctr
+    ws.cell(12, 14).value = "미판정"
+    ws.cell(12, 14).fill = FILL_SUBHEADER; ws.cell(12, 14).font = FONT_HEADER; ws.cell(12, 14).alignment = ctr
 
-    stat_sub_hdrs = ["전체", "점검", "양호", "취약", "N-A", "수동확인", "전체점수", "취약점수", "보안수준"]
+    stat_sub_hdrs = ["전체", "점검", "양호", "취약", "N-A", "수동확인", "점검불가", "전체점수", "취약점수", "보안수준"]
     for ci, hdr in enumerate(stat_sub_hdrs, 4):
-        c = ws.cell(12, ci)
+        c = ws.cell(13, ci)
         c.value = hdr
         c.fill = FILL_SUBHEADER; c.font = FONT_HEADER; c.alignment = ctr
-    _apply_border(ws, 11, 12, 1, 12)
+    _apply_border(ws, 12, 13, 1, 14)
 
     # 영역별 데이터 행 (수식: 상세 영역 O/M열 참조 → 점검결과 수동 변경 시 즉시 반영)
     layout = _detail_layout(area_groups)
@@ -7392,24 +7892,27 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
         O = f"$O${s}:$O${e}"
         M = f"$M${s}:$M${e}"
         rr = stat_row
+        # 전체점수 A = 양호+취약 위험도값 합 (수동확인·점검불가·N-A 제외), 취약점수 B = 취약 합, 보안수준 = A=0 이면 '산정불가'
         stat_vals = [
-            f"=ROWS({O})",
-            f"=D{rr}-H{rr}",
-            f'=COUNTIF({O},"{RESULT_GOOD}")',
-            f'=COUNTIF({O},"{RESULT_BAD}")',
-            f'=COUNTIF({O},"{RESULT_NA}")',
-            f"=D{rr}-F{rr}-G{rr}-H{rr}",
-            f'=SUMPRODUCT(({O}<>"{RESULT_NA}")*{M})',
-            f'=SUMPRODUCT(({O}="{RESULT_BAD}")*{M})',
-            f"=IF(J{rr}=0,100,ROUND((J{rr}-K{rr})/J{rr}*100,1))",
+            f"=ROWS({O})",                                               # D 전체
+            f"=D{rr}-H{rr}",                                             # E 점검 (N-A 제외)
+            f'=COUNTIF({O},"{RESULT_GOOD}")',                            # F 양호
+            f'=COUNTIF({O},"{RESULT_BAD}")',                             # G 취약
+            f'=COUNTIF({O},"{RESULT_NA}")',                              # H N-A
+            f'=COUNTIF({O},"{RESULT_MANUAL}")',                          # I 수동확인
+            f'=COUNTIF({O},"{RESULT_UNABLE}")',                          # J 점검불가
+            f'=SUMPRODUCT((({O}="{RESULT_GOOD}")+({O}="{RESULT_BAD}"))*{M})',   # K 전체점수 A
+            f'=SUMPRODUCT(({O}="{RESULT_BAD}")*{M})',                    # L 취약점수 B
+            f'=IF(K{rr}=0,"산정불가",ROUND((K{rr}-L{rr})/K{rr}*100,1))',   # M 보안수준
+            f"=I{rr}+J{rr}",                                             # N 미판정
         ]
         for ci, v in enumerate(stat_vals, 4):
             c = ws.cell(stat_row, ci)
             c.value = v
             c.font = FONT_DATA; c.alignment = ctr
-            if ci == 12:
+            if ci == 13:
                 c.number_format = '0.0"%"'
-        _apply_border(ws, stat_row, stat_row, 1, 12)
+        _apply_border(ws, stat_row, stat_row, 1, 14)
         stat_row += 1
     stat_data_end = stat_row - 1
 
@@ -7421,19 +7924,20 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
     ws.cell(stat_row, 1).alignment = ctr
     tr = stat_row
     tot_vals = [f"=SUM({get_column_letter(ci)}{stat_data_start}:{get_column_letter(ci)}{stat_data_end})"
-                for ci in range(4, 12)]
-    tot_vals.append(f"=IF(J{tr}=0,100,ROUND((J{tr}-K{tr})/J{tr}*100,1))")
+                for ci in range(4, 13)]
+    tot_vals.append(f'=IF(K{tr}=0,"산정불가",ROUND((K{tr}-L{tr})/K{tr}*100,1))')
+    tot_vals.append(f"=I{tr}+J{tr}")
     for ci, v in enumerate(tot_vals, 4):
         c = ws.cell(stat_row, ci)
         c.value = v
         c.fill = FILL_SUMMARY
         c.font = Font(name=FONT_NAME, size=9, bold=True, color="333333")
         c.alignment = ctr
-        if ci == 12:
+        if ci == 13:
             c.number_format = '0.0"%"'
-    _apply_border(ws, stat_row, stat_row, 1, 12)
-    ws.merge_cells(f"A{stat_row + 1}:L{stat_row + 1}")
-    ws.cell(stat_row + 1, 1).value = (f'=IF(I{tr}>0,"※ 수동확인 "&I{tr}&"건 미판정 — 판정 확정 전까지 보안수준은 잠정치","")')
+    _apply_border(ws, stat_row, stat_row, 1, 14)
+    ws.merge_cells(f"A{stat_row + 1}:N{stat_row + 1}")
+    ws.cell(stat_row + 1, 1).value = (f'=IF(N{tr}>0,"※ 미판정 "&N{tr}&"건(수동확인 "&I{tr}&" · 점검불가 "&J{tr}&") — 보안수준 산정에서 제외, 판정 확정 전까지 잠정치","")')
     ws.cell(stat_row + 1, 1).font = Font(name=FONT_NAME, size=8, color="C0392B")
     ws.cell(stat_row + 1, 1).alignment = Alignment(horizontal="left", vertical="center")
 
@@ -7466,7 +7970,12 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
         radar.style = 10
         radar.width = 9.5
         radar.height = 6.4
-        sec_ref = Reference(ws, min_col=12, min_row=stat_data_start - 1, max_row=stat_data_end)
+        # 보안수준이 '산정불가'(텍스트)인 영역은 레이더에 0/100 으로 찍히지 않도록 숨김 보조 열(U)에 #N/A 로 둔다
+        ws.cell(stat_data_start - 1, 21).value = "보안수준"
+        for _rr in range(stat_data_start, stat_data_end + 1):
+            ws.cell(_rr, 21).value = f"=IF(ISNUMBER(M{_rr}),M{_rr},NA())"
+        ws.column_dimensions["U"].hidden = True
+        sec_ref = Reference(ws, min_col=21, min_row=stat_data_start - 1, max_row=stat_data_end)
         radar.add_data(sec_ref, titles_from_data=True)
         radar.set_categories(cats_ref)
         for _s in radar.series:
@@ -7492,7 +8001,7 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
         from openpyxl.drawing.xdr import XDRPositiveSize2D as _Ext
         from openpyxl.utils.units import cm_to_EMU
         radar.anchor = OneCellAnchor(
-            _from=_AM(col=12, colOff=146050, row=5, rowOff=107950),
+            _from=_AM(col=14, colOff=146050, row=5, rowOff=107950),
             ext=_Ext(cx=cm_to_EMU(9.5), cy=cm_to_EMU(6.4)))
         ws._charts.append(radar)
 
@@ -7504,7 +8013,7 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
     ws.row_dimensions[detail_start].height = 22
 
     ws.merge_cells(f"P{detail_start}:Q{detail_start}")
-    ws.cell(detail_start, 16).value = "(양호, 취약, N-A, 수동확인)"
+    ws.cell(detail_start, 16).value = "(양호, 취약, N-A, 수동확인, 점검불가)"
     ws.cell(detail_start, 16).font = Font(name=FONT_NAME, size=8, color="666666")
     ws.cell(detail_start, 16).alignment = Alignment(horizontal="right", vertical="center")
 
@@ -7540,17 +8049,23 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
 
             # 조치방안
             fix_text = _fix_text_for(item, detected_sub)
-            if item.get("guide") and result_val in (RESULT_BAD, RESULT_MANUAL):   # 주요정보: 대상 환경별 조치 명령
+            if item.get("guide") and result_val in (RESULT_BAD, RESULT_MANUAL, RESULT_UNABLE):   # 주요정보: 대상 환경별 조치 명령
                 cmd = _kisa_cmd_block(code, _kisa_env(detected_sub, host_info))
                 if cmd:
                     fix_text = f"{fix_text}\n{cmd}" if fix_text else cmd
 
             row_fill = FILL_ODD if (data_row - hdr_row) % 2 else FILL_EVEN
 
-            # C: 항목코드
+            # C: 항목코드 (증적이 있으면 '증적 원문' 시트의 해당 행으로 링크)
             ws.cell(data_row, 3).value = code
             ws.cell(data_row, 3).font = Font(name=FONT_NAME, size=10, bold=True)
             ws.cell(data_row, 3).alignment = ctr
+            if evd_rows and evd_rows.get(code):
+                try:
+                    ws.cell(data_row, 3).hyperlink = f"#{_qsheet(EVIDENCE_SHEET)}!A{evd_rows[code]}"
+                    ws.cell(data_row, 3).font = Font(name=FONT_NAME, size=10, bold=True, color="0563C1", underline="single")
+                except Exception:
+                    pass
 
             # D-K: 항목명 (merge D:K)
             ws.merge_cells(f"D{data_row}:K{data_row}")
@@ -7577,7 +8092,7 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
 
             # N: 점검결과값
             ws.cell(data_row, 14).value = (
-                f'=IF(OR(O{data_row}="{RESULT_NA}",O{data_row}="{RESULT_MANUAL}"),"-",'
+                f'=IF(OR(O{data_row}="{RESULT_NA}",O{data_row}="{RESULT_MANUAL}",O{data_row}="{RESULT_UNABLE}"),"-",'
                 f'IF(O{data_row}="{RESULT_BAD}",M{data_row},0))')
             ws.cell(data_row, 14).font = FONT_DATA; ws.cell(data_row, 14).alignment = ctr
 
@@ -7627,28 +8142,27 @@ def _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, host_i
         f"P{first}:P{last}",
         FormulaRule(formula=[f'AND($S{first}<>"",$O{first}<>$S{first})'],
                     fill=PatternFill("solid", start_color="FCE4D6", end_color="FCE4D6")))
-    # 양호/취약/N-A/수동확인 외 값(공란·붙여넣기 오입력) 노란 배경
+    # 양호/취약/N-A/수동확인/점검불가 외 값(공란·붙여넣기 오입력) 노란 배경
     ws.conditional_formatting.add(
         f"O{first}:O{last}",
         FormulaRule(formula=[f'AND($O{first}<>"{RESULT_GOOD}",$O{first}<>"{RESULT_BAD}",'
-                             f'$O{first}<>"{RESULT_NA}",$O{first}<>"{RESULT_MANUAL}")'],
+                             f'$O{first}<>"{RESULT_NA}",$O{first}<>"{RESULT_MANUAL}",$O{first}<>"{RESULT_UNABLE}")'],
                     fill=PatternFill("solid", start_color="FFFF00", end_color="FFFF00")))
     _add_result_cf(ws, first, last)
     ws.column_dimensions["S"].hidden = True
     O_rng, S_rng = f"$O${first}:$O${last}", f"$S${first}:$S${last}"
     _tr = layout["stat_total_row"]
+    _misc = (f'(ROWS({O_rng})-COUNTIF({O_rng},"{RESULT_GOOD}")-COUNTIF({O_rng},"{RESULT_BAD}")'
+             f'-COUNTIF({O_rng},"{RESULT_NA}")-COUNTIF({O_rng},"{RESULT_MANUAL}")-COUNTIF({O_rng},"{RESULT_UNABLE}"))')
     ws.cell(_tr + 1, 1).value = (
-        f'=IF(I{_tr}>0,"※ 수동확인 "&I{_tr}&"건 미판정 — 판정 확정 전까지 보안수준은 잠정치'
-        f'"&IF(ROWS({O_rng})-COUNTIF({O_rng},"{RESULT_GOOD}")-COUNTIF({O_rng},"{RESULT_BAD}")'
-        f'-COUNTIF({O_rng},"{RESULT_NA}")-COUNTIF({O_rng},"{RESULT_MANUAL}")>0," (미입력·오입력 "&'
-        f'(ROWS({O_rng})-COUNTIF({O_rng},"{RESULT_GOOD}")-COUNTIF({O_rng},"{RESULT_BAD}")'
-        f'-COUNTIF({O_rng},"{RESULT_NA}")-COUNTIF({O_rng},"{RESULT_MANUAL}"))&"건 포함)",""),"")'
+        f'=IF(N{_tr}>0,"※ 미판정 "&N{_tr}&"건(수동확인 "&I{_tr}&" · 점검불가 "&J{_tr}&") — 보안수준 산정에서 제외, 판정 확정 전까지 잠정치"'
+        f'&IF({_misc}>0," (미입력·오입력 "&{_misc}&"건 포함)",""),"")'
         f'&IF(SUMPRODUCT(--({O_rng}<>{S_rng}))>0,"  ※ 판정 변경 "&SUMPRODUCT(--({O_rng}<>{S_rng}))'
         f'&"건 — 현황 및 문제점 문구 검토 (주황 표시)","")')
     dv = DataValidation(type="list", allow_blank=False, showErrorMessage=True,
-                        formula1=f'"{RESULT_GOOD},{RESULT_BAD},{RESULT_NA},{RESULT_MANUAL}"',
+                        formula1=f'"{",".join(ALL_RESULTS)}"',
                         errorTitle="점검결과 입력 오류",
-                        error="양호 / 취약 / N-A / 수동확인 중에서 선택하세요.")
+                        error="양호 / 취약 / N-A / 수동확인 / 점검불가 중에서 선택하세요.")
     dv.add(f"O{first}:O{last}")
     ws.add_data_validation(dv)
     ws.column_dimensions["R"].hidden = True
@@ -7697,7 +8211,8 @@ def _create_vuln_list_sheet(wb, all_results, criteria_items):
                 calc.cell(cr, 4).value = item.get("name", "")
                 calc.cell(cr, 5).value = risk_disp
                 calc.cell(cr, 6).value = f'=IF({q}!O{hrow}="","",{q}!O{hrow})'
-                calc.cell(cr, 7).value = f'=IF(F{cr}="{RESULT_BAD}",COUNTIF($F$2:F{cr},"{RESULT_BAD}"),"")'
+                calc.cell(cr, 10).value = f'=IF(F{cr}="{RESULT_BAD}",1,0)+N(J{cr - 1})'   # 취약 누적 개수 (O(n) — 행마다 COUNTIF 범위를 늘리지 않음)
+                calc.cell(cr, 7).value = f'=IF(F{cr}="{RESULT_BAD}",J{cr},"")'
                 calc.cell(cr, 8).value = f'=IF({q}!P{hrow}="","",{q}!P{hrow})'
                 calc.cell(cr, 9).value = f'=IF({q}!Q{hrow}="","",{q}!Q{hrow})'
                 cr += 1
@@ -7729,8 +8244,11 @@ def _create_vuln_list_sheet(wb, all_results, criteria_items):
 
     link_font = Font(name=FONT_NAME, size=9, color="0563C1", underline="single")
     first = hdr_row + 1
-    last = hdr_row + max(n_rows, 1)
-    for k in range(1, max(n_rows, 1) + 1):
+    # 목록 행 수: 호스트·항목이 많으면(수천 행) 모든 항목 수만큼 MATCH 를 두면 계산이 매우 느려지므로 현재 취약 건수 + 여유 행만 둔다
+    n_bad0 = sum(1 for h in all_results for c in criteria_items if (all_results[h][0].get(c) or ("", ""))[0] == RESULT_BAD)
+    list_rows = n_rows if n_rows <= 3000 else min(n_rows, n_bad0 + max(300, n_bad0 // 2))
+    last = hdr_row + max(list_rows, 1)
+    for k in range(1, max(list_rows, 1) + 1):
         r = hdr_row + k
         ws.cell(r, 10).value = f"=IFERROR(MATCH({k},{CQ}!$G$2:$G${calc_last},0)+1,\"\")"
 
@@ -7769,7 +8287,7 @@ def _create_vuln_list_sheet(wb, all_results, criteria_items):
     n_bad = sum(1 for h in all_results
                 for code in criteria_items
                 if (all_results[h][0].get(code) or ("", ""))[0] == RESULT_BAD)
-    for k in range(n_bad + 1, max(n_rows, 1) + 1):
+    for k in range(n_bad + 1, max(list_rows, 1) + 1):
         ws.row_dimensions[hdr_row + k].hidden = True
     # (필터 조건 '비어 있지 않음' 은 LibreOffice 저장 시 손상되어 미사용 — 행 숨김만 적용)
     ws.auto_filter.ref = f"A{hdr_row}:H{last}"
@@ -7791,7 +8309,7 @@ REVIEW_SHEET = "검토·수정"
 
 
 def _create_review_sheet(wb, all_results, criteria_items):
-    """검토·수정 시트 — 생성 시점 취약·수동확인 항목을 한곳에 모아 최종 판정·현황을 수정
+    """검토·수정 시트 — 생성 시점 취약·수동확인·점검불가 항목을 한곳에 모아 최종 판정·현황을 수정
     - 이 시트의 '최종 판정'·'현황 및 문제점'이 호스트 시트 점검결과(O)·현황(P)의 원본이 됨(호스트 시트는 수식으로 참조)
       → 수정 즉시 호스트 시트·영역별 통계·보안수준 통계·요약 통계·취약점 목록에 반영
     - 양호·N-A 로 생성된 항목은 기존처럼 호스트 시트에서 직접 수정 (취약으로 바꾸면 취약점 목록에 자동 추가)"""
@@ -7818,11 +8336,11 @@ def _create_review_sheet(wb, all_results, criteria_items):
                 hrow = host_first + idx
                 idx += 1
                 rv, why = res.get(code) or ("", "")
-                if rv in (RESULT_BAD, RESULT_MANUAL):
+                if rv in (RESULT_BAD, RESULT_MANUAL, RESULT_UNABLE):
                     rows.append((hostname, hrow, code, rv, why or ""))
 
     ws.merge_cells("A2:G2")
-    ws.cell(2, 1).value = "▣ 검토·수정 (취약·수동확인 항목)"
+    ws.cell(2, 1).value = "▣ 검토·수정 (취약·수동확인·점검불가 항목)"
     ws.cell(2, 1).font = FONT_SECTION
     ws.row_dimensions[2].height = 22
     ws.merge_cells("A3:K3")
@@ -7836,7 +8354,7 @@ def _create_review_sheet(wb, all_results, criteria_items):
     last = hdr + max(len(rows), 1)
     G_rng, F_rng = f"$G${hdr + 1}:$G${last}", f"$F${hdr + 1}:$F${last}"
     ws.cell(2, 8).value = (f'="대상 {len(rows)}건 / 현재 취약 "&COUNTIF({G_rng},"{RESULT_BAD}")&" · 수동확인 "&COUNTIF({G_rng},"{RESULT_MANUAL}")'
-                           f'&" · 양호 "&COUNTIF({G_rng},"{RESULT_GOOD}")&" · N-A "&COUNTIF({G_rng},"{RESULT_NA}")'
+                           f'&" · 점검불가 "&COUNTIF({G_rng},"{RESULT_UNABLE}")&" · 양호 "&COUNTIF({G_rng},"{RESULT_GOOD}")&" · N-A "&COUNTIF({G_rng},"{RESULT_NA}")'
                            f'&" (판정 변경 "&SUMPRODUCT(--({G_rng}<>{F_rng}))&"건)"')
     ws.cell(2, 8).font = Font(name=FONT_NAME, size=9, bold=True, color="C0392B")
     ws.cell(2, 8).alignment = Alignment(horizontal="right", vertical="center")
@@ -7856,7 +8374,6 @@ def _create_review_sheet(wb, all_results, criteria_items):
 
     link_font = Font(name=FONT_NAME, size=9, color="0563C1", underline="single")
     edit_fill = PatternFill("solid", fgColor="FFF2CC")
-    linked_fill = PatternFill("solid", fgColor="EAF1FB")
     thin = Side(style="thin", color="BFBFBF")
     brd = Border(left=thin, right=thin, top=thin, bottom=thin)
     for k, (hostname, hrow, code, rv, why) in enumerate(rows, 1):
@@ -7874,21 +8391,20 @@ def _create_review_sheet(wb, all_results, criteria_items):
             c.border = brd
             if ci in (7, 9, 11):
                 c.fill = edit_fill
-        # 호스트 시트: 점검결과(O)·현황(P)을 이 시트 참조로 전환 (옅은 파랑 = 검토·수정 시트 연결 칸)
+        # 호스트 시트: 점검결과(O)·현황(P)을 이 시트 참조로 전환 (칸 배경은 행 색 그대로 - 판정별 서식은 조건부 서식이 처리)
         hws = wb[_host_sheet_name(hostname)]
         hws.cell(hrow, 15).value = f'=IF({RQ}!G{r}="","",{RQ}!G{r})'
         hws.cell(hrow, 16).value = f'=IF({RQ}!I{r}="","",{RQ}!I{r})'
-        hws.cell(hrow, 15).fill = linked_fill
-        hws.cell(hrow, 16).fill = linked_fill
     first = hdr + 1
     if rows:
         dv = DataValidation(type="list", allow_blank=False, showErrorMessage=True,
-                            formula1=f'"{RESULT_GOOD},{RESULT_BAD},{RESULT_NA},{RESULT_MANUAL}"',
-                            errorTitle="최종 판정 입력 오류", error="양호 / 취약 / N-A / 수동확인 중에서 선택하세요.")
+                            formula1=f'"{",".join(ALL_RESULTS)}"',
+                            errorTitle="최종 판정 입력 오류", error="양호 / 취약 / N-A / 수동확인 / 점검불가 중에서 선택하세요.")
         dv.add(f"G{first}:G{last}")
         ws.add_data_validation(dv)
-        for val, font in ((RESULT_BAD, FONT_BAD), (RESULT_GOOD, FONT_GOOD), (RESULT_NA, FONT_NA), (RESULT_MANUAL, FONT_MANUAL)):
-            ws.conditional_formatting.add(f"G{first}:G{last}", FormulaRule(formula=[f'$G{first}="{val}"'], font=_cf_font(font.color, font.bold)))
+        for val, font in RESULT_FONT.items():
+            ws.conditional_formatting.add(f"G{first}:G{last}", FormulaRule(formula=[f'$G{first}="{val}"'], font=_cf_font(font.color, font.bold),
+                                                                          fill=DXF_UNABLE if val == RESULT_UNABLE else None))
         ws.conditional_formatting.add(f"A{first}:K{last}", FormulaRule(formula=[f'$G{first}<>$F{first}'],
                                       fill=PatternFill("solid", fgColor="FCE4D6", bgColor="FCE4D6")))
         ws.auto_filter.ref = f"A{hdr}:K{last}"
@@ -7992,7 +8508,11 @@ def _eos_products_from(category, text, evd, hinfo):
         elif vendor == "CISCO" and "D-LINK" not in osd:
             out.append(("네트워크 OS", "cisco-ios", v.group(1) if v else ""))
         elif vendor == "ASA":
-            out.append(("네트워크 OS", "cisco-asa", v.group(1) if v else ""))
+            av = re.search(r"^:?\s*ASA Version\s+(\d+\.\d+)", text, re.M | re.I)
+            out.append(("네트워크 OS", "cisco-asa", av.group(1) if av else (v.group(1) if v else "")))
+        elif vendor == "NXOS":
+            nv = re.search(r"^\s*version\s+(\d+\.\d+)", text, re.M | re.I)
+            out.append(("네트워크 OS", "cisco-nx-os", nv.group(1) if nv else (v.group(1) if v else "")))
         elif vendor == "JUNIPER":
             out.append(("네트워크 OS", "junos", v.group(1) if v else ""))
         else:
@@ -8037,8 +8557,7 @@ def _eos_scan_category(category, base_dir):
             brand, model, fw = _net_brand(text)
             mv = re.search(r"^\s*(?:version|JUNOS|Software Version)\s+(\S+)", text, re.M | re.I)
             hinfo["os"] = " ".join(x for x in ((brand or detect_net_vendor(text)), model, (mv.group(1) if mv else fw)) if x)
-            hn = re.search(r"^\s*hostname\s+(\S+)", text, re.M)
-            host = hn.group(1) if hn else os.path.splitext(f)[0]
+            host = _net_hostname(text) or os.path.splitext(f)[0]
             os_disp, kern = hinfo["os"], ""
         else:
             prod, ver, os_disp = _eos_os_from(text, evd)
@@ -8058,6 +8577,8 @@ def _eos_scan_category(category, base_dir):
         if kern and kern[:1].isdigit() and mod:
             kr, ke, kd = mod.kernel_status(kern, os.environ.get("EOS_OFFLINE") != "1")
             judged.append(("커널(참고)", "linux", kern, "참고", ke, kd + " - 배포판 커널은 배포판 지원 정책을 따르므로 판정에 미반영"))
+        if any(r[0] == host for r in rows):   # 같은 호스트의 전자금융·주요정보 결과 파일이 함께 있으면 1대로 집계
+            continue
         rows.append((host, os_disp, kern, judged))
     return rows, mod
 
@@ -8112,163 +8633,237 @@ def write_eos_inventory(base_dir, categories=None, out_dir=None):
 
 
 # ================================================================
-# 메인 변환 함수
+# 호스트 집합 · 대상 범위(scope.txt) · 인터뷰 반영(override.csv)
 # ================================================================
-
-
-def auto_create_template(cat_dir, criteria_excel, sheet_name, mode="EF"):
-    """기준 엑셀에서 결과 기입용 template.xlsx 자동 생성"""
+def _parse_dt(val, fallback=None):
+    """'2026-11-02 09:35:42' 같은 점검 일시 문자열 → datetime (실패 시 fallback)"""
+    m = re.search(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})(?:[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?", str(val or ""))
+    if not m:
+        return fallback
     try:
-        from openpyxl import Workbook, load_workbook
-        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-        
-        src_wb = load_workbook(criteria_excel, read_only=True)
-        if sheet_name not in src_wb.sheetnames:
-            print(f"[ERROR] 기준 엑셀에 [{sheet_name}] 시트 없음")
-            return None
-        ws_src = src_wb[sheet_name]
+        y, mo, d, h, mi, se = (int(x) if x else 0 for x in m.groups())
+        return datetime.datetime(y, mo, d, h, mi, se)
+    except ValueError:
+        return fallback
 
-        col_filter = 9 if mode == "EF" else 10  # COL_EF=9, COL_MI=10
-        items = []
-        for row in ws_src.iter_rows(min_row=5, values_only=True):
-            if not row or len(row) < 2: continue
-            code = str(row[1]).strip() if row[1] else ""
-            if not code or code == "None" or "-" not in code: continue
-            if not (len(row) > col_filter and row[col_filter]): continue  # EF/MI 필터
-            name  = str(row[6])[:60]  if len(row) > 6  and row[6]  else ""
-            risk  = str(row[7])       if len(row) > 7  and row[7]  else ""
-            ef    = "o"               if len(row) > 9  and row[9]  else ""
-            mi    = "o"               if len(row) > 10 and row[10] else ""
-            items.append((code, name, risk, ef, mi))
 
-        wb  = Workbook()
-        ws  = wb.active
-        ws.title = f"{sheet_name} 점검결과"
-        ws.freeze_panes = "A6"
+def _is_placeholder(rv):
+    """결과 파일에 없어서 컨버터가 채운 값(스크립트 미점검 / 유형 해당 없음)인지"""
+    why = rv[1] or ""
+    return why.startswith(("스크립트 미점검 항목", "config에서 자동 판단 불가")) or ("에 해당 없는 항목" in why[:60] and rv[0] == RESULT_NA)
 
-        H1 = PatternFill("solid", fgColor="1F3864")
-        H2 = PatternFill("solid", fgColor="2E75B6")
-        bd = Border(
-            left=Side(style="thin", color="BBBBBB"),
-            right=Side(style="thin", color="BBBBBB"),
-            top=Side(style="thin", color="BBBBBB"),
-            bottom=Side(style="thin", color="BBBBBB"),
-        )
-        def fnt(bold=False, color="000000", size=9):
-            return Font(name="맑은 고딕", size=size, bold=bold, color=color)
-        ctr = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        lft = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 
-        # 제목
-        ws.merge_cells("A1:N1")
-        mode_label = "전자금융기반시설" if mode == "EF" else "주요정보통신기반시설"
-        ws["A1"].value = f"{mode_label} 보안 취약점 평가 결과 [{sheet_name}]"
-        ws["A1"].font  = Font(name="맑은 고딕", size=13, bold=True, color="FFFFFF")
-        ws["A1"].fill  = H1
-        ws["A1"].alignment = ctr
-        ws.row_dimensions[1].height = 28
-
-        # 정보행
-        ws["B2"] = "점검 기관:"; ws["C2"] = ""
-        ws["E2"] = "점검 일자:"; ws["F2"] = datetime.datetime.now().strftime("%Y-%m-%d")
-        ws["H2"] = "점검자:";    ws["I2"] = ""
-        for addr in ["B2","C2","E2","F2","H2","I2"]:
-            ws[addr].font = fnt(size=9)
-        ws.row_dimensions[2].height = 16
-
-        # 요약 수식
-        stat_row   = 3
-        res_col    = "M"
-        last_data  = 5 + len(items)
-        stats = [
-            ("C3:D3", "양호",   "양호",   "C6EFCE", "006100"),
-            ("E3:F3", "취약",   "취약",   "FFC7CE", "9C0006"),
-            ("G3:H3", "N-A",    "N-A",    "EEEEEE", "595959"),
-            ("I3:J3", "수동확인","수동확인","FFEB9C","9C5700"),
-        ]
-        ws.merge_cells("A3:B3"); ws["A3"].value = "점검 결과 요약"
-        ws["A3"].font = Font(name="맑은 고딕", size=10, bold=True, color="FFFFFF")
-        ws["A3"].fill = H2; ws["A3"].alignment = ctr
-        ws.merge_cells("A4:B4")
-
-        for merge, label, val, bg, fg in stats:
-            ws.merge_cells(merge)
-            start = merge.split(":")[0]
-            ws[start].value = label
-            ws[start].font  = Font(name="맑은 고딕", size=10, bold=True, color=fg)
-            ws[start].fill  = PatternFill("solid", fgColor=bg)
-            ws[start].alignment = ctr
-
-            cnt_addr = start[0] + "4"
-            ws.merge_cells(f"{start[0]}4:{merge.split(':')[1][0]}4")
-            ws[cnt_addr].value = f'=COUNTIF({res_col}6:{res_col}{last_data},"{val}")'
-            ws[cnt_addr].font  = Font(name="맑은 고딕", size=11, bold=True, color=fg)
-            ws[cnt_addr].fill  = PatternFill("solid", fgColor=bg)
-            ws[cnt_addr].alignment = ctr
-
-        ws.row_dimensions[3].height = 20
-        ws.row_dimensions[4].height = 22
-
-        # 헤더
-        headers = [
-            ("A",4,"No."),("B",14,"평가항목ID"),("C",50,"평가항목명"),
-            ("D",8,"위험도"),("E",8,"전자금융"),("F",8,"주요정보"),
-            ("G",12,"대상 서버 IP"),("H",12,"대상 서버 IP"),
-            ("I",12,"대상 서버 IP"),("J",12,"대상 서버 IP"),
-            ("K",12,"대상 서버 IP"),
-            ("L",12,"점검 IP"),
-            ("M",10,"점검결과"),
-            ("N",60,"현황 (자동기입)"),
-            ("O",50,"해결방안"),
-        ]
-        for col, width, hdr in headers:
-            c = ws[f"{col}5"]
-            c.value = hdr; c.fill = H2; c.border = bd
-            c.font  = Font(name="맑은 고딕", size=9, bold=True, color="FFFFFF")
-            c.alignment = ctr
-            ws.column_dimensions[col].width = width
-        ws.row_dimensions[5].height = 20
-
-        # 데이터
-        even = PatternFill("solid", fgColor="EEF3FA")
-        odd  = PatternFill("solid", fgColor="FFFFFF")
-        for idx, (code, name, risk, ef, mi) in enumerate(items):
-            row = idx + 6
-            fill = even if idx % 2 == 0 else odd
-            def sc(col, val, align=ctr, bold=False, clr="000000"):
-                c = ws[f"{col}{row}"]
-                c.value = val; c.fill = fill; c.border = bd
-                c.font  = Font(name="맑은 고딕", size=9, bold=bold, color=clr)
-                c.alignment = align
-            sc("A", idx+1)
-            sc("B", code, bold=True, clr="1F3864")
-            sc("C", name, align=lft)
-            # 위험도 색상
-            try: rv = float(risk) if risk else 0
-            except: rv = 0
-            rc = ws[f"D{row}"]
-            rc.value = risk; rc.border = bd; rc.alignment = ctr
-            if rv >= 4.0:
-                rc.fill = PatternFill("solid", fgColor="FFC7CE")
-                rc.font = Font(name="맑은 고딕", size=9, bold=True, color="9C0006")
-            elif rv >= 3.0:
-                rc.fill = PatternFill("solid", fgColor="FFEB9C")
-                rc.font = Font(name="맑은 고딕", size=9, bold=True, color="9C5700")
+def _merge_results(old_res, new_res):
+    """같은 호스트의 두 결과를 항목별로 병합.  컨버터가 채운 미점검 값(placeholder)은 실제 판정에 밀리고,
+    둘 다 실제 판정이면 parse_pipe 와 같은 순위(취약 > 점검불가 > 수동확인 > 양호 > N-A)로 더 나쁜 판정을 남기며 근거를 합친다.
+    반환: (병합 결과, 새 쪽 값이 채택된 항목코드 집합)"""
+    merged, from_new = dict(old_res), set()
+    for c, v in new_res.items():
+        if c not in merged or _is_placeholder(merged[c]):
+            merged[c] = v; from_new.add(c)
+        elif _is_placeholder(v):
+            continue
+        else:
+            ov = merged[c]
+            if ov == v:
+                continue
+            ow, nw = ov[1] or "", v[1] or ""
+            if ov[0] != v[0]:
+                ow = ow if ow.startswith("[") else f"[{ov[0]}] {ow}"
+                nw = f"[{v[0]}] {nw}"
+            if RESULT_RANK.get(v[0], 0) > RESULT_RANK.get(ov[0], 0):
+                merged[c] = (v[0], f"{nw} / {ow}"); from_new.add(c)
             else:
-                rc.fill = fill
-                rc.font = Font(name="맑은 고딕", size=9)
-            sc("E", ef); sc("F", mi)
-            for col in list("GHIJKL"): sc(col, "")
-            sc("M", ""); sc("N", "", align=lft)
-            ws.row_dimensions[row].height = 16
+                merged[c] = (ov[0], f"{ow} / {nw}")
+    return merged, from_new
 
-        tmpl_path = os.path.join(cat_dir, "template.xlsx")
-        wb.save(tmpl_path)
-        print(f"[INFO] template.xlsx 자동 생성 완료 ({len(items)}개 항목)")
-        return tmpl_path
-    except Exception as e:
-        print(f"[ERROR] 템플릿 자동 생성 실패: {e}")
+
+class _HostSet:
+    """변환 대상 호스트 모음.  같은 '점검 대상' 의 결과 파일이 여럿일 때:
+      - 서로 다른 항목 집합(전자금융 SRV + 주요정보 U 등)이면 판정·증적을 병합해 1대로 취급
+      - 같은 항목을 다시 점검한 파일이면 점검 일시가 최신인 파일을 채택 (콘솔·감사 로그에 알림)
+      - 이름은 같은데 IP 가 다르면 '호스트명(IP)' 로 구분"""
+
+    def __init__(self):
+        self.all_results, self.evidences, self.hosts_info, self.meta = {}, {}, [], {}
+        self.split_names = set()   # IP 로 구분해야 하는 호스트명
+
+    def _hi(self, key):
+        return next((h for h in self.hosts_info if h["hostname"] == key), None)
+
+    def _rename(self, old, new):
+        self.all_results[new] = self.all_results.pop(old)
+        self.evidences[new] = self.evidences.pop(old)
+        self.meta[new] = self.meta.pop(old)
+        hi = self._hi(old)
+        if hi:
+            hi["hostname"] = new
+
+    def add(self, hinfo, res, sub, evidence, fname, raw_codes, mtime=None):
+        base = hinfo["hostname"]
+        ips = set(hinfo.get("ips") or [])
+        dt = _parse_dt(hinfo.get("date"), mtime)
+        hinfo.setdefault("src_file", fname)
+        note = _RUN_NOTES.setdefault("duplicates", [])
+
+        def label(ipset):
+            return f"{base}({sorted(ipset)[0]})" if ipset else base
+
+        key = label(ips) if base in self.split_names else base
+        if key in self.meta:
+            old = self.meta[key]
+            if ips and old["ips"] and not (ips & old["ips"]) and key == base:
+                # 이름은 같고 IP 가 다름 → 호스트명(IP) 로 구분
+                self.split_names.add(base)
+                self._rename(base, label(old["ips"]))
+                msg = f"같은 호스트명 '{base}' 이나 IP 가 다름({', '.join(sorted(old['ips']))} / {', '.join(sorted(ips))}) → '{label(old['ips'])}', '{label(ips)}' 로 구분 ({old['file']}, {fname})"
+                print(f"[알림] {msg}")
+                note.append({"type": "ip_split", "message": msg})
+                key = label(ips)
+                hinfo["hostname"] = key
+            else:
+                overlap = raw_codes & old["raw"]
+                small = max(1, min(len(raw_codes), len(old["raw"])))
+                if overlap and len(overlap) >= 0.5 * small and not (dt and old["dt"] and dt != old["dt"]):
+                    # 같은 항목을 같은 시각(또는 점검 일시 미상)으로 점검한 파일 → 최신을 가릴 수 없으므로 한쪽으로 덮지 않고 항목별로 더 나쁜 판정 유지
+                    old_res, old_sub = self.all_results[key]
+                    merged, from_new = _merge_results(old_res, res)
+                    old_ev = self.evidences.get(key, {})
+                    ev = dict(evidence or {}); ev.update({c: e for c, e in old_ev.items() if c not in from_new})
+                    ev.update({c: e for c, e in (evidence or {}).items() if c in from_new})
+                    self.all_results[key] = (merged, sub or old_sub)
+                    self.evidences[key] = ev
+                    old_hi = self._hi(key)
+                    for k, v in hinfo.items():
+                        if v and not old_hi.get(k):
+                            old_hi[k] = v
+                    old_hi["src_file"] = f"{old_hi.get('src_file', '')}, {fname}"
+                    old["raw"] = old["raw"] | raw_codes
+                    old["file"] = f"{old['file']}, {fname}"
+                    msg = (f"'{key}' 의 결과 파일 {old['file']} 는 점검 일시가 같거나 알 수 없어(기존 {old['dt'] or '미상'} / 신규 {dt or '미상'}) "
+                           f"최신 파일을 가릴 수 없음 → 겹치는 항목은 더 나쁜 판정(취약 > 점검불가 > 수동확인 > 양호 > N-A)을 유지하고 근거를 합침")
+                    print(f"[알림] {msg}")
+                    note.append({"type": "duplicate_merged_worst", "message": msg})
+                    return key
+                if overlap and len(overlap) >= 0.5 * small:   # 같은 항목을 다시 점검한 결과 → 점검 일시가 최신인 파일 채택
+                    newer = (dt or datetime.datetime.min) >= (old["dt"] or datetime.datetime.min)
+                    keep, drop = (fname, old["file"]) if newer else (old["file"], fname)
+                    msg = (f"'{key}' 의 결과 파일이 여러 개({old['file']} / {fname}) → 점검 일시가 최신인 "
+                           f"'{keep}' 채택, '{drop}' 제외 (점검 일시: 기존 {old['dt'] or '미상'} / 신규 {dt or '미상'})")
+                    print(f"[알림] {msg}")
+                    note.append({"type": "duplicate_latest", "message": msg, "kept": keep, "dropped": drop})
+                    if newer:
+                        hinfo["hostname"] = key
+                        self.all_results[key] = (res, sub)
+                        self.evidences[key] = evidence or {}
+                        self.meta[key] = {"ips": ips or old["ips"], "dt": dt, "raw": raw_codes, "file": fname}
+                        old_hi = self._hi(key)
+                        self.hosts_info[self.hosts_info.index(old_hi)] = hinfo
+                    return key
+                # 보완 관계(서로 다른 항목 집합) → 판정·증적 병합, 대상 1대
+                old_res, old_sub = self.all_results[key]
+                merged, from_new = _merge_results(old_res, res)
+                self.all_results[key] = (merged, sub or old_sub)
+                old_ev = self.evidences.get(key, {})
+                ev = {**(evidence or {}), **{c: e for c, e in old_ev.items() if c not in from_new}}
+                ev.update({c: e for c, e in (evidence or {}).items() if c in from_new})
+                self.evidences[key] = ev
+                old_hi = self._hi(key)
+                for k, v in hinfo.items():
+                    if v and not old_hi.get(k):
+                        old_hi[k] = v
+                old_hi["src_file"] = f"{old_hi.get('src_file', '')}, {fname}"
+                old["raw"] = old["raw"] | raw_codes
+                old["file"] = f"{old['file']}, {fname}"
+                print(f"[INFO] {fname}: 같은 호스트({key})의 다른 결과 파일과 병합")
+                return key
+        hinfo["hostname"] = key
+        self.all_results[key] = (res, sub)
+        self.evidences[key] = evidence or {}
+        self.meta[key] = {"ips": ips, "dt": dt, "raw": set(raw_codes), "file": fname}
+        self.hosts_info.append(hinfo)
+        return key
+
+
+def _read_scope(cat_dir):
+    """<분야>/scope.txt — 한 줄에 호스트명 또는 IP (# 주석). 없으면 None(전체)"""
+    path = os.path.join(cat_dir, "scope.txt")
+    if not os.path.exists(path):
         return None
+    ent = set()
+    for ln in read_text(path).splitlines():
+        t = ln.split("#", 1)[0].strip()
+        if t:
+            ent.add(t.lower())
+    print(f"[INFO] 대상 범위 파일: {path} ({len(ent)}개 항목) — 목록에 있는 호스트만 보고서에 포함")
+    _RUN_NOTES["scope"] = {"file": path, "entries": sorted(ent), "included": [], "excluded": []}
+    return ent
+
+
+def _scope_check(scope, hinfo, fname):
+    """scope 목록(호스트명·IP·파일명) 에 해당하면 True.  제외 시 콘솔·감사 로그에 기록"""
+    if scope is None:
+        return True
+    names = {str(hinfo.get("hostname", "")).lower(), os.path.splitext(fname)[0].lower()}
+    names |= {x.lower() for x in (hinfo.get("ips") or [])}
+    hit = bool(names & scope)
+    rec = {"file": fname, "hostname": hinfo.get("hostname", ""), "ip": hinfo.get("ip", "")}
+    sc = _RUN_NOTES["scope"]
+    (sc["included"] if hit else sc["excluded"]).append(rec)
+    if not hit:
+        print(f"[범위 제외] {fname} (호스트 {hinfo.get('hostname', '')}, IP {hinfo.get('ip') or '미확인'}) — scope.txt 에 없음")
+    return hit
+
+
+def _apply_override(cat_dir, all_results, criteria_items, hosts_info):
+    """<분야>/override.csv (UTF-8, 헤더: 호스트,항목코드,판정,근거) — 인터뷰 결과로 판정 덮어쓰기.
+    근거 앞에 '[인터뷰] ' 와 원래 판정을 남기고, 원래 현황 문구는 아래에 보존.  반환: 적용 건수"""
+    path = os.path.join(cat_dir, "override.csv")
+    if not os.path.exists(path):
+        return 0
+    try:
+        rows = list(csv.DictReader(read_text(path).splitlines()))
+    except Exception as e:
+        print(f"[경고] override.csv 읽기 실패: {e}")
+        return 0
+    alias = {}
+    for h in all_results:
+        hi = next((x for x in hosts_info if x["hostname"] == h), {})
+        for a in {h.lower(), re.sub(r"\([^)]*\)$", "", h).lower()} | {x.lower() for x in (hi.get("ips") or [])}:
+            alias.setdefault(a, []).append(h)
+    done = []
+    log = _RUN_NOTES.setdefault("override", {"file": path, "applied": [], "skipped": []})
+    for i, row in enumerate(rows, 2):
+        host = (row.get("호스트") or "").strip().lstrip("\ufeff")
+        code = (row.get("항목코드") or "").strip().upper()
+        verdict_raw = (row.get("판정") or "").strip()
+        why = (row.get("근거") or "").strip()
+        if not host and not code:
+            continue
+        verdict, unknown = _norm_result(verdict_raw)
+        targets = alias.get(host.lower(), [])
+        if unknown or not targets or code not in criteria_items:
+            reason = ("판정값 오류" if unknown else "호스트가 이 보고서에 없음" if not targets else "항목코드가 이 보고서 기준에 없음")
+            print(f"[경고] override.csv {i}행 ({host},{code},{verdict_raw}): {reason} → 건너뜀"
+                  + (" (Unix/Windows 등 다른 보고서 대상이면 무시)" if not targets or code not in criteria_items else ""))
+            log["skipped"].append({"row": i, "host": host, "code": code, "reason": reason})
+            continue
+        for h in targets:
+            res, sub = all_results[h]
+            old_v, old_w = res.get(code, ("", ""))
+            res[code] = (verdict, f"[인터뷰] 원래 판정: {old_v or '-'} → {verdict}\n{why}" + (f"\n---- 원 점검 결과 ----\n{old_w}" if old_w else ""))
+            all_results[h] = (res, sub)
+            done.append((h, code, old_v, verdict))
+            log["applied"].append({"host": h, "code": code, "from": old_v, "to": verdict, "reason": why})
+    if done:
+        print(f"[INFO] 인터뷰 결과(override.csv) {len(done)}건 반영: " + ", ".join(f"{h}/{c} {o}→{n}" for h, c, o, n in done[:8]) + (" …" if len(done) > 8 else ""))
+    return len(done)
+
+
+def _read_header_files(input_dir, category):
+    """분야 입력 폴더의 결과 파일 목록 (증적 파일 제외)"""
+    return sorted(f for f in os.listdir(input_dir) if f.endswith(".txt") and "evidence" not in f.lower())
+
 
 def run_webwas_convert(mode, base_dir, criteria_excel):
     """
@@ -8284,8 +8879,7 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
     if not os.path.exists(input_dir):
         print(f"[ERROR] 입력 폴더 없음: {input_dir}"); return
 
-    input_files = sorted(f for f in os.listdir(input_dir)
-                         if f.endswith(".txt") and "evidence" not in f.lower())
+    input_files = _read_header_files(input_dir, "webwas")
     # 결과 파일이 없으면 증적 파일(*_webwas_evidence.txt)의 [판정] 줄로 결과 복원
     evidence_only = False
     if not input_files:
@@ -8300,13 +8894,13 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
     criteria_items = load_criteria(criteria_excel, SHEET_MAP["webwas"], "EF" if mode == "MI" else mode)   # MI: 가이드 항목 판정 근거 자료로 전 항목 사용
     print(f"[INFO] 평가항목 {len(criteria_items)}개 로드 ({'전자금융' if mode=='EF' else '주요정보'} 기준)")
 
-    all_results = {}
-    evidences   = {}
-    hosts_info  = []
+    hs = _HostSet()
+    scope = _read_scope(cat_dir)
 
     for fname in input_files:
         pure = os.path.splitext(fname)[0]
-        text = read_text(os.path.join(input_dir, fname))
+        fpath = os.path.join(input_dir, fname)
+        text = read_text(fpath)
         if evidence_only:
             text = _evidence_to_pipe_text(text)
             pure = re.sub(r"(_webwas)?_evidence$", "", pure, flags=re.I)
@@ -8316,10 +8910,15 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
         if not hinfo["hostname"]:
             hinfo["hostname"] = pure
 
-        res = parse_pipe(text)
-        if _category_mismatch(res, criteria_items, fname):
+        res = parse_pipe(text, fname)
+        # MI: 2026 가이드 코드(WEB-xx 만 있는 `check_webwas.sh mi` 결과)도 정상 입력으로 인정
+        known_codes = dict(criteria_items, **{k: {} for k in KISA_GUIDE_ITEMS}) if mode == "MI" else criteria_items
+        if _category_mismatch(res, known_codes, fname):
             continue
-        evd_path = os.path.join(input_dir, fname) if evidence_only else find_evidence_file(os.path.join(input_dir, fname))
+        if not _scope_check(scope, hinfo, fname):
+            continue
+        raw_codes = set(res)
+        evd_path = fpath if evidence_only else find_evidence_file(fpath)
         if evd_path:
             evidence = parse_evidence(evd_path)
             print(f"[INFO] {fname} → 증적 파일 병합: {os.path.basename(evd_path)} ({len(evidence)}건)")
@@ -8353,104 +8952,64 @@ def run_webwas_convert(mode, base_dir, criteria_excel):
                     forced += 1
             if forced:
                 print(f"[INFO] {fname} → 평가대상 아닌 항목 {forced}건 N-A 보정")
-        if mode == "MI":   # 가이드 항목 변환 후 현황 구성
-            evidences[hinfo["hostname"]] = evidence
-        else:
+        if mode != "MI":   # 가이드 항목 변환 후 현황 구성(MI) / 전자금융은 여기서 구성
             res = compose_status(res, evidence, criteria_items, detected_sub)
-        _h = hinfo["hostname"]
-        if _h in all_results:   # 같은 호스트 결과 파일이 여럿(전자금융 + 주요정보 전용 스크립트 등) → 판정·증적 병합, 대상 1대 (파일 순서 무관)
-            _old_res, _old_sub = all_results[_h]
-            res = {**_old_res, **res}
-            detected_sub = detected_sub or _old_sub
-            if _h in evidences:
-                evidences[_h] = {**evidences[_h], **(evidence or {})}
-            for _hi in hosts_info:
-                if _hi.get("hostname") == _h:
-                    for _k, _v in hinfo.items():
-                        if _v and not _hi.get(_k):
-                            _hi[_k] = _v
-            print(f"[INFO] {fname}: 같은 호스트({_h})의 다른 결과 파일과 병합")
-            all_results[_h] = (res, detected_sub)
-            continue
-        all_results[_h] = (res, detected_sub)
-        hosts_info.append(hinfo)
-
-        total = sum(1 for k in res if k in criteria_items)
-        bad   = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_BAD)
-        good  = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_GOOD)
+        key = hs.add(hinfo, res, detected_sub, evidence, fname, raw_codes, _mtime(fpath))
+        r2 = hs.all_results[key][0]
+        bad  = sum(1 for k, v in r2.items() if k in criteria_items and v[0] == RESULT_BAD)
+        good = sum(1 for k, v in r2.items() if k in criteria_items and v[0] == RESULT_GOOD)
         print(f"[INFO] {fname} → 웹서버={web_disp}, WAS={was_disp}, 양호 {good} / 취약 {bad}")
 
-    if not all_results:
+    if not hs.all_results:
         _no_results_stop(mode, "webwas")
         return
-    # 주요정보(MI): 2026 상세가이드 웹 서비스(WEB-xx) 항목 체계로 변환
-    if mode == "MI" and all_results:
-        _, all_results, hosts_info, criteria_items = _kisa_groups("webwas", all_results, hosts_info, criteria_items, evidences)[0]
+    _finish("webwas", mode, cat_dir, base_dir, hs, criteria_items, file_tag="웹WAS")
 
-    wb = openpyxl.Workbook()
-    print(f"[INFO] 보고서 생성 중...")
 
-    _create_cover_sheet(wb, mode, "webwas", hosts_info)
-    _create_overview_sheet(wb, mode, "webwas", hosts_info, criteria_items,
-                           next(iter(all_results), None))
-    _create_revision_sheet(wb)
-    _init_sheet_names(list(all_results.keys()))
-    target_row_map = _create_target_sheet(wb, hosts_info, all_results)
-    _create_security_stats_sheet(wb, all_results, criteria_items, hosts_info, "webwas")
-    _create_summary_stats_sheet(wb, all_results, criteria_items)
-
-    for hostname, (res, detected_sub) in all_results.items():
-        hi = next((h for h in hosts_info if h["hostname"] == hostname), {})
-        _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, hi,
-                             target_row_map.get(hostname))
-        filled = sum(1 for code in criteria_items if code in res)
-        print(f"[INFO] {hostname}: {filled}개 항목 기입 완료")
-
-    _create_vuln_list_sheet(wb, all_results, criteria_items)
-    _create_review_sheet(wb, all_results, criteria_items)
-    _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items)
-
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    mode_str  = "전자금융" if mode == "EF" else "주요정보"
-    out_path  = os.path.join(cat_dir, f"상세보고서_{mode_str}_웹WAS_{timestamp}.xlsx")
-    wb.save(out_path)
-    total_bad = sum(sum(1 for v in res.values() if v[0] == RESULT_BAD)
-                    for res, _ in all_results.values())
-    print(f"\n[완료] 상세보고서 저장: {out_path}")
-    print(f"  시트 구성: 표지 / 개요 / 개정이력 / 점검대상 / 보안수준 통계 / 요약 통계 / 호스트 상세 {len(all_results)}개")
-    print(f"  총 점검 대상: {len(all_results)}대 / 전체 취약: {total_bad}건")
-
-    audit_targets = []
-    for hostname, (res, detected_sub) in all_results.items():
-        filtered = {code: res.get(code, (RESULT_MANUAL, "")) for code in criteria_items}
-        good = sum(1 for v in filtered.values() if v[0] == RESULT_GOOD)
-        bad  = sum(1 for v in filtered.values() if v[0] == RESULT_BAD)
-        na_c = sum(1 for v in filtered.values() if v[0] == RESULT_NA)
-        mc   = sum(1 for v in filtered.values() if v[0] == RESULT_MANUAL)
-        hi = next((h for h in hosts_info if h["hostname"] == hostname), {})
-        audit_targets.append({
-            "name": hostname, "subtype": detected_sub,
-            "web_info": hi.get("web_info", ""),
-            "good": good, "bad": bad, "na": na_c, "manual": mc,
-            "input_file": f"{hostname}.txt",
-        })
-    write_audit_log(base_dir, mode, "webwas", audit_targets, out_path)
+def _mtime(path):
     try:
-        write_eos_inventory(base_dir, ["webwas"], cat_dir)
-    except Exception as e:
-        print(f"[경고] EoS 현황 생성 실패: {e}")
+        return datetime.datetime.fromtimestamp(os.path.getmtime(path))
+    except OSError:
+        return None
+
+
+def _finish(category, mode, cat_dir, base_dir, hs, criteria_items, file_tag=None):
+    """호스트 집합 → (MI 이면 가이드 항목 변환) → 보고서 작성 → EoS 현황"""
+    if mode == "MI" and category in KISA_CATEGORY_FAMILY:
+        groups = _kisa_groups(category, hs.all_results, hs.hosts_info, criteria_items, hs.evidences)
+    else:
+        groups = [("", hs.all_results, hs.hosts_info, criteria_items, hs.evidences)]
+    for label, g_results, g_hosts, g_items, g_evd in groups:
+        _write_report(mode, category, cat_dir, base_dir, g_results, g_hosts, g_items, label, g_evd, file_tag)
+    if category in _EOS_CATS:   # 서버·웹/WAS·DBMS·네트워크: 대상별 OS·버전·커널·제품 EoS 현황 .txt
+        try:
+            write_eos_inventory(base_dir, [category], cat_dir)
+        except Exception as e:
+            print(f"[경고] EoS 현황 생성 실패: {e}")
+
+
+_EOS_MOD = {}
 
 
 def _load_eos_checker(base_dir):
-    """eos_checker.py를 직접 import하여 check_eos 함수 반환"""
+    """eos_checker.py를 직접 import하여 check_eos 함수 반환 (한 번만 로드, 실패 시 한 번 경고)"""
+    if base_dir in _EOS_MOD:
+        return _EOS_MOD[base_dir]
+    fn = None
     eos_path = os.path.join(base_dir, "eos_checker.py")
     if not os.path.exists(eos_path):
-        return None
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("eos_checker", eos_path)
-    mod  = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.check_eos
+        print(f"[경고] eos_checker.py 없음({eos_path}) → EoS 항목 자동 판정 생략 (수동확인 유지)")
+    else:
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("eos_checker", eos_path)
+            mod  = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            fn = mod.check_eos
+        except Exception as e:
+            print(f"[경고] eos_checker.py 로드 실패({type(e).__name__}: {e}) → EoS 항목 자동 판정 생략")
+    _EOS_MOD[base_dir] = fn
+    return fn
 
 
 def parse_version_info(text):
@@ -8582,10 +9141,12 @@ def run_eos_check(category, res, text, base_dir):
         if product == "unknown":
             continue
         try:
-            result, eol_date, desc = check_eos(product, version, use_api=False)
+            # EoS 현황(write_eos_inventory)과 같은 조회 방식(온라인 → 실패 시 내장표, EOS_OFFLINE=1 이면 내장표만) → 두 결과가 달라지지 않음
+            result, eol_date, desc = check_eos(product, version, os.environ.get("EOS_OFFLINE") != "1")
+            result, _unk = _norm_result(result)
             eos_results.append((product, version, result, eol_date, desc))
-        except Exception:
-            pass
+        except Exception as e:
+            eos_results.append((product, version, RESULT_UNABLE, None, f"{product} {version} EoS 판정 중 오류({type(e).__name__}) - 수동 확인"))
 
     if not eos_results:
         return res
@@ -8594,15 +9155,13 @@ def run_eos_check(category, res, text, base_dir):
     descs = []
     for product, version, result, eol_date, desc in eos_results:
         descs.append(desc)
-        if result == RESULT_BAD:
-            worst = RESULT_BAD
-        elif result == RESULT_MANUAL and worst != RESULT_BAD:
-            worst = RESULT_MANUAL
+        if RESULT_RANK.get(result, 0) > RESULT_RANK.get(worst, 0) and result != RESULT_NA:
+            worst = result
 
     combined = " / ".join(descs)
     if eos_code in res:
         old_result, old_reason = res[eos_code]
-        if old_result == RESULT_MANUAL:
+        if old_result in UNDECIDED:   # 스크립트가 판정하지 못한(수동확인·점검불가) EoS 항목만 헤더 버전으로 채움
             res[eos_code] = (worst, combined)
     else:
         res[eos_code] = (worst, combined)
@@ -8636,8 +9195,7 @@ def run_pc_convert(mode, base_dir):
         print(f"[ERROR] PC 점검 결과 폴더 없음: {input_dir}")
         return
 
-    input_files = sorted(f for f in os.listdir(input_dir)
-                         if f.endswith(".txt") and "evidence" not in f.lower())
+    input_files = _read_header_files(input_dir, "pc")
     if not input_files:
         print(f"[ERROR] {input_dir}에 .txt 파일 없음")
         return
@@ -8649,8 +9207,8 @@ def run_pc_convert(mode, base_dir):
         criteria_items = _pc_items_as_criteria()
         print(f"[INFO] PC 내장 항목 {len(criteria_items)}개 로드")
 
-    all_results = {}
-    hosts_info  = []
+    hs = _HostSet()
+    scope = _read_scope(cat_dir)
 
     for fname in input_files:
         path = os.path.join(input_dir, fname)
@@ -8662,9 +9220,9 @@ def run_pc_convert(mode, base_dir):
         if not hinfo["hostname"]:
             hinfo["hostname"] = pure
         if not hinfo.get("os"):
-            hinfo["os"] = "Windows"
+            hinfo["os"] = "OS 미확인"   # iOS 체크리스트·macOS 결과 등 '# OS:' 헤더가 없는 결과를 Windows 로 오표기하지 않음
 
-        res = parse_pipe(text)
+        res = parse_pipe(text, fname)
         kisa_file = "상세가이드(2026)" in "\n".join(text.splitlines()[:15])   # check_pc_kisa.ps1 / check_pc_mac_kisa.sh 결과 머리말
         if (mode == "MI") != kisa_file:   # PC 항목코드가 같아도 기준(항목 의미)이 다름 → 섞지 않음
             print(f"[경고] {fname}: " + ("전자금융용 check_pc.ps1/check_pc_mac.sh 결과 - 주요정보 변환에는 check_pc_kisa.ps1/check_pc_mac_kisa.sh 결과 필요 → 제외"
@@ -8672,6 +9230,9 @@ def run_pc_convert(mode, base_dir):
             continue
         if _category_mismatch(res, criteria_items, fname):
             continue
+        if not _scope_check(scope, hinfo, fname):
+            continue
+        raw_codes = set(res)
         evd_path = find_evidence_file(path)
         if evd_path:
             evidence = parse_evidence(evd_path)
@@ -8681,60 +9242,158 @@ def run_pc_convert(mode, base_dir):
                 res[code] = (RESULT_MANUAL, "스크립트 미점검 항목 (수동 확인 필요)")
 
         res = compose_status(res, evidence, criteria_items, None)
-        all_results[hinfo["hostname"]] = (res, "PC")
-        hosts_info.append(hinfo)
+        key = hs.add(hinfo, res, "PC", evidence, fname, raw_codes, _mtime(path))
+        r2 = hs.all_results[key][0]
+        bad  = sum(1 for v in r2.values() if v[0] == RESULT_BAD)
+        good = sum(1 for v in r2.values() if v[0] == RESULT_GOOD)
+        print(f"[INFO] {fname} → 총 {len(r2)}개 / 양호 {good} / 취약 {bad}")
 
-        bad  = sum(1 for v in res.values() if v[0] == RESULT_BAD)
-        good = sum(1 for v in res.values() if v[0] == RESULT_GOOD)
-        print(f"[INFO] {fname} → 총 {len(res)}개 / 양호 {good} / 취약 {bad}")
-
-    if not all_results:
+    if not hs.all_results:
         _no_results_stop(mode, "pc")
         return
-    wb = openpyxl.Workbook()
-    print(f"[INFO] 보고서 생성 중...")
+    _finish("pc", mode, cat_dir, base_dir, hs, criteria_items, file_tag="PC")
 
-    _create_cover_sheet(wb, mode, "pc", hosts_info)
-    _create_overview_sheet(wb, mode, "pc", hosts_info, criteria_items,
-                           next(iter(all_results), None))
-    _create_revision_sheet(wb)
-    _init_sheet_names(list(all_results.keys()))
-    target_row_map = _create_target_sheet(wb, hosts_info, all_results)
-    _create_security_stats_sheet(wb, all_results, criteria_items, hosts_info, "pc")
-    _create_summary_stats_sheet(wb, all_results, criteria_items)
 
-    for hostname, (res, detected_sub) in all_results.items():
-        hi = next((h for h in hosts_info if h["hostname"] == hostname), {})
-        _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, hi,
-                             target_row_map.get(hostname))
-        print(f"[INFO] {hostname}: {len(criteria_items)}개 항목 기입 완료")
+# ================================================================
+# 증적 원문 시트 · 현황 셀 길이 제한 · 인쇄 설정
+# ================================================================
+EVD_CELL_LIMIT = 12000     # 호스트 상세 '현황 및 문제점' 셀에 넣는 최대 글자 수 (엑셀 한도 32,767자보다 훨씬 작게) — 초과분은 증적 시트로 연결
+EVD_CHUNK = 30000          # 증적 시트 한 셀의 최대 글자 수 (줄 단위로 나눠 여러 행에 기록)
 
-    _create_vuln_list_sheet(wb, all_results, criteria_items)
-    _create_review_sheet(wb, all_results, criteria_items)
-    _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items)
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    mode_str  = "전자금융" if mode == "EF" else "주요정보"
-    out_path  = os.path.join(cat_dir, f"상세보고서_{mode_str}_PC_{timestamp}.xlsx")
-    wb.save(out_path)
-    total_bad = sum(sum(1 for v in res.values() if v[0] == RESULT_BAD)
-                    for res, _ in all_results.values())
-    print(f"\n[완료] 상세보고서 저장: {out_path}")
-    print(f"  시트 구성: 표지 / 개요 / 개정이력 / 점검대상 / 보안수준 통계 / 요약 통계 / 호스트 상세 {len(all_results)}개")
-    print(f"  총 점검 대상: {len(all_results)}대 / 전체 취약: {total_bad}건")
+def _evd_chunks(text, limit=EVD_CHUNK):
+    """긴 증적을 줄 단위로 limit 자 이하 조각으로 분할 (한 줄이 limit 보다 길면 그 줄을 쪼갬)"""
+    chunks, cur, n = [], [], 0
+    for ln in text.split("\n"):
+        while len(ln) > limit:
+            if cur:
+                chunks.append("\n".join(cur)); cur, n = [], 0
+            chunks.append(ln[:limit]); ln = ln[limit:]
+        if n + len(ln) + 1 > limit and cur:
+            chunks.append("\n".join(cur)); cur, n = [], 0
+        cur.append(ln); n += len(ln) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks or [""]
 
-    audit_targets = []
-    for hostname, (res, detected_sub) in all_results.items():
-        filtered = {code: res.get(code, (RESULT_MANUAL, "")) for code in criteria_items}
-        good = sum(1 for v in filtered.values() if v[0] == RESULT_GOOD)
-        bad  = sum(1 for v in filtered.values() if v[0] == RESULT_BAD)
-        na_c = sum(1 for v in filtered.values() if v[0] == RESULT_NA)
-        mc   = sum(1 for v in filtered.values() if v[0] == RESULT_MANUAL)
-        audit_targets.append({
-            "name": hostname, "good": good, "bad": bad, "na": na_c, "manual": mc,
-            "input_file": f"{hostname}.txt",
-        })
-    write_audit_log(base_dir, mode, "pc", audit_targets, out_path)
+
+def _plan_evidence(all_results, evidences, criteria_items):
+    """증적 원문 시트 배치 계획 → (entries, key_row, code_rows)
+    entries: [(호스트, 증적 키, [조각...], 첫 행)], key_row: {(호스트, 키): 첫 행},
+    code_rows: {호스트: {항목코드: 증적 시트 첫 행}}  (항목코드 → 자기 증적 또는 연계(sources) 증적)"""
+    entries, key_row, code_rows = [], {}, {}
+    r = 5
+    for host in all_results:
+        ev = (evidences or {}).get(host) or {}
+        for key, raw in ev.items():
+            text = _evd_text(raw).strip("\n")
+            if not text.strip():
+                continue
+            ch = _evd_chunks(text)
+            entries.append((host, key, ch, r))
+            key_row[(host, key)] = r
+            r += len(ch)
+        rows = {}
+        for code, item in criteria_items.items():
+            for k in [code] + list(item.get("sources") or []):
+                if (host, k) in key_row:
+                    rows[code] = key_row[(host, k)]
+                    break
+        code_rows[host] = rows
+    return entries, key_row, code_rows
+
+
+def _cap_status(text, ref_row=None):
+    """현황 셀 문자열이 너무 길면 앞부분 + '증적 원문' 시트 참조 안내로 줄임 (줄 경계에서 자름)"""
+    text = text or ""
+    if len(text) <= EVD_CELL_LIMIT:
+        return text
+    cut = text.rfind("\n", 0, EVD_CELL_LIMIT - 200)
+    if cut < EVD_CELL_LIMIT // 2:
+        cut = EVD_CELL_LIMIT - 200
+    where = f"'{EVIDENCE_SHEET}' 시트 {ref_row}행" if ref_row else f"증적 파일 (이 항목 전체 {len(text)}자)"
+    return text[:cut] + f"\n… (이하 생략 — 전체는 {where} 참조)"
+
+
+def _create_evidence_sheet(wb, entries, criteria_items):
+    """증적 원문 시트: 호스트별·증적 키별 명령 + 출력 원문 (자르지 않음, 마스킹된 값은 그대로)"""
+    if not entries:
+        return None
+    ws = wb.create_sheet(EVIDENCE_SHEET)
+    ws.sheet_properties.tabColor = "7F7F7F"
+    ctr = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.cell(2, 1).value = "▣ 증적 원문"
+    ws.cell(2, 1).font = FONT_SECTION
+    ws.cell(3, 1).value = ("점검 스크립트 증적 파일의 항목별 명령($)·설명(#)·출력 원문 전체입니다. 한 셀(32,767자) 한도를 넘는 증적은 여러 행으로 나눠 기록했습니다. "
+                           "호스트 시트의 항목코드를 누르면 이 시트의 해당 행으로 이동합니다.")
+    ws.cell(3, 1).font = Font(name=FONT_NAME, size=9, color="555555")
+    heads = ["호스트", "증적 항목", "항목명", "조각", "증적 원문 (명령 + 출력)"]
+    widths = [22, 12, 30, 7, 130]
+    for i, (h, w) in enumerate(zip(heads, widths), 1):
+        c = ws.cell(4, i)
+        c.value = h
+        c.fill = FILL_SUBHEADER; c.font = FONT_HEADER; c.alignment = ctr
+        ws.column_dimensions[get_column_letter(i)].width = w
+    link_font = Font(name=FONT_NAME, size=9, color="0563C1", underline="single")
+    mono = Font(name="Consolas", size=9, color="333333")
+    top = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    r = 5
+    for host, key, chunks, _first in entries:
+        nm = (criteria_items.get(key) or {}).get("name", "")
+        for i, ch in enumerate(chunks, 1):
+            ws.cell(r, 1).value = host
+            ws.cell(r, 2).value = key
+            ws.cell(r, 3).value = nm
+            ws.cell(r, 4).value = f"{i}/{len(chunks)}"
+            c = ws.cell(r, 5)
+            c.value = ch
+            if ch.startswith(("=", "+", "-", "@")):   # 수식으로 해석되지 않게 문자열로 고정
+                c.data_type = "s"
+            for ci in range(1, 5):
+                ws.cell(r, ci).font = FONT_DATA
+                ws.cell(r, ci).alignment = Alignment(horizontal="center" if ci in (2, 4) else "left", vertical="top", wrap_text=True)
+            c.font = mono
+            c.alignment = top
+            try:
+                ws.cell(r, 1).hyperlink = _sheet_link(host)
+                ws.cell(r, 1).font = link_font
+            except Exception:
+                pass
+            ws.row_dimensions[r].height = min(409, max(15, 12.5 * (ch.count("\n") + 1 + sum(len(l) // 150 for l in ch.split("\n")))))
+            r += 1
+    _apply_border(ws, 4, r - 1, 1, 5)
+    ws.freeze_panes = "A5"
+    ws.auto_filter.ref = f"A4:E{r - 1}"
+    ws.print_title_rows = "4:4"
+    return ws
+
+
+def _apply_print_setup(wb):
+    """모든 시트(표지 제외 — 표지는 별도 서식 유지) 인쇄 설정: A4, 여백, 폭 맞춤, 바닥글 페이지 번호"""
+    from openpyxl.worksheet.page import PageMargins
+    for ws in wb.worksheets:
+        if ws.title == "표지":
+            continue
+        wide = ws.title in (EVIDENCE_SHEET, SECURITY_GUIDE_SHEET)
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_margins = PageMargins(left=0.5, right=0.5, top=0.7, bottom=0.7, header=0.3, footer=0.3)
+        ws.print_options.horizontalCentered = True
+        ws.oddFooter.left.text = "&A"
+        ws.oddFooter.center.text = "- &P / &N -"
+        ws.oddFooter.right.text = "&D"
+        if wide:
+            ws.page_setup.orientation = "landscape"
+        elif ws.page_setup.orientation is None:
+            ws.page_setup.orientation = "portrait"
+        if ws.title == "요약 통계" and (ws.sheet_properties.pageSetUpPr is None or not ws.sheet_properties.pageSetUpPr.fitToPage):
+            continue   # 호스트가 많은 요약 통계는 폭 맞춤을 강제하지 않음(글자가 지나치게 작아짐)
+        if ws.sheet_properties.pageSetUpPr is None:
+            ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
+        if ws.page_setup.fitToWidth is None or ws.page_setup.fitToWidth == 0:
+            ws.page_setup.fitToWidth = 1
+        if ws.page_setup.fitToHeight is None:
+            ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
 
 
 def _no_results_stop(mode, category):
@@ -8751,6 +9410,7 @@ def run_convert(mode, category, base_dir, criteria_excel):
     base_dir: convert/ 루트 폴더
     criteria_excel: 기준 엑셀 경로
     """
+    _RUN_NOTES.clear()
     # 웹/WAS는 유형별 자동 분류 전용 함수로 처리
     if category == "webwas":
         run_webwas_convert(mode, base_dir, criteria_excel)
@@ -8807,10 +9467,10 @@ def run_convert(mode, category, base_dir, criteria_excel):
         print(f"[INFO] 평가항목 {len(criteria_items)}개 로드 완료 ({'전자금융' if mode=='EF' else '주요정보'} 기준)")
     known_codes = dict(criteria_items, **{k: {} for k in KISA_GUIDE_ITEMS}) if kisa_mode else criteria_items
 
+    hs = _HostSet()
+    scope = _read_scope(cat_dir)
+
     # 각 입력 파일 파싱
-    all_results = {}
-    evidences   = {}
-    hosts_info  = []
     for fname in sorted(input_files):
         path  = os.path.join(input_dir, fname)
         pure  = os.path.splitext(fname)[0]
@@ -8826,11 +9486,14 @@ def run_convert(mode, category, base_dir, criteria_excel):
             hinfo["hostname"] = pure
 
         if input_mode == "pipe":
-            res = parse_pipe(text)
+            res = parse_pipe(text, fname)
             if _category_mismatch(res, known_codes, fname):
                 continue
             if not kisa_mode and any(k in KISA_GUIDE_ITEMS for k in res) and not any(k in criteria_items for k in res):
                 continue
+            if not _scope_check(scope, hinfo, fname):
+                continue
+            raw_codes = set(res)
             evd_path = path if evidence_only else find_evidence_file(path)
             if evd_path:
                 evidence = parse_evidence(evd_path)
@@ -8844,7 +9507,7 @@ def run_convert(mode, category, base_dir, criteria_excel):
                     if sub_key and not hinfo.get("os"):
                         hinfo["os"] = f"{sub_key} (추정)"
             elif category == "dbms":
-                sub_key = detect_dbms_vendor(text)
+                sub_key = detect_dbms_vendor(text)   # 관리형(RDS/Aurora/Azure)이면 기준 엑셀의 RDS-*·Aurora-*·Azure-* 열 키를 반환
             elif category == "security":
                 mdev = re.search(r"^#\s*장비유형\s*:\s*(\S+)", text, re.M)
                 dev = mdev.group(1).upper().replace("-", "") if mdev else ""
@@ -8885,7 +9548,14 @@ def run_convert(mode, category, base_dir, criteria_excel):
                     res[code] = (RESULT_MANUAL, "스크립트 미점검 항목 (수동 확인 필요)")
         else:  # network config
             vendor = detect_net_vendor(text)
-            res    = build_net_checks(lines, text)
+            if not _scope_check(scope, _net_scope_info(hinfo, text, pure), fname):
+                continue
+            try:
+                res = _mask_results(build_net_checks(lines, text))
+            except Exception as e:   # 한 장비의 파싱 오류가 전체 변환을 막지 않게
+                print(f"[경고] {fname}: 네트워크 설정 분석 중 오류({type(e).__name__}: {e}) → 이 장비는 제외")
+                continue
+            raw_codes = set(res)
             sub_key = None
             # 판정된 항목도 평가대상(장비 유형·벤더 그룹) 아니면 N-A
             for code in list(res):
@@ -8893,15 +9563,26 @@ def run_convert(mode, category, base_dir, criteria_excel):
                 if item and res[code][0] != RESULT_NA and not net_applicable(item, text, lines):
                     res[code] = (RESULT_NA, f"평가대상 아님 (장비 유형 {detect_net_dtype(lines)}·벤더 {vendor} 해당 없음 - 평가기준 평가대상 열)")
             if mode == "MI":   # 가이드 항목 직접 판정 (통합 점검 항목 분리)
-                res.update(build_net_kisa_checks(lines, text))
+                try:
+                    kres = _mask_results(build_net_kisa_checks(lines, text))
+                except Exception as e:
+                    print(f"[경고] {fname}: 주요정보 N-xx 판정 중 오류({type(e).__name__}: {e}) → 연계 NET 항목으로 대체")
+                    kres = {}
+                res.update(kres)
+                raw_codes |= set(kres)
+            mv = re.search(r"^\s*(?:version|JUNOS|Software Version)\s+(\S+)", text, re.M | re.I)
+            hn = _net_hostname(text)
+            if hn and hinfo["hostname"] == pure:
+                hinfo["hostname"] = hn
             if not hinfo.get("os"):
-                mv = re.search(r"^\s*(?:version|JUNOS|Software Version)\s+(\S+)", text, re.M | re.I)
-                hn = re.search(r"^\s*hostname\s+(\S+)", text, re.M)
-                if hn and hinfo["hostname"] == pure:
-                    hinfo["hostname"] = hn.group(1)
                 brand, model, fw = _net_brand(text)
                 ver = mv.group(1) if mv else fw
                 hinfo["os"] = " ".join(x for x in ((brand or vendor), model, ver) if x)
+            if not hinfo.get("ip"):   # 설정에서 관리 IP 추정 (헤더 메타데이터가 없는 config)
+                ips = _net_mgmt_ips(text)
+                if ips:
+                    hinfo["ips"] = ips[:4]
+                    hinfo["ip"] = ", ".join(ips[:4])
             net_subs = detect_net_subtypes(text, lines)
             for code in criteria_items:
                 if code in res: continue
@@ -8916,106 +9597,136 @@ def run_convert(mode, category, base_dir, criteria_excel):
         res = run_eos_check(category, res, text, base_dir)
 
         detected_sub = sub_key if input_mode == "pipe" else "GENERIC"
-        if kisa_mode:   # 가이드 항목 변환 후 현황 구성
-            evidences[hinfo["hostname"]] = evidence
-        else:
+        if not kisa_mode:   # 전자금융/가이드 변환 없는 분야는 여기서 현황 구성 (가이드 항목 변환 후 구성은 _kisa_groups)
             res = compose_status(res, evidence, criteria_items, detected_sub)
-        _h = hinfo["hostname"]
-        if _h in all_results:   # 같은 호스트 결과 파일이 여럿(전자금융 + 주요정보 전용 스크립트 등) → 판정·증적 병합, 대상 1대 (파일 순서 무관)
-            _old_res, _old_sub = all_results[_h]
-            res = {**_old_res, **res}
-            detected_sub = detected_sub or _old_sub
-            if _h in evidences:
-                evidences[_h] = {**evidences[_h], **(evidence or {})}
-            for _hi in hosts_info:
-                if _hi.get("hostname") == _h:
-                    for _k, _v in hinfo.items():
-                        if _v and not _hi.get(_k):
-                            _hi[_k] = _v
-            print(f"[INFO] {fname}: 같은 호스트({_h})의 다른 결과 파일과 병합")
-            all_results[_h] = (res, detected_sub)
-            continue
-        all_results[_h] = (res, detected_sub)
-        hosts_info.append(hinfo)
-        total = sum(1 for k in res if k in criteria_items)
-        bad   = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_BAD)
-        good  = sum(1 for k, v in res.items() if k in criteria_items and v[0] == RESULT_GOOD)
+        key = hs.add(hinfo, res, detected_sub, evidence, fname, raw_codes, _mtime(path))
+        r2 = hs.all_results[key][0]
+        total = sum(1 for k in r2 if k in criteria_items)
+        bad   = sum(1 for k, v in r2.items() if k in criteria_items and v[0] == RESULT_BAD)
+        good  = sum(1 for k, v in r2.items() if k in criteria_items and v[0] == RESULT_GOOD)
         print(f"[INFO] {fname} → 총 {total}개 / 양호 {good} / 취약 {bad}")
 
-    if not all_results:
+    if not hs.all_results:
         _no_results_stop(mode, category)
         return
-    # 주요정보(MI): 가이드 항목 체계로 변환 (서버 Unix/Windows 혼재 시 보고서 분리)
-    if mode == "MI" and category in KISA_CATEGORY_FAMILY:
-        groups = _kisa_groups(category, all_results, hosts_info, criteria_items, evidences)
-    else:
-        groups = [("", all_results, hosts_info, criteria_items)]
-    for label, g_results, g_hosts, g_items in groups:
-        _write_report(mode, category, cat_dir, base_dir, g_results, g_hosts, g_items, label)
-    if category in _EOS_CATS:   # 서버·DBMS·네트워크: 대상별 OS·버전·커널·제품 EoS 현황 .txt
-        try:
-            write_eos_inventory(base_dir, [category], cat_dir)
-        except Exception as e:
-            print(f"[경고] EoS 현황 생성 실패: {e}")
+    _finish(category, mode, cat_dir, base_dir, hs, criteria_items)
 
 
-def _write_report(mode, category, cat_dir, base_dir, all_results, hosts_info, criteria_items, label=""):
-    """상세보고서 워크북 생성·저장 + 감사 로그 (label: 파일명 구분자, 예: Unix/Windows)"""
-    # 새 워크북 생성 (템플릿 불필요)
+def _net_hostname(text):
+    """네트워크 config 의 장비 이름: IOS/ASA/NX-OS 'hostname', Junos 'set system host-name'/'host-name x;', 'sysname', D-Link 'config command_prompt'"""
+    for pat in (r"^\s*hostname\s+\"?([^\s\";]+)", r"^\s*(?:set\s+system\s+)?host-name\s+\"?([^\s\";]+)",
+                r"^\s*sysname\s+(\S+)", r"^\s*config\s+command_prompt\s+\"?([^\s\"]+)"):
+        m = re.search(pat, text, re.M | re.I)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _net_mgmt_ips(text):
+    """네트워크 config 에서 장비 IP 추정: 'ip address a.b.c.d', Junos 'family inet address a.b.c.d/n', D-Link 'ipif … ipaddress a.b.c.d/n'"""
+    ips = []
+    for pat in (r"^\s*ip address\s+(\d+\.\d+\.\d+\.\d+)(?:\s|/)", r"\bfamily inet address\s+(\d+\.\d+\.\d+\.\d+)(?:/|\s|;|$)",
+                r"^\s*address\s+(\d+\.\d+\.\d+\.\d+)/\d+\s*;", r"\bipaddress\s+(\d+\.\d+\.\d+\.\d+)(?:/|\s|$)"):
+        for m in re.finditer(pat, text, re.M | re.I):
+            ip = m.group(1)
+            if ip not in ips and not ip.startswith("127.") and ip != "0.0.0.0":
+                ips.append(ip)
+    return ips
+
+
+def _net_scope_info(hinfo, text, pure):
+    """네트워크 config 의 범위 판정용 호스트 정보 (config 의 hostname·관리 IP 포함)"""
+    info = dict(hinfo)
+    hn = _net_hostname(text)
+    if hn:
+        info["hostname"] = hn
+    info["ips"] = list(info.get("ips") or []) + _net_mgmt_ips(text)
+    return info
+
+
+def _write_report(mode, category, cat_dir, base_dir, all_results, hosts_info, criteria_items, label="", evidences=None, file_tag=None):
+    """상세보고서 워크북 생성·저장 + 감사 로그 (label: 파일명 구분자, 예: Unix/Windows)
+    evidences: {호스트: {증적 키: 증적 원문}} — '증적 원문' 시트와 항목코드 링크에 사용"""
+    _apply_override(cat_dir, all_results, criteria_items, hosts_info)
+
     wb = openpyxl.Workbook()
     print(f"[INFO] 보고서 생성 중...")
 
+    _init_sheet_names(list(all_results.keys()))   # 시트명 정규화를 먼저 확정 (개요·통계 시트의 시트 참조 수식에 사용)
+    entries, _key_row, code_rows = _plan_evidence(all_results, evidences, criteria_items)
+    # 현황 셀이 너무 길면 앞부분 + 증적 시트 참조로 줄임 (전체 원문은 증적 원문 시트에 보존)
+    capped = {}
+    for host, (res, sub) in all_results.items():
+        rr = code_rows.get(host, {})
+        capped[host] = ({c: (v[0], _cap_status(v[1], rr.get(c))) for c, v in res.items()}, sub)
+
     _create_cover_sheet(wb, mode, category, hosts_info)
     _create_overview_sheet(wb, mode, category, hosts_info, criteria_items,
-                           next(iter(all_results), None))
+                           next(iter(capped), None))
     _create_revision_sheet(wb)
-    _init_sheet_names(list(all_results.keys()))
-    target_row_map = _create_target_sheet(wb, hosts_info, all_results)
-    _create_security_stats_sheet(wb, all_results, criteria_items, hosts_info, category)
-    _create_summary_stats_sheet(wb, all_results, criteria_items)
+    target_row_map = _create_target_sheet(wb, hosts_info, capped)
+    _create_security_stats_sheet(wb, capped, criteria_items, hosts_info, category)
+    _create_summary_stats_sheet(wb, capped, criteria_items)
 
-    for hostname, (res, detected_sub) in all_results.items():
+    for hostname, (res, detected_sub) in capped.items():
         hi = next((h for h in hosts_info if h["hostname"] == hostname), {})
         _create_detail_sheet(wb, hostname, res, criteria_items, detected_sub, hi,
-                             target_row_map.get(hostname))
+                             target_row_map.get(hostname), code_rows.get(hostname))
         filled = sum(1 for code in criteria_items if code in res)
         print(f"[INFO] {hostname}: {filled}개 항목 기입 완료")
 
-    # 저장
-    _create_vuln_list_sheet(wb, all_results, criteria_items)
-    _create_review_sheet(wb, all_results, criteria_items)
-    _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items)
+    _create_vuln_list_sheet(wb, capped, criteria_items)
+    _create_review_sheet(wb, capped, criteria_items)
+    _create_security_guide_sheet(wb, capped, hosts_info, criteria_items)
+    _create_evidence_sheet(wb, entries, criteria_items)
+    _apply_print_setup(wb)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_str  = "전자금융" if mode == "EF" else "주요정보"
-    cat_str   = CAT_LABEL.get(category, category)
+    cat_str   = file_tag or re.sub(r'[\\/:*?"<>|]', "", CAT_LABEL.get(category, category))
     out_name  = f"상세보고서_{mode_str}_{cat_str}{'_' + label if label else ''}_{timestamp}.xlsx"
     out_path  = os.path.join(cat_dir, out_name)
+    seq = 1
+    while os.path.exists(out_path):   # 같은 초에 만든 다른 보고서(Unix/Windows 분리 등)를 덮어쓰지 않음
+        seq += 1
+        out_path = os.path.join(cat_dir, out_name[:-5] + f"_{seq}.xlsx")
     wb.save(out_path)
     total_bad = sum(sum(1 for v in res.values() if v[0] == RESULT_BAD)
                     for res, _ in all_results.values())
     print(f"\n[완료] 상세보고서 저장: {out_path}")
-    print(f"  시트 구성: 표지 / 개요 / 개정이력 / 점검대상 / 보안수준 통계 / 요약 통계 / 호스트 상세 {len(all_results)}개")
+    print(f"  시트 구성: 표지 / 개요 / 개정이력 / 점검대상 / 보안수준 통계 / 요약 통계 / 취약점 목록 / 검토·수정 / 호스트 상세 {len(all_results)}개"
+          + (" / 증적 원문" if entries else ""))
     print(f"  총 점검 대상: {len(all_results)}대 / 전체 취약: {total_bad}건")
 
     audit_targets = []
     for hostname, (res, detected_sub) in all_results.items():
         filtered = {code: res.get(code, (RESULT_MANUAL, "")) for code in criteria_items}
-        good = sum(1 for v in filtered.values() if v[0] == RESULT_GOOD)
-        bad  = sum(1 for v in filtered.values() if v[0] == RESULT_BAD)
-        na_c = sum(1 for v in filtered.values() if v[0] == RESULT_NA)
-        mc   = sum(1 for v in filtered.values() if v[0] == RESULT_MANUAL)
-        audit_targets.append({
-            "name": hostname, "subtype": detected_sub,
-            "good": good, "bad": bad, "na": na_c, "manual": mc,
-            "input_file": f"{hostname}.txt",
-        })
+        cnt = {k: sum(1 for v in filtered.values() if v[0] == k) for k in ALL_RESULTS}
+        hi = next((h for h in hosts_info if h["hostname"] == hostname), {})
+        t = {"name": hostname, "subtype": detected_sub,
+             "good": cnt[RESULT_GOOD], "bad": cnt[RESULT_BAD], "na": cnt[RESULT_NA],
+             "manual": cnt[RESULT_MANUAL], "unable": cnt[RESULT_UNABLE],
+             "input_file": hi.get("src_file") or f"{hostname}.txt"}
+        if hi.get("web_info"):
+            t["web_info"] = hi["web_info"]
+        if hi.get("ip"):
+            t["ip"] = hi["ip"]
+        audit_targets.append(t)
     write_audit_log(base_dir, mode, category, audit_targets, out_path)
 
 
 # ================================================================
 # CLI 메뉴
 # ================================================================
+def _ask(prompt):
+    """입력 한 줄 (파이프·리다이렉트로 입력이 끝났을 때(EOF)는 안내 후 종료)"""
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        print("\n[중단] 입력이 끝났습니다(EOF). 대화형 터미널에서 실행하거나 선택값을 입력으로 전달하세요.")
+        sys.exit(1)
+
+
 def main():
     print("=" * 60)
     print("  전자금융기반시설 / 주요정보통신기반시설")
@@ -9024,14 +9735,14 @@ def main():
 
     # ── 기준 엑셀 위치 ─────────────────────────────────────────
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    
+
     # 기준 엑셀 탐색
     criteria_candidates = [
         os.path.join(base_dir, "전자금융기반시설_보안_취약점_평가기준_제2026-1호.xlsx"),
         os.path.join(base_dir, "criteria.xlsx"),
     ]
-    criteria_candidates += [os.path.join(base_dir, f) for f in os.listdir(base_dir)
-                             if "취약점" in f and "평가기준" in f and f.endswith(".xlsx")]
+    criteria_candidates += [os.path.join(base_dir, f) for f in sorted(os.listdir(base_dir))
+                             if "취약점" in f and "평가기준" in f and f.endswith(".xlsx") and not f.startswith("~$")]
     criteria_excel = next((p for p in criteria_candidates if os.path.exists(p)), None)
 
     if not criteria_excel:
@@ -9046,7 +9757,7 @@ def main():
     print("  1. 전자금융기반시설 (전자금융감독규정 준거)")
     print("  2. 주요정보통신기반시설 (과학기술정보통신부 고시 준거)")
     while True:
-        sel = input("  선택 (1/2): ").strip()
+        sel = _ask("  선택 (1/2): ")
         if sel == "1":  mode = "EF"; mode_name = "전자금융기반시설"; break
         if sel == "2":  mode = "MI"; mode_name = "주요정보통신기반시설"; break
         print("  1 또는 2를 입력하세요.")
@@ -9060,12 +9771,12 @@ def main():
     print(f"  1. 서버           ({codes[0]}: Linux/Unix/Windows - AIX, HP-UX, LINUX, Solaris, Windows)")
     print(f"  2. 웹서버/WAS     ({codes[1]}: Apache, Nginx, WebtoB, Tomcat, JEUS, IIS)")
     print(f"  3. 데이터베이스   ({codes[2]}: Oracle, MSSQL, MySQL, MariaDB, PostgreSQL, Tibero)")
-    print(f"  4. 네트워크 장비  ({codes[3]}: Cisco, A10, Alteon, Juniper, D-Link)")
+    print(f"  4. 네트워크 장비  ({codes[3]}: Cisco IOS/ASA/NX-OS, A10, Alteon, Juniper, D-Link)")
     print(f"  5. 보안장비       ({codes[4]}: FW, VPN, IDS, IPS, DDoS, WAF)")
     print(f"  6. PC(업무용단말) ({codes[5]}: Windows 10/11, macOS)")
     print("  7. EoS 현황       (서버·웹/WAS·DBMS·네트워크 OS·버전·커널 → 지원 종료 대수 .txt)")
     while True:
-        sel = input("  선택 (1~7): ").strip()
+        sel = _ask("  선택 (1~7): ")
         if sel == "7":
             write_eos_inventory(base_dir)
             return

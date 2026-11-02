@@ -7,3 +7,9 @@
 converter/*/output/
 converter/network/config/
 converter/logs/
+
+# 파이썬 캐시
+__pycache__/
+
+# 에이전트 작업 사본
+.claude/worktrees/

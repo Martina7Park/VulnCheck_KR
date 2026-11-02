@@ -1,5 +1,5 @@
 #!/bin/bash
-if [ -z "$BASH_VERSION" ]; then for _b in /bin/bash /usr/bin/bash /opt/freeware/bin/bash /usr/local/bin/bash /usr/contrib/bin/bash; do [ -x $_b ] && exec $_b "$0" "$@"; done; echo "bash 필요 (AIX: AIX Toolbox bash / HP-UX: Porting Centre bash 설치 후 재실행)"; exit 1; fi   # sh 로 실행 시 bash 로 재실행 (declare -A 등 bash 전용 문법)
+if [ -z "$BASH_VERSION" ]; then for _b in /bin/bash /usr/bin/bash /opt/freeware/bin/bash /usr/local/bin/bash /usr/contrib/bin/bash; do [ -x $_b ] && exec $_b "$0" "$@"; done; echo "bash 필요 (AIX: AIX Toolbox bash / HP-UX: Porting Centre bash 설치 후 재실행)"; exit 1; fi   # sh 로 실행 시 bash 로 재실행 (process substitution 등 bash 전용 문법)
 unset LC_ALL; export LC_MESSAGES=C LC_TIME=C          # apt/lastlog 등 명령 출력·날짜를 영문 고정 (ko_KR 로케일 판정 차이 방지)
 # ================================================================
 # 서버(Unix/Linux) 보안 취약점 자동 점검 스크립트 — 전자금융기반시설
@@ -14,14 +14,18 @@ unset LC_ALL; export LC_MESSAGES=C LC_TIME=C          # apt/lastlog 등 명령 �
 #   AIX 6.1~7.3 / HP-UX 11i / Solaris 10~11
 #
 # [사전 조건]
-#   - root 권한 필요 (sudo bash 또는 root 로그인)
+#   - root 권한 필요 (sudo bash 또는 root 로그인) — 비root 실행 시 shadow·sudoers·타 계정 홈 등
+#     읽을 수 없는 자료는 해당 항목을 '점검불가' 로 처리한다.
 #
 # [실행 방법]
 #   bash check_server_srv.sh > /tmp/$(hostname)_srv.txt
 #
 # [산출물]
-#   1) 표준출력: SRV-항목코드|결과|근거설명  (양호/취약/수동확인/N-A)
-#   2) 증적 파일: /tmp/<호스트명>_srv_evidence.txt
+#   1) 표준출력: SRV-항목코드|결과|근거설명  (양호/취약/수동확인/점검불가/N-A)
+#      맨 앞 '#' 헤더에 IP·실행 계정·클라우드 정보를 기록한다.
+#      평가기준 평가항목(_GUIDE_SRV 106개)만 실행·출력한다.
+#   2) 증적 파일: /tmp/<호스트명>_srv_evidence.txt  (소유자만 읽도록 권한 600, 비밀번호 해시·SNMP community 는 마스킹)
+#   3) 결과 사본: /tmp/<호스트명>_srv.txt
 #
 # ================================================================
 
@@ -78,9 +82,92 @@ AIX)     PATH="/opt/freeware/bin:$PATH" ;;
 HPUX)    PATH="/usr/local/bin:$PATH" ;;
 esac; export PATH
 HN=$(hostname 2>/dev/null || uname -n)
+_UMASK_ORIG=$(umask 2>/dev/null)   # SRV-122 가 점검하는 실행 계정의 원래 umask
+umask 077   # 결과·증적 파일(sudoers·SNMP·계정 정보 포함)은 소유자만 읽도록 (생성 파일 권한 600)
+_safe_file() {   # /tmp 의 예측 가능한 파일명 보호: 심볼릭 링크·타 사용자 소유 파일은 지우고 새로 만들고, 권한을 600 으로 제한
+    [ -L "$1" ] && rm -f "$1" 2>/dev/null
+    [ -e "$1" ] && [ ! -O "$1" ] && rm -f "$1" 2>/dev/null
+    ( : >> "$1" ) 2>/dev/null && chmod 600 "$1" 2>/dev/null
+}
+
+# ── 헤더 메타데이터: IP / 실행 계정 / 클라우드 (수집 실패해도 점검은 계속) ──
+_ip_list() {   # 루프백을 제외한 IPv4 전부 (Linux ip / UNIX ifconfig -a / HP-UX netstat -in)
+    local l
+    l=$(ip -4 -o addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')
+    [ -z "$l" ] && l=$( { ifconfig -a 2>/dev/null || /usr/sbin/ifconfig -a 2>/dev/null; } | awk '{for(i=1;i<NF;i++) if($i=="inet"){v=$(i+1); sub(/^addr:/,"",v); print v}}')
+    [ -z "$l" ] && l=$(netstat -in 2>/dev/null | awk 'NR>1 && $4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $4}')
+    [ -z "$l" ] && l=$(hostname -I 2>/dev/null | tr ' ' '\n')
+    l=$(echo "$l" | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $1 !~ /^127\./ && $1 != "0.0.0.0" && !s[$1]++ {printf "%s%s", (n++?", ":""), $1}')
+    echo "${l:-미확인}"
+}
+_imds_req() {   # $1=메서드(GET|PUT) $2=URL 나머지=헤더('이름: 값', 빈 값은 무시) — 타임아웃 2초, 실패 시 비어 있음·rc≠0
+    local m="$1" url="$2" h; shift 2
+    if command -v curl >/dev/null 2>&1; then
+        local a=(); for h in "$@"; do [ -n "$h" ] && a+=(-H "$h"); done
+        curl -s -f -X "$m" --noproxy '*' --connect-timeout 2 -m 2 "${a[@]}" "$url" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        local a=(); for h in "$@"; do [ -n "$h" ] && a+=(--header="$h"); done
+        [ "$m" = PUT ] && a+=(--method=PUT --body-data=)
+        wget -q -O - --no-proxy -T 2 -t 1 "${a[@]}" "$url" 2>/dev/null
+    else return 127; fi
+}
+_CLOUD="미확인"; _CLOUD_ID=""; _CLOUD_REGION=""; _CLOUD_SG=""   # 방화벽 항목(SRV-027·155)에서 ${_CLOUD:-} 로 참조
+_cloud_detect() {
+    local base="${_IMDS_BASE:-http://169.254.169.254}" tok th r mac hint sgs="" rc unreach=0   # _IMDS_BASE 는 시험용 재정의
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || return 0   # 조회 수단 없음 = 미확인
+    # AWS (IMDSv2 토큰 먼저, 실패하면 v1)
+    tok=$(_imds_req PUT "$base/latest/api/token" "X-aws-ec2-metadata-token-ttl-seconds: 60"); rc=$?
+    case "$rc" in 7|28|4) unreach=1 ;; esac   # 연결 거부·타임아웃: IMDS 주소에 접속 자체가 안 되면 Azure·GCP 시도는 생략 (최대 2초)
+    th=""; [ -n "$tok" ] && th="X-aws-ec2-metadata-token: $tok"
+    [ "$unreach" = 1 ] || r=$(_imds_req GET "$base/latest/meta-data/instance-id" "$th")
+    case "$r" in i-[0-9a-f]*)
+        _CLOUD="AWS"; _CLOUD_ID="$r"
+        r=$(_imds_req GET "$base/latest/meta-data/placement/region" "$th")
+        [ -z "$r" ] && r=$(_imds_req GET "$base/latest/meta-data/placement/availability-zone" "$th" | sed 's/[a-z]$//')
+        _CLOUD_REGION="$r"
+        for mac in $(_imds_req GET "$base/latest/meta-data/network/interfaces/macs/" "$th" | tr -d '/'); do
+            sgs="${sgs}
+$(_imds_req GET "$base/latest/meta-data/network/interfaces/macs/$mac/security-group-ids" "$th")"
+        done
+        _CLOUD_SG=$(echo "$sgs" | awk 'NF && !s[$1]++ {printf "%s%s", (n++?",":""), $1}')
+        return 0 ;;
+    esac
+    # Azure (Metadata:true, 인스턴스 메타데이터에는 NSG 정보가 없음)
+    [ "$unreach" = 1 ] || r=$(_imds_req GET "$base/metadata/instance/compute?api-version=2021-02-01&format=json" "Metadata: true")
+    case "$r" in *vmId*)
+        _CLOUD="Azure"
+        _CLOUD_ID=$(echo "$r" | sed -n 's/.*"vmId" *: *"\([^"]*\)".*/\1/p')
+        _CLOUD_REGION=$(echo "$r" | sed -n 's/.*"location" *: *"\([^"]*\)".*/\1/p')
+        return 0 ;;
+    esac
+    # GCP (Metadata-Flavor: Google, 방화벽 규칙은 네트워크 태그로 적용)
+    [ "$unreach" = 1 ] && r="" || r=$(_imds_req GET "$base/computeMetadata/v1/instance/id" "Metadata-Flavor: Google")
+    case "$r" in [0-9]*)
+        _CLOUD="GCP"; _CLOUD_ID="$r"
+        _CLOUD_REGION=$(_imds_req GET "$base/computeMetadata/v1/instance/zone" "Metadata-Flavor: Google" | sed 's#.*/##; s/-[a-z]$//')
+        _CLOUD_SG=$(_imds_req GET "$base/computeMetadata/v1/instance/tags" "Metadata-Flavor: Google" | tr -d '[]" \n')
+        [ -n "$_CLOUD_SG" ] && _CLOUD_SG="네트워크 태그 ${_CLOUD_SG}"
+        return 0 ;;
+    esac
+    # 응답 없음: DMI 가 클라우드 가상머신을 가리키면 IMDS 차단 등으로 확인 불가, 아니면 클라우드 아님
+    hint=$(cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/chassis_asset_tag 2>/dev/null | tr '\n' ' ')
+    case "$hint" in *[Aa]mazon*|*Google*|*"Virtual Machine"*|*OpenStack*|*Alibaba*|*"7783-7084"*) _CLOUD="미확인" ;; *) _CLOUD="없음" ;; esac
+    return 0
+}
+_cloud_line() {
+    case "$_CLOUD" in
+    AWS|Azure|GCP)
+        echo "${_CLOUD} (instance ${_CLOUD_ID:-미확인}, region ${_CLOUD_REGION:-미확인}, SG: ${_CLOUD_SG:-$([ "$_CLOUD" = Azure ] && echo 'NSG 는 IMDS 미제공' || echo 미확인)})" ;;
+    *) echo "$_CLOUD" ;;
+    esac
+}
+_cloud_detect
+_NONROOT=0; _WHO=$(id -un 2>/dev/null || echo "?")
+[ "$(id -u 2>/dev/null)" != "0" ] && { _NONROOT=1; _WHO="${_WHO} (관리자 아님 - 일부 항목 점검불가)"; }
+
 # ── 결과 사본 자동 저장: '> 파일' 리다이렉트를 빠뜨려도 판정 결과가 증적과 같은 위치에 남도록 표준출력을 복사 ──
 _RESF="/tmp/${HN}_srv.txt"
-if [ -z "$NO_RESULT_COPY" ] && ! [ /dev/fd/1 -ef "$_RESF" ] 2>/dev/null && ( : > "$_RESF" ) 2>/dev/null; then
+if [ -z "$NO_RESULT_COPY" ] && ! [ /dev/fd/1 -ef "$_RESF" ] 2>/dev/null && _safe_file "$_RESF"; then
     exec > >(tee "$_RESF"); _TEEPID=$!
 else
     _RESF=""
@@ -88,223 +175,231 @@ fi
 
 echo "# ============================================================"
 echo "# 점검 대상: ${HN}"
+echo "# IP: $(_ip_list)"
+echo "# 실행 계정: ${_WHO}"
+echo "# 클라우드: $(_cloud_line)"
 echo "# OS: ${OS_FAMILY} / ${OS_DISTRO} ${OS_MAJOR}"
 echo "# OS 상세: $( ( [ -r /etc/os-release ] && . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-$NAME $VERSION_ID}" ) || ( command -v oslevel >/dev/null 2>&1 && echo "AIX $(oslevel -s 2>/dev/null)" ) || ( [ -r /etc/release ] && head -1 /etc/release | sed 's/^ *//' ) || uname -sr 2>/dev/null)"
 echo "# 커널: $(uname -r 2>/dev/null)$( [ "$(uname -s 2>/dev/null)" = SunOS ] && echo " / $(uname -v 2>/dev/null)")"
 echo "# 점검 기준: 전자금융기반시설 보안 취약점 평가기준 제2026-1호 [서버]"
 echo "# 점검 일시: $(date '+%Y-%m-%d %H:%M:%S')"
 if [ "$OS_DISTRO" = "RHEL" ]; then
-    _id=$(. /etc/os-release 2>/dev/null; echo "$ID")
-    [ "$_id" = "centos" ] && echo "# [경고] CentOS는 전체 버전 EOL - 취약 판정 대상"
+    _id=$(. /etc/os-release 2>/dev/null; echo "$ID"); _nm=$(. /etc/os-release 2>/dev/null; echo "$NAME")
+    case "$_nm" in *Stream*) ;; *) [ "$_id" = "centos" ] && echo "# [경고] CentOS Linux는 전체 버전 EOL - 취약 판정 대상 (CentOS Stream 은 SRV-179 에서 주기별 판정)" ;; esac
 fi
 if [ "$OS_FAMILY" = "WINDOWS" ]; then
     echo "# [경고] Windows 환경(Git Bash)에서 실행됨 — Linux/Unix 전용 스크립트"
     echo "# [경고] Windows Server 점검은 check_server.ps1 사용"
 fi
+[ "$_NONROOT" = 1 ] && echo "# [경고] root 권한 아님 — /etc/shadow·sudoers·타 계정 홈 등 읽을 수 없는 자료는 해당 항목을 '점검불가' 로 처리, root 로 재점검 권고"
 echo "# ============================================================"
 
 # ── 결과 카운터 ──────────────────────────────────────────────────
-_CP=0; _CF=0; _CM=0; _CN=0
+_CP=0; _CF=0; _CM=0; _CN=0; _CU=0
 _EVD="/tmp/${HN}_srv_evidence.txt"
 # 증적 파일 쓰기 불가(다른 사용자 소유 기존 파일, /tmp 용량 부족 등) → 대체 경로 (쓰기 실패로 판정 중복 방지)
-if ! ( : >> "$_EVD" ) 2>/dev/null; then
+if ! _safe_file "$_EVD"; then
     _EVD=$(mktemp "${TMPDIR:-/tmp}/${HN}_evidence.XXXXXX" 2>/dev/null || echo "./${HN}_evidence_$$.txt")
     echo "# [경고] 기본 증적 파일에 쓸 수 없어 대체 경로 사용: $_EVD"
 fi
-_NONROOT=0; [ "$(id -u 2>/dev/null)" != "0" ] && { _NONROOT=1; echo "# [경고] root 권한 아님 — /etc/shadow·타 계정 홈 등 조회 불가 항목(SRV-022/074/096/122)은 수동확인 처리, root 로 재점검 권고"; }
 echo "# ================================================================" > "$_EVD"
 echo "# 증적 파일 (감사 추적용)" >> "$_EVD"
 echo "# 대상: ${HN} / ${OS_FAMILY} ${OS_DISTRO} ${OS_MAJOR}" >> "$_EVD"
+echo "# IP: $(_ip_list)" >> "$_EVD"
+echo "# 실행 계정: ${_WHO}" >> "$_EVD"
+echo "# 클라우드: $(_cloud_line)" >> "$_EVD"
 echo "# 생성: $(date '+%Y-%m-%d %H:%M:%S')" >> "$_EVD"
 echo "# ================================================================" >> "$_EVD"
 
-declare -A _INAME=(
-    [SRV-001]='안전한 네트워크 모니터링 서비스 사용'
-    [SRV-002]='패스워드 복잡성/최소 길이 설정'
-    [SRV-003]='네트워크 모니터링 서비스 접근통제 설정 적절성'
-    [SRV-004]='불필요한 SMTP 서비스 비활성화'
-    [SRV-005]='SMTP 서비스의 expn/vrfy 명령어 실행 제한 여부'
-    [SRV-006]='SMTP 서비스 로그 수준 설정 적절성'
-    [SRV-007]='SMTP 서비스 보안 패치 적용 여부'
-    [SRV-008]='SMTP 서비스의 DoS 방지 기능 설정 여부'
-    [SRV-009]='SMTP 서비스 스팸 메일 릴레이 제한 설정 여부'
-    [SRV-010]='SMTP 서비스의 메일 queue 처리 권한 설정 적절성'
-    [SRV-011]='시스템 관리자 계정의 FTP 사용 제한 여부'
-    [SRV-012]='.netrc 파일 내 중요 정보 미포함 여부'
-    [SRV-013]='Anonymous 계정의 FTP 서비스 접속 제한 여부'
-    [SRV-014]='NFS 접근통제 설정 적절성'
-    [SRV-015]='불필요한 NFS 서비스 비활성화'
-    [SRV-016]='불필요한 RPC 서비스 비활성화'
-    [SRV-017]='관리자 그룹 구성원 관리'
-    [SRV-018]='불필요한 하드디스크 기본 공유 비활성화'
-    [SRV-019]='관리자 그룹 구성원 적절성'
-    [SRV-020]='공유 기능에 대한 접근통제 설정 적절성'
-    [SRV-021]='FTP 서비스 접근통제 설정 적절성'
-    [SRV-022]='계정의 비밀번호 미설정, 빈 암호 사용 관리 여부'
-    [SRV-023]='원격 터미널 서비스의 암호화 설정 적절성'
-    [SRV-024]='취약한 Telnet 인증 방식 사용 제한 여부'
-    [SRV-025]='hosts.equiv 또는 .rhosts 설정 제한 여부'
-    [SRV-026]='root 계정 원격 접속 제한 여부'
-    [SRV-027]='서비스 접근 IP 및 포트 제한 여부'
-    [SRV-028]='원격 터미널 접속 타임아웃 설정 여부'
-    [SRV-029]='SMB 세션 중단 관리 설정 여부'
-    [SRV-030]='NFS 서비스 비활성화'
-    [SRV-031]='계정 목록 및 네트워크 공유 이름 노출 방지 여부'
-    [SRV-032]='automountd 서비스 비활성화'
-    [SRV-033]='불필요한 RPC 서비스 비활성화'
-    [SRV-034]='불필요한 서비스 비활성화'
-    [SRV-035]='취약한 서비스 비활성화'
-    [SRV-036]='Sendmail 서비스 비활성화'
-    [SRV-037]='취약한 FTP 서비스 비활성화'
-    [SRV-038]='웹서비스 디렉터리 리스팅'
-    [SRV-039]='웹 프로세스 권한 제한'
-    [SRV-040]='상위 디렉터리 접근 금지'
-    [SRV-041]='웹서비스 불필요한 파일 제거'
-    [SRV-042]='심볼릭 링크 사용 금지'
-    [SRV-043]='파일 업로드/다운로드 제한'
-    [SRV-044]='웹서비스 영역 분리'
-    [SRV-045]='최신 보안패치 적용 여부'
-    [SRV-046]='로그 정기 검토 및 보고'
-    [SRV-047]='시스템 로깅 설정'
-    [SRV-048]='su 사용 로그 설정'
-    [SRV-049]='접속 기록 파일 권한 설정'
-    [SRV-050]='로그인/로그아웃 기록 관리'
-    [SRV-051]='su 사용자 제한'
-    [SRV-052]='SMTP 서비스 비활성화'
-    [SRV-053]='SMTP expn/vrfy 명령어 제한'
-    [SRV-054]='SMTP 로그 수준 설정'
-    [SRV-055]='SMTP 보안 패치 적용'
-    [SRV-056]='SMTP DoS 방지 설정'
-    [SRV-057]='SMTP 릴레이 제한'
-    [SRV-058]='DNS 보안패치 적용'
-    [SRV-059]='DNS 영역전송 제한'
-    [SRV-060]='DNS Dynamic Update 비활성화'
-    [SRV-061]='DNS 최신 버전 사용'
-    [SRV-062]='DNS 서비스 정보 노출 방지 여부'
-    [SRV-063]='DNS Recursive Query 제한 설정 여부'
-    [SRV-064]='DNS 서비스 보안 패치 적용 여부'
-    [SRV-065]='Cron 서비스 사용 권한 제한'
-    [SRV-066]='DNS Zone Transfer 제한 설정 적절성'
-    [SRV-067]='로그온 경고 메시지 설정'
-    [SRV-068]='NFS 설정 파일 권한'
-    [SRV-069]='비밀번호 관리정책 설정 적절성'
-    [SRV-070]='취약한 패스워드 저장 방식 사용 제한 여부'
-    [SRV-071]='웹서비스 디렉터리 인덱싱'
-    [SRV-072]='기본 관리자 계정명(Administrator) 변경 여부'
-    [SRV-073]='관리자 그룹에 불필요한 사용자 제거'
-    [SRV-074]='불필요하거나 관리되지 않는 계정 제거'
-    [SRV-075]='비밀번호 복잡도 설정'
-    [SRV-076]='SNMP 접근통제 설정'
-    [SRV-077]='SNMP Community String 복잡성'
-    [SRV-078]='불필요한 Guest 계정 비활성화'
-    [SRV-079]='익명 사용자에게 부적절한 권한(Everyone) 제거'
-    [SRV-080]='일반 사용자의 프린터 드라이버 설치 제한 여부'
-    [SRV-081]='Crontab 설정파일 권한 설정 적절성'
-    [SRV-082]='시스템 주요 디렉터리 권한 설정 적절성'
-    [SRV-083]='시스템 스타트업 스크립트 권한 설정 적절성'
-    [SRV-084]='시스템 주요 파일 권한 설정 적절성'
-    [SRV-085]='PATH 환경변수 설정'
-    [SRV-086]='사용자 홈 디렉터리 소유자/권한'
-    [SRV-087]='설치된 C 컴파일러의 권한 설정 적절성'
-    [SRV-088]='Crontab 파일 권한'
-    [SRV-089]='hosts.equiv/.rhosts 파일 존재'
-    [SRV-090]='불필요한 원격 레지스트리 서비스 비활성화'
-    [SRV-091]='불필요하게 SUID, SGID bit가 설정된 파일 제거'
-    [SRV-092]='사용자 홈 디렉터리 경로 및 권한 설정 적절성'
-    [SRV-093]='불필요한 world writable 파일 제거'
-    [SRV-094]='Crontab 참조파일 권한 설정 적절성'
-    [SRV-095]='존재하지 않는 소유자 및 그룹 권한을 가진 파일 또는 디렉터리 제거'
-    [SRV-096]='사용자 환경파일의 소유자 또는 권한 설정 적절성'
-    [SRV-097]='FTP 서비스 디렉터리 접근권한 설정 적절성'
-    [SRV-098]='최소 필요 서비스만 유지'
-    [SRV-099]='네트워크 접근제어 설정'
-    [SRV-100]='시스템 계정 Shell 점검'
-    [SRV-101]='불필요한 예약 작업 제거'
-    [SRV-102]='세션 타임아웃 설정'
-    [SRV-103]='LAN Manager 인증 수준 적절성'
-    [SRV-104]='보안 채널 데이터 디지털 암호화 또는 서명 기능 설정 적절성'
-    [SRV-105]='불필요한 시작프로그램 제거'
-    [SRV-106]='root 외 UID 0 금지'
-    [SRV-107]='패스워드 최소 길이'
-    [SRV-108]='로그에 대한 접근통제 및 관리 적절성'
-    [SRV-109]='시스템 주요 이벤트 로그 설정 적절성'
-    [SRV-110]='소유자 없는 파일 점검'
-    [SRV-111]='로그 관리(logrotate) 설정'
-    [SRV-112]='Cron 서비스 로깅 설정 적절성'
-    [SRV-113]='네트워크 접근통제 설정'
-    [SRV-114]='xinetd 서비스 점검'
-    [SRV-115]='로그의 정기적 검토 및 보고 수행 여부'
-    [SRV-116]='“보안 감사를 수행할 수 없는 경우, 즉시 시스템 종료” 기능 비활성화'
-    [SRV-117]='감사 로깅(auditd) 설정'
-    [SRV-118]='주기적인 보안패치 및 벤더 권고사항 적용 여부'
-    [SRV-119]='백신 프로그램 업데이트 적용 여부'
-    [SRV-120]='보안 모듈(SELinux/AppArmor) 설정'
-    [SRV-121]='root 계정의 PATH 환경변수 설정 적절성'
-    [SRV-122]='umask 설정 적절성'
-    [SRV-123]='최종 로그인 사용자 계정 노출 방지 여부'
-    [SRV-124]='/etc/shadow 파일 권한'
-    [SRV-125]='화면보호기 설정 적절성'
-    [SRV-126]='자동 로그온 방지 설정 여부'
-    [SRV-127]='로그인 실패 횟수에 따른 접속 제한 설정'
-    [SRV-128]='NTFS 파일 시스템 사용 여부'
-    [SRV-129]='백신 프로그램 설치 여부'
-    [SRV-130]='불필요한 리스닝 서비스 점검'
-    [SRV-131]='SU 명령 사용가능 그룹 제한 설정 적절성'
-    [SRV-132]='NTP 시간 동기화 설정'
-    [SRV-133]='Cron 서비스 사용 계정 제한 설정 적절성'
-    [SRV-134]='스택 영역 실행 방지 설정 여부'
-    [SRV-135]='TCP 보안 설정 여부'
-    [SRV-136]='로그온 단계에서 "시스템 종료" 기능 비활성화'
-    [SRV-137]='네트워크 서비스 접근 권한 적절성'
-    [SRV-138]='백업 및 복구 권한 설정 적절성'
-    [SRV-139]='시스템 자원 소유권 변경 권한 설정 적절성'
-    [SRV-140]='이동식 미디어 포맷 및 꺼내기 허용 정책 설정 적절성'
-    [SRV-141]='감사 로그 설정 파일 관리'
-    [SRV-142]='중복 UID가 부여된 계정 제한 여부'
-    [SRV-143]='불필요한 프로토콜 모듈 제거'
-    [SRV-144]='/dev 경로에 불필요한 파일 제거'
-    [SRV-145]='파일 무결성 점검 도구 설치'
-    [SRV-146]='안티바이러스 설치 점검'
-    [SRV-147]='불필요한 네트워크 모니터링 서비스 비활성화'
-    [SRV-148]='부트로더 패스워드 설정'
-    [SRV-149]='디스크 볼륨 암호화 적용 여부'
-    [SRV-150]='로컬 로그온 허용 계정 제한 여부'
-    [SRV-151]='익명 SID/이름 변환 설정 제한 여부'
-    [SRV-152]='원격터미널 접속 가능한 사용자 그룹 제한 여부'
-    [SRV-153]='시스템 하드닝 설정'
-    [SRV-154]='커널 보안 파라미터 설정'
-    [SRV-155]='방화벽 설정 점검'
-    [SRV-156]='보안패치 주기 및 절차'
-    [SRV-157]='백업 설정 점검'
-    [SRV-158]='불필요한 Telnet 서비스 비활성화'
-    [SRV-159]='서비스 배너 정보 노출 방지'
-    [SRV-160]='패스워드 정책 설정'
-    [SRV-161]='ftpusers 파일의 소유자 및 권한 설정 적절성'
-    [SRV-162]='마운트 옵션 설정(nosuid/noexec)'
-    [SRV-163]='시스템 사용 주의사항 출력'
-    [SRV-164]='구성원이 존재하지 않는 GID 제거'
-    [SRV-165]='불필요하게 Shell이 부여된 계정 제거'
-    [SRV-166]='불필요한 숨김 파일 또는 디렉터리 제거'
-    [SRV-167]='NFS/Samba 공유 설정'
-    [SRV-168]='주요 설정파일 권한'
-    [SRV-169]='.forward/.exrc/.netrc 파일 점검'
-    [SRV-170]='SMTP 서비스 정보 노출 방지 여부'
-    [SRV-171]='FTP 서비스 정보 노출 방지 여부'
-    [SRV-172]='불필요한 시스템 자원 공유 제거'
-    [SRV-173]='DNS 서비스 동적 업데이트 설정 적절성'
-    [SRV-174]='불필요한 DNS 서비스 비활성화'
-    [SRV-175]='시간 동기화를 위한 NTP 설정'
-    [SRV-176]='비밀번호 저장 암호화 방식'
-    [SRV-177]='sudo 명령어 접근 권한 설정 적절성'
-    [SRV-179]='서비스 지원이 종료된(EoS) 시스템 및 장비 교체 여부'
-)
+_iname() {   # 항목코드 → 항목명 (bash 3 호환: 연관배열 대신 case)
+    case "$1" in
+    SRV-001) printf '%s' '안전한 네트워크 모니터링 서비스 사용' ;;
+    SRV-002) printf '%s' '패스워드 복잡성/최소 길이 설정' ;;
+    SRV-003) printf '%s' '네트워크 모니터링 서비스 접근통제 설정 적절성' ;;
+    SRV-004) printf '%s' '불필요한 SMTP 서비스 비활성화' ;;
+    SRV-005) printf '%s' 'SMTP 서비스의 expn/vrfy 명령어 실행 제한 여부' ;;
+    SRV-006) printf '%s' 'SMTP 서비스 로그 수준 설정 적절성' ;;
+    SRV-007) printf '%s' 'SMTP 서비스 보안 패치 적용 여부' ;;
+    SRV-008) printf '%s' 'SMTP 서비스의 DoS 방지 기능 설정 여부' ;;
+    SRV-009) printf '%s' 'SMTP 서비스 스팸 메일 릴레이 제한 설정 여부' ;;
+    SRV-010) printf '%s' 'SMTP 서비스의 메일 queue 처리 권한 설정 적절성' ;;
+    SRV-011) printf '%s' '시스템 관리자 계정의 FTP 사용 제한 여부' ;;
+    SRV-012) printf '%s' '.netrc 파일 내 중요 정보 미포함 여부' ;;
+    SRV-013) printf '%s' 'Anonymous 계정의 FTP 서비스 접속 제한 여부' ;;
+    SRV-014) printf '%s' 'NFS 접근통제 설정 적절성' ;;
+    SRV-015) printf '%s' '불필요한 NFS 서비스 비활성화' ;;
+    SRV-016) printf '%s' '불필요한 RPC 서비스 비활성화' ;;
+    SRV-017) printf '%s' '관리자 그룹 구성원 관리' ;;
+    SRV-018) printf '%s' '불필요한 하드디스크 기본 공유 비활성화' ;;
+    SRV-019) printf '%s' '관리자 그룹 구성원 적절성' ;;
+    SRV-020) printf '%s' '공유 기능에 대한 접근통제 설정 적절성' ;;
+    SRV-021) printf '%s' 'FTP 서비스 접근통제 설정 적절성' ;;
+    SRV-022) printf '%s' '계정의 비밀번호 미설정, 빈 암호 사용 관리 여부' ;;
+    SRV-023) printf '%s' '원격 터미널 서비스의 암호화 설정 적절성' ;;
+    SRV-024) printf '%s' '취약한 Telnet 인증 방식 사용 제한 여부' ;;
+    SRV-025) printf '%s' 'hosts.equiv 또는 .rhosts 설정 제한 여부' ;;
+    SRV-026) printf '%s' 'root 계정 원격 접속 제한 여부' ;;
+    SRV-027) printf '%s' '서비스 접근 IP 및 포트 제한 여부' ;;
+    SRV-028) printf '%s' '원격 터미널 접속 타임아웃 설정 여부' ;;
+    SRV-029) printf '%s' 'SMB 세션 중단 관리 설정 여부' ;;
+    SRV-030) printf '%s' 'NFS 서비스 비활성화' ;;
+    SRV-031) printf '%s' '계정 목록 및 네트워크 공유 이름 노출 방지 여부' ;;
+    SRV-032) printf '%s' 'automountd 서비스 비활성화' ;;
+    SRV-033) printf '%s' '불필요한 RPC 서비스 비활성화' ;;
+    SRV-034) printf '%s' '불필요한 서비스 비활성화' ;;
+    SRV-035) printf '%s' '취약한 서비스 비활성화' ;;
+    SRV-036) printf '%s' 'Sendmail 서비스 비활성화' ;;
+    SRV-037) printf '%s' '취약한 FTP 서비스 비활성화' ;;
+    SRV-038) printf '%s' '웹서비스 디렉터리 리스팅' ;;
+    SRV-039) printf '%s' '웹 프로세스 권한 제한' ;;
+    SRV-040) printf '%s' '상위 디렉터리 접근 금지' ;;
+    SRV-041) printf '%s' '웹서비스 불필요한 파일 제거' ;;
+    SRV-042) printf '%s' '심볼릭 링크 사용 금지' ;;
+    SRV-043) printf '%s' '파일 업로드/다운로드 제한' ;;
+    SRV-044) printf '%s' '웹서비스 영역 분리' ;;
+    SRV-045) printf '%s' '최신 보안패치 적용 여부' ;;
+    SRV-046) printf '%s' '로그 정기 검토 및 보고' ;;
+    SRV-047) printf '%s' '시스템 로깅 설정' ;;
+    SRV-048) printf '%s' 'su 사용 로그 설정' ;;
+    SRV-049) printf '%s' '접속 기록 파일 권한 설정' ;;
+    SRV-050) printf '%s' '로그인/로그아웃 기록 관리' ;;
+    SRV-051) printf '%s' 'su 사용자 제한' ;;
+    SRV-052) printf '%s' 'SMTP 서비스 비활성화' ;;
+    SRV-053) printf '%s' 'SMTP expn/vrfy 명령어 제한' ;;
+    SRV-054) printf '%s' 'SMTP 로그 수준 설정' ;;
+    SRV-055) printf '%s' 'SMTP 보안 패치 적용' ;;
+    SRV-056) printf '%s' 'SMTP DoS 방지 설정' ;;
+    SRV-057) printf '%s' 'SMTP 릴레이 제한' ;;
+    SRV-058) printf '%s' 'DNS 보안패치 적용' ;;
+    SRV-059) printf '%s' 'DNS 영역전송 제한' ;;
+    SRV-060) printf '%s' 'DNS Dynamic Update 비활성화' ;;
+    SRV-061) printf '%s' 'DNS 최신 버전 사용' ;;
+    SRV-062) printf '%s' 'DNS 서비스 정보 노출 방지 여부' ;;
+    SRV-063) printf '%s' 'DNS Recursive Query 제한 설정 여부' ;;
+    SRV-064) printf '%s' 'DNS 서비스 보안 패치 적용 여부' ;;
+    SRV-065) printf '%s' 'Cron 서비스 사용 권한 제한' ;;
+    SRV-066) printf '%s' 'DNS Zone Transfer 제한 설정 적절성' ;;
+    SRV-067) printf '%s' '로그온 경고 메시지 설정' ;;
+    SRV-068) printf '%s' 'NFS 설정 파일 권한' ;;
+    SRV-069) printf '%s' '비밀번호 관리정책 설정 적절성' ;;
+    SRV-070) printf '%s' '취약한 패스워드 저장 방식 사용 제한 여부' ;;
+    SRV-071) printf '%s' '웹서비스 디렉터리 인덱싱' ;;
+    SRV-072) printf '%s' '기본 관리자 계정명(Administrator) 변경 여부' ;;
+    SRV-073) printf '%s' '관리자 그룹에 불필요한 사용자 제거' ;;
+    SRV-074) printf '%s' '불필요하거나 관리되지 않는 계정 제거' ;;
+    SRV-075) printf '%s' '비밀번호 복잡도 설정' ;;
+    SRV-076) printf '%s' 'SNMP 접근통제 설정' ;;
+    SRV-077) printf '%s' 'SNMP Community String 복잡성' ;;
+    SRV-078) printf '%s' '불필요한 Guest 계정 비활성화' ;;
+    SRV-079) printf '%s' '익명 사용자에게 부적절한 권한(Everyone) 제거' ;;
+    SRV-080) printf '%s' '일반 사용자의 프린터 드라이버 설치 제한 여부' ;;
+    SRV-081) printf '%s' 'Crontab 설정파일 권한 설정 적절성' ;;
+    SRV-082) printf '%s' '시스템 주요 디렉터리 권한 설정 적절성' ;;
+    SRV-083) printf '%s' '시스템 스타트업 스크립트 권한 설정 적절성' ;;
+    SRV-084) printf '%s' '시스템 주요 파일 권한 설정 적절성' ;;
+    SRV-085) printf '%s' 'PATH 환경변수 설정' ;;
+    SRV-086) printf '%s' '사용자 홈 디렉터리 소유자/권한' ;;
+    SRV-087) printf '%s' '설치된 C 컴파일러의 권한 설정 적절성' ;;
+    SRV-088) printf '%s' 'Crontab 파일 권한' ;;
+    SRV-089) printf '%s' 'hosts.equiv/.rhosts 파일 존재' ;;
+    SRV-090) printf '%s' '불필요한 원격 레지스트리 서비스 비활성화' ;;
+    SRV-091) printf '%s' '불필요하게 SUID, SGID bit가 설정된 파일 제거' ;;
+    SRV-092) printf '%s' '사용자 홈 디렉터리 경로 및 권한 설정 적절성' ;;
+    SRV-093) printf '%s' '불필요한 world writable 파일 제거' ;;
+    SRV-094) printf '%s' 'Crontab 참조파일 권한 설정 적절성' ;;
+    SRV-095) printf '%s' '존재하지 않는 소유자 및 그룹 권한을 가진 파일 또는 디렉터리 제거' ;;
+    SRV-096) printf '%s' '사용자 환경파일의 소유자 또는 권한 설정 적절성' ;;
+    SRV-097) printf '%s' 'FTP 서비스 디렉터리 접근권한 설정 적절성' ;;
+    SRV-098) printf '%s' '최소 필요 서비스만 유지' ;;
+    SRV-099) printf '%s' '네트워크 접근제어 설정' ;;
+    SRV-100) printf '%s' '시스템 계정 Shell 점검' ;;
+    SRV-101) printf '%s' '불필요한 예약 작업 제거' ;;
+    SRV-102) printf '%s' '세션 타임아웃 설정' ;;
+    SRV-103) printf '%s' 'LAN Manager 인증 수준 적절성' ;;
+    SRV-104) printf '%s' '보안 채널 데이터 디지털 암호화 또는 서명 기능 설정 적절성' ;;
+    SRV-105) printf '%s' '불필요한 시작프로그램 제거' ;;
+    SRV-106) printf '%s' 'root 외 UID 0 금지' ;;
+    SRV-107) printf '%s' '패스워드 최소 길이' ;;
+    SRV-108) printf '%s' '로그에 대한 접근통제 및 관리 적절성' ;;
+    SRV-109) printf '%s' '시스템 주요 이벤트 로그 설정 적절성' ;;
+    SRV-110) printf '%s' '소유자 없는 파일 점검' ;;
+    SRV-111) printf '%s' '로그 관리(logrotate) 설정' ;;
+    SRV-112) printf '%s' 'Cron 서비스 로깅 설정 적절성' ;;
+    SRV-113) printf '%s' '네트워크 접근통제 설정' ;;
+    SRV-114) printf '%s' 'xinetd 서비스 점검' ;;
+    SRV-115) printf '%s' '로그의 정기적 검토 및 보고 수행 여부' ;;
+    SRV-116) printf '%s' '“보안 감사를 수행할 수 없는 경우, 즉시 시스템 종료” 기능 비활성화' ;;
+    SRV-117) printf '%s' '감사 로깅(auditd) 설정' ;;
+    SRV-118) printf '%s' '주기적인 보안패치 및 벤더 권고사항 적용 여부' ;;
+    SRV-119) printf '%s' '백신 프로그램 업데이트 적용 여부' ;;
+    SRV-120) printf '%s' '보안 모듈(SELinux/AppArmor) 설정' ;;
+    SRV-121) printf '%s' 'root 계정의 PATH 환경변수 설정 적절성' ;;
+    SRV-122) printf '%s' 'umask 설정 적절성' ;;
+    SRV-123) printf '%s' '최종 로그인 사용자 계정 노출 방지 여부' ;;
+    SRV-124) printf '%s' '/etc/shadow 파일 권한' ;;
+    SRV-125) printf '%s' '화면보호기 설정 적절성' ;;
+    SRV-126) printf '%s' '자동 로그온 방지 설정 여부' ;;
+    SRV-127) printf '%s' '로그인 실패 횟수에 따른 접속 제한 설정' ;;
+    SRV-128) printf '%s' 'NTFS 파일 시스템 사용 여부' ;;
+    SRV-129) printf '%s' '백신 프로그램 설치 여부' ;;
+    SRV-130) printf '%s' '불필요한 리스닝 서비스 점검' ;;
+    SRV-131) printf '%s' 'SU 명령 사용가능 그룹 제한 설정 적절성' ;;
+    SRV-132) printf '%s' 'NTP 시간 동기화 설정' ;;
+    SRV-133) printf '%s' 'Cron 서비스 사용 계정 제한 설정 적절성' ;;
+    SRV-134) printf '%s' '스택 영역 실행 방지 설정 여부' ;;
+    SRV-135) printf '%s' 'TCP 보안 설정 여부' ;;
+    SRV-136) printf '%s' '로그온 단계에서 "시스템 종료" 기능 비활성화' ;;
+    SRV-137) printf '%s' '네트워크 서비스 접근 권한 적절성' ;;
+    SRV-138) printf '%s' '백업 및 복구 권한 설정 적절성' ;;
+    SRV-139) printf '%s' '시스템 자원 소유권 변경 권한 설정 적절성' ;;
+    SRV-140) printf '%s' '이동식 미디어 포맷 및 꺼내기 허용 정책 설정 적절성' ;;
+    SRV-141) printf '%s' '감사 로그 설정 파일 관리' ;;
+    SRV-142) printf '%s' '중복 UID가 부여된 계정 제한 여부' ;;
+    SRV-143) printf '%s' '불필요한 프로토콜 모듈 제거' ;;
+    SRV-144) printf '%s' '/dev 경로에 불필요한 파일 제거' ;;
+    SRV-145) printf '%s' '파일 무결성 점검 도구 설치' ;;
+    SRV-146) printf '%s' '안티바이러스 설치 점검' ;;
+    SRV-147) printf '%s' '불필요한 네트워크 모니터링 서비스 비활성화' ;;
+    SRV-148) printf '%s' '부트로더 패스워드 설정' ;;
+    SRV-149) printf '%s' '디스크 볼륨 암호화 적용 여부' ;;
+    SRV-150) printf '%s' '로컬 로그온 허용 계정 제한 여부' ;;
+    SRV-151) printf '%s' '익명 SID/이름 변환 설정 제한 여부' ;;
+    SRV-152) printf '%s' '원격터미널 접속 가능한 사용자 그룹 제한 여부' ;;
+    SRV-153) printf '%s' '시스템 하드닝 설정' ;;
+    SRV-154) printf '%s' '커널 보안 파라미터 설정' ;;
+    SRV-155) printf '%s' '방화벽 설정 점검' ;;
+    SRV-156) printf '%s' '보안패치 주기 및 절차' ;;
+    SRV-157) printf '%s' '백업 설정 점검' ;;
+    SRV-158) printf '%s' '불필요한 Telnet 서비스 비활성화' ;;
+    SRV-159) printf '%s' '서비스 배너 정보 노출 방지' ;;
+    SRV-160) printf '%s' '패스워드 정책 설정' ;;
+    SRV-161) printf '%s' 'ftpusers 파일의 소유자 및 권한 설정 적절성' ;;
+    SRV-162) printf '%s' '마운트 옵션 설정(nosuid/noexec)' ;;
+    SRV-163) printf '%s' '시스템 사용 주의사항 출력' ;;
+    SRV-164) printf '%s' '구성원이 존재하지 않는 GID 제거' ;;
+    SRV-165) printf '%s' '불필요하게 Shell이 부여된 계정 제거' ;;
+    SRV-166) printf '%s' '불필요한 숨김 파일 또는 디렉터리 제거' ;;
+    SRV-167) printf '%s' 'NFS/Samba 공유 설정' ;;
+    SRV-168) printf '%s' '주요 설정파일 권한' ;;
+    SRV-169) printf '%s' '.forward/.exrc/.netrc 파일 점검' ;;
+    SRV-170) printf '%s' 'SMTP 서비스 정보 노출 방지 여부' ;;
+    SRV-171) printf '%s' 'FTP 서비스 정보 노출 방지 여부' ;;
+    SRV-172) printf '%s' '불필요한 시스템 자원 공유 제거' ;;
+    SRV-173) printf '%s' 'DNS 서비스 동적 업데이트 설정 적절성' ;;
+    SRV-174) printf '%s' '불필요한 DNS 서비스 비활성화' ;;
+    SRV-175) printf '%s' '시간 동기화를 위한 NTP 설정' ;;
+    SRV-176) printf '%s' '비밀번호 저장 암호화 방식' ;;
+    SRV-177) printf '%s' 'sudo 명령어 접근 권한 설정 적절성' ;;
+    SRV-179) printf '%s' '서비스 지원이 종료된(EoS) 시스템 및 장비 교체 여부' ;;
+    esac
+}
 
 # ── Windows 환경 조기 종료 ───────────────────────────────────────
 if [ "$OS_FAMILY" = "WINDOWS" ]; then
     echo "# Windows 환경 — 전 항목 N-A 처리" >> "$_EVD"
     for _i in $(echo "$_GUIDE_SRV" | tr ' ' '\n' | sed -n 's/^SRV-//p'); do
         _CN=$((_CN+1))
-        _code="SRV-${_i}"; _nm="${_INAME[SRV-${_i}]:-}"
+        _code="SRV-${_i}"; _nm=$(_iname "SRV-${_i}")
         echo "${_code}|N-A|Windows 환경 — Linux/Unix 전용 항목"
         if [ -n "$_nm" ]; then
             printf '[판정] %s (%s)|N-A|Windows 환경 — Linux/Unix 전용 항목\n\n' "$_code" "$_nm" >> "$_EVD"
@@ -312,13 +407,14 @@ if [ "$OS_FAMILY" = "WINDOWS" ]; then
             printf '[판정] %s|N-A|Windows 환경 — Linux/Unix 전용 항목\n\n' "$_code" >> "$_EVD"
         fi
     done
-    _TOTAL=$((_CP + _CF + _CM + _CN))
+    _TOTAL=$((_CP + _CF + _CM + _CN + _CU))
     echo "# ================================================================"
     echo "# 점검 요약 — 전자금융기반시설 (SRV)"
     echo "#   총 점검 항목: ${_TOTAL}"
     echo "#   양호:         ${_CP}  (0%)"
     echo "#   취약:         ${_CF}  (0%)"
     echo "#   수동확인:     ${_CM}"
+    echo "#   점검불가:     ${_CU}"
     echo "#   N-A:          ${_CN}"
     echo "# ================================================================"
     echo "# 점검 완료: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -348,16 +444,12 @@ result() {
     case "${1%%|*}" in SRV-*)
         case "$_GUIDE_SRV" in *" ${1%%|*} "*) ;; *)
             printf '[참고-평가기준 외] %s\n\n' "$1" >> "$_EVD"; return 0 ;; esac ;; esac
-    if [ "$_NONROOT" = 1 ]; then
-        case "${1%%|*}" in SRV-022|SRV-074|SRV-096|SRV-122)
-            case "$1" in *"|양호|"*|*"|취약|"*)
-                set -- "${1%%|*}|수동확인|root 권한 아님 - shadow·타 계정 파일 조회 불가로 판정 신뢰 불가, root 로 재점검 필요 (원 판정: ${1#*|})" ;; esac ;; esac
-    fi
     local _code="${1%%|*}" _rest="${1#*|}"
     _code="${_code%% *}"
+    # 결과 줄 형식(코드|결과|근거)이 깨지지 않게 근거 속의 '|' 와 줄바꿈을 제거
+    case "$_rest" in *"|"*) _rest="${_rest%%|*}|$(printf '%s' "${_rest#*|}" | tr '|\n' '/ ')"; set -- "${_code}|${_rest}" ;; esac
     if _not_target "$_code" && [ "${_rest%%|*}" != "N-A" ]; then
-        printf '[평가대상 아님] %s 원 판정: %s
-' "$_code" "$1" >> "$_EVD"
+        printf '[평가대상 아님] %s 원 판정: %s\n' "$_code" "$1" >> "$_EVD"
         set -- "${_code}|N-A|평가대상 아님 (${OS_FAMILY} 해당 없음 - 평가기준 평가대상 열)"
     fi
     echo "$1"
@@ -366,9 +458,10 @@ result() {
     *"|취약|"*)     _CF=$((_CF+1)) ;;
     *"|수동확인|"*) _CM=$((_CM+1)) ;;
     *"|N-A|"*)      _CN=$((_CN+1)) ;;
+    *"|점검불가|"*) _CU=$((_CU+1)) ;;
     esac
-    local _code="${1%%|*}" _rest="${1#*|}"
-    local _nm="${_INAME[$_code]:-}"
+    _code="${1%%|*}"; _rest="${1#*|}"
+    local _nm; _nm=$(_iname "$_code")
     if [ -n "$_nm" ]; then
         printf '[판정] %s (%s)|%s\n\n' "$_code" "$_nm" "$_rest" >> "$_EVD"
     else
@@ -379,7 +472,7 @@ result() {
 evd() {
     local item="$1"; shift
     printf '[%s] %s $ %s\n' "$item" "$(date '+%H:%M:%S')" "$*" >> "$_EVD"
-    eval "$@" >> "$_EVD" 2>&1
+    eval "$@" </dev/null 2>&1 | _evcap >> "$_EVD"   # 표준입력을 닫아 빈 인자 grep 이 입력 대기하지 않게, 출력은 마스킹·2000줄 상한
     printf '\n' >> "$_EVD"
 }
 _csv() { tr '\n' ',' | sed 's/,$//'; }
@@ -392,8 +485,51 @@ evd_file() {
     fi
 }
 
+# >>> SRV-COMMON-BEGIN — 원본: server/check_server_srv.sh. 사본(webwas/check_webwas.sh)은 python tools/sync_common.py 로 갱신
 # 전체 파일시스템 탐색 시 네트워크/가상 파일시스템 제외 (NFS/CIFS/WSL 윈도우 드라이브 등)
 _FP="( -fstype nfs -o -fstype nfs4 -o -fstype cifs -o -fstype smbfs -o -fstype 9p -o -fstype drvfs -o -fstype fuse.sshfs -o -fstype autofs -o -fstype proc -o -fstype sysfs ) -prune -o"
+# ── 증적·문자열 공통 헬퍼 ───────────────────────────────────────
+_lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }   # ${v,,} 대체 (bash 3·Solaris 호환)
+_uc() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+_mask() {   # 증적 비밀정보 마스킹: 패스워드 해시는 알고리즘 접두만, SNMP community·createUser 는 앞 2자+***, password=값, DB 클라이언트 -p비밀번호
+    awk '
+    function mk(x) { return substr(x,1,2) "***" }
+    function join(f,n,   i,r) { r=f[1]; for (i=2;i<=n;i++) r=r " " f[i]; return r }
+    {
+        line=$0; out=""
+        sub(/^[^: ]*\.sh: line [0-9]+: /, "", line)   # bash 오류 메시지의 스크립트 경로·줄번호 접두 제거
+        while (match(line, /\$(1|2[aby]|5|6|y|gy|7)\$[^:[:space:]]+/)) {
+            h=substr(line,RSTART,RLENGTH); n=index(substr(h,2),"$")+1
+            out=out substr(line,1,RSTART-1) substr(h,1,n) "***"; line=substr(line,RSTART+RLENGTH)
+        }
+        line=out line
+        n=split(line,f," "); t=tolower(f[1])
+        if (t ~ /^(ro|rw)community6?$/ || t=="community") { f[2]=mk(f[2]); line=join(f,n) }
+        else if (t ~ /^com2sec6?$/) { f[4]=mk(f[4]); line=join(f,n) }
+        else if (t=="createuser") { for (i=3;i<=n;i++) if (f[i] !~ /^(MD5|SHA|SHA-?[0-9]*|DES|AES|AES-?[0-9]*)$/) f[i]="***"; line=join(f,n) }
+        else if (t=="usmuser" || t=="usmuser6") { line="usmUser *** (키 마스킹)" }
+        else if (t ~ /^(get|set)-community-name:?$/) { sub(/:[ \t]*[^ \t]+/, ": ***", line) }
+        else if (tolower(line) ~ /snmp-server community/) { sub(/[Cc]ommunity[ \t]+[^ \t]+/, "community ***", line) }
+        if (tolower(line) ~ /(mysql|mysqldump|mysqladmin|psql|pg_dump|sqlplus)/) gsub(/[ \t]-p[^ \t]+/, " -p***", line)
+        gsub(/[Pp]ass(word|wd)[ \t]*[=:][ \t]*[^ \t]+/, "password=***", line)
+        gsub(/grub\.pbkdf2\.[^ \t]+/, "grub.pbkdf2.***", line)
+        print line
+    }'
+}
+_evcap() {   # 증적 출력: 비밀정보 마스킹 후 너무 큰 목록만 2000줄 상한 (생략 줄 수 표시)
+    _mask | awk 'NR<=2000 {print} END {if (NR>2000) print "(이하 " NR-2000 "줄 생략)"}'
+}
+_unreadable() {   # 존재하지만 현재 계정으로 읽을 수 없는 파일 (비root 실행·권한 부족 → 점검불가 판단용)
+    local f
+    for f in "$@"; do [ -e "$f" ] && [ ! -r "$f" ] && { echo "$f"; return 0; }; done
+    return 1
+}
+_cfg() {   # 주석(#, !, ;)·빈 줄을 제외한 설정 줄 (여러 파일 가능, 없는 파일은 무시)
+    local f
+    for f in "$@"; do [ -f "$f" ] && grep -vE '^[[:space:]]*([#!;]|$)' "$f" 2>/dev/null; done
+    return 0
+}
+_pid_comm() { UNIX95=1 ps -e -o pid=,comm=,args= 2>/dev/null | awk '{c=$2; sub(/.*\//,"",c); $2=c; print}'; }   # "PID 프로세스명 인자..." (프로세스명 기준 매칭용)
 # ── 공통 함수 ────────────────────────────────────────────────────
 get_perm() {
     local f="$1"; [ -e "$f" ] || [ -L "$f" ] || { echo ""; return; }
@@ -422,13 +558,28 @@ get_owner() {
     esac
 }
 is_running() {
-    local svc="$1"
-    command -v systemctl >/dev/null 2>&1 && systemctl is-active "$svc" 2>/dev/null | grep -q "^active" && return 0
-    command -v service  >/dev/null 2>&1 && service "$svc" status 2>/dev/null | grep -qiE "running|started" && return 0
-    command -v lssrc    >/dev/null 2>&1 && lssrc -s "$svc" 2>/dev/null | grep -qi "active" && return 0
-    command -v svcs     >/dev/null 2>&1 && svcs -H "$svc" 2>/dev/null | grep -q "^online" && return 0
-    ps -ef 2>/dev/null | grep -v grep | grep -qiw "$svc" && return 0
-    command -v ps >/dev/null 2>&1 || { grep -qixF "$svc" /proc/[0-9]*/comm 2>/dev/null && return 0; }
+    local svc="$1" ls out
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        # systemd: 유닛이 로드되어 있으면 is-active 결과만 신뢰 (inactive/failed 면 바로 '실행 중 아님' — 로그의 'Started …' 문구 등으로 오판하지 않음)
+        ls=$(systemctl show -p LoadState "$svc" 2>/dev/null | sed 's/^LoadState=//')
+        if [ "$ls" = "loaded" ]; then
+            case "$(systemctl is-active "$svc" 2>/dev/null)" in active|activating|reloading) return 0 ;; *) return 1 ;; esac
+        fi
+    elif command -v service >/dev/null 2>&1 && [ -x "/etc/init.d/$svc" ]; then
+        # SysV: 명확한 상태 문구만 인정 ('is not running'·'stopped'·'dead' 등은 실행 중 아님)
+        out=$(service "$svc" status 2>&1 </dev/null)
+        if ! echo "$out" | grep -qiE 'not running|stopped|inactive|dead|failed|not found|unrecognized|usage'; then
+            echo "$out" | grep -qiE 'is running|active \(running\)|running\.\.\.|\(pid +[0-9]+\)' && return 0
+        fi
+    fi
+    command -v lssrc >/dev/null 2>&1 && [ "$(lssrc -s "$svc" 2>/dev/null | awk 'NR>1{print $NF}')" = "active" ] && return 0
+    command -v svcs  >/dev/null 2>&1 && svcs -H "$svc" 2>/dev/null | grep -q "^online" && return 0
+    # 프로세스: 인자가 아니라 프로세스 이름(comm) 정확 일치 (comm 은 15자까지만 기록되는 OS 가 있어 15자 접두도 인정)
+    if command -v ps >/dev/null 2>&1; then
+        _comm | grep -qxF -e "$svc" -e "$(printf '%s' "$svc" | cut -c1-15)" && return 0
+    else
+        grep -qxF -e "$svc" -e "$(printf '%s' "$svc" | cut -c1-15)" /proc/[0-9]*/comm 2>/dev/null && return 0
+    fi
     return 1
 }
 get_pam_files() {
@@ -443,7 +594,7 @@ get_pam_files() {
                 echo "/etc/pam.d/system-auth /etc/pam.d/password-auth" || \
                 echo "/etc/pam.d/system-auth /etc/pam.d/password-auth" ;;
         UBUNTU|DEBIAN) echo "/etc/pam.d/common-auth /etc/pam.d/common-password" ;;
-        SLES)   echo "/etc/pam.d/common-auth /etc/pam.d/login" ;;
+        SLES)   echo "/etc/pam.d/common-auth /etc/pam.d/common-password /etc/pam.d/login" ;;
         *)
             for _pf in /etc/pam.d/system-auth /etc/pam.d/password-auth /etc/pam.d/common-auth /etc/pam.d/common-password; do
                 [ -f "$_pf" ] && printf '%s ' "$_pf"
@@ -501,14 +652,9 @@ _snmp_confs() {
         [ -f "$f" ] && echo "$f"
     done
 }
-_named_conf() {
-    local c
-    for c in /etc/named.conf /etc/bind/named.conf; do
-        [ -f "$c" ] || continue
-        named-checkconf -p "$c" 2>/dev/null | tr '\n\t' '  ' | sed 's/"//g; s/;/;\n/g' && return
-        cat "$c" /etc/bind/named.conf.options /etc/bind/named.conf.local 2>/dev/null | grep -vE '^\s*(//|#)'
-        return
-    done
+_named_conf() {   # 호환용: named 설정(주석 제거, include 포함) 출력 — 실제 로직은 _named_load
+    _named_load
+    printf '%s\n' "$_NC"
 }
 # ── 8차 공통 헬퍼 (실무 스크립트·UNIX 실장비 결과 대조) ──
 _TO=$(command -v timeout 2>/dev/null)
@@ -527,23 +673,26 @@ _inetd_on() {   # inetd(AIX·HP-UX·Solaris≤9) / SMF(Solaris 10+) / xinetd 로
 _listen() { { ss -tln 2>/dev/null || netstat -an 2>/dev/null; } | awk -v p="$1" '/LISTEN/ {for(i=1;i<=NF;i++) if ($i ~ ("[.:]" p "$")) {print; exit}}'; }   # TCP LISTEN (Linux ':23' / UNIX '*.23')
 _sshd_cfg() { local c; for c in /etc/ssh/sshd_config /opt/ssh/etc/sshd_config /usr/local/etc/sshd_config /etc/openssh/sshd_config; do [ -f "$c" ] && { echo "$c"; return; }; done; }
 _sshd_bin() { local b; for b in $(command -v sshd 2>/dev/null) /usr/sbin/sshd /opt/ssh/sbin/sshd /usr/lib/ssh/sshd /usr/local/sbin/sshd; do [ -x "$b" ] && { echo "$b"; return; }; done; }
-_snmp_run() { is_running snmpd && return 0; ps -ef 2>/dev/null | grep -v grep | grep -qE '[/ ](snmpd|snmpdm|snmpdv3ne|snmpdv3e)( |$)'; }   # HP-UX snmpdm, AIX snmpdv3 (cmsnmpd·dsm_sa_snmpd 제외)
+_snmp_run() { is_running snmpd && return 0; _comm | grep -qxE 'snmpd|snmpdm|snmpdv3ne|snmpdv3e'; }   # HP-UX snmpdm, AIX snmpdv3 (cmsnmpd·dsm_sa_snmpd 제외) — 프로세스 이름 정확 일치
 _comm() { if [ "$OS_FAMILY" = HPUX ]; then UNIX95=1 ps -e -o comm= 2>/dev/null; else ps -e -o comm= 2>/dev/null; fi | sed 's#.*/##'; }
 _ftp_running() { is_running vsftpd || is_running proftpd || is_running pure-ftpd || is_running in.ftpd || is_running ftpd || [ -n "$(_inetd_on ftp)" ] || [ -n "$(_listen 21)" ]; }
 
 check_SRV001() {
     # 평가기준: v2 이용 시(v3 사용 가능 환경) 취약, v3 사용 시 보안레벨 AuthPriv — net-snmp 문법(rocommunity/rwcommunity/com2sec)
     local confs; confs=$(_snmp_confs)
-    evd "SRV-001" "for f in $(echo $confs); do echo \"# \$f\"; grep -vE '^\s*(#|\$)' \$f | head -20; done"
-    evd "SRV-001" "ps -ef 2>/dev/null | grep -iE '[s]nmp'; lssrc -s snmpd 2>/dev/null; ls -l /var/lib/net-snmp/snmpd.conf /var/lib/snmp/snmpd.conf 2>/dev/null; grep -ciE '^\s*(usmUser|createUser)' /var/lib/net-snmp/snmpd.conf /var/lib/snmp/snmpd.conf 2>/dev/null"
+    evd "SRV-001" "_svc_state snmpd snmpdm snmpdv3ne snmpdv3e; UNIX95=1 ps -e -o pid,comm,args 2>&1 | grep '[s]nmpd'"
+    evd "SRV-001" "_show_cfg ${confs:-/etc/snmp/snmpd.conf /etc/snmpd.conf /etc/snmpdv3.conf}"
     if [ -z "$confs" ] && ! _snmp_run; then result "SRV-001|N-A|SNMP 미설치/미실행"; return; fi
     _snmp_run || { result "SRV-001|N-A|SNMP 설정 파일은 있으나 snmpd 미실행"; return; }
-    local v2 v3 v3weak
-    v2=$(cat $confs 2>/dev/null | grep -vE '^\s*#' | grep -iE '^\s*(rocommunity6?|rwcommunity6?|com2sec6?|community)\s|^\s*(get|set)-community-name\s*:' | head -3)
-    v3=$(cat $confs 2>/dev/null | grep -vE '^\s*#' | grep -iE '^\s*(rouser|rwuser|createUser)\s|^\s*access\s.*\susm\s|^\s*USM_USER' | head -5)
-    v3weak=$(cat $confs 2>/dev/null | grep -vE '^\s*#' | grep -iE '^\s*(rouser|rwuser)\s+\S+(\s+(noauth|auth)\b|\s*$)|^\s*access\s.*\susm\s+(noauth|auth)\b|^\s*VACM_ACCESS\s.*\b(noAuthNoPriv|AuthNoPriv)\b|^\s*USM_USER\s+(\S+\s+){5}(-|none)\b' | head -3)
-    if [ -n "$v2" ]; then result "SRV-001|취약|SNMP v1/v2c 사용: $(echo "$v2" | head -1 | awk '{print $1}') (v3 사용 가능 환경에서 v2 이용)"
-    elif [ -n "$v3weak" ]; then result "SRV-001|취약|SNMPv3 보안레벨 AuthPriv 미적용: $(echo "$v3weak" | head -1)"
+    [ -z "$confs" ] && { result "SRV-001|점검불가|snmpd 가 실행 중이나 설정 파일을 찾지 못해 버전·보안레벨 확인 불가 (/etc/snmp/snmpd.conf 등 8개 경로 없음)"; return; }
+    local u; u=$(_unreadable $confs) && { result "SRV-001|점검불가|SNMP 설정 파일 읽기 권한 없음: ${u} (root 로 재점검 필요)"; return; }
+    local cl v2 v3 v3weak
+    cl=$(_cfg $confs)
+    v2=$(echo "$cl" | grep -iE '^[[:space:]]*(rocommunity6?|rwcommunity6?|com2sec6?|community)[[:space:]]|^[[:space:]]*(get|set)-community-name[[:space:]]*:')
+    v3=$(echo "$cl" | grep -iE '^[[:space:]]*(rouser|rwuser|createUser)[[:space:]]|^[[:space:]]*access[[:space:]].*[[:space:]]usm[[:space:]]|^[[:space:]]*USM_USER')
+    v3weak=$(echo "$cl" | grep -iE '^[[:space:]]*(rouser|rwuser)[[:space:]]+[^[:space:]]+([[:space:]]+(noauth|auth)([[:space:]]|$)|[[:space:]]*$)|^[[:space:]]*access[[:space:]].*[[:space:]]usm[[:space:]]+(noauth|auth)([[:space:]]|$)|^[[:space:]]*VACM_ACCESS[[:space:]].*(noAuthNoPriv|AuthNoPriv)|^[[:space:]]*USM_USER[[:space:]]+([^[:space:]]+[[:space:]]+){5}(-|none)([[:space:]]|$)')
+    if [ -n "$v2" ]; then result "SRV-001|취약|SNMP v1/v2c 사용 $(echo "$v2" | grep -c .)건 ($(echo "$v2" | awk '{print $1}' | sort -u | _csv)) - v3 사용 가능 환경에서 v2 이용"
+    elif [ -n "$v3weak" ]; then result "SRV-001|취약|SNMPv3 보안레벨 AuthPriv 미적용 $(echo "$v3weak" | grep -c .)건: $(echo "$v3weak" | _mask | _csv)"
     elif [ -n "$v3" ]; then result "SRV-001|양호|SNMPv3 AuthPriv(priv) 사용"
     else result "SRV-001|수동확인|snmpd 실행 중 - 버전·보안레벨 설정 수동 확인 ($(echo $confs))"; fi
 }
@@ -554,15 +703,20 @@ check_SRV001() {
 check_SRV003() {
     # 평가기준 판단방법: rocommunity/rwcommunity/com2sec 출발지(source) 제한, 'rocommunity public' 출발지 없음 = 통제 미흡
     local confs; confs=$(_snmp_confs)
-    evd "SRV-003" "grep -hiE '^\s*(agentAddress|rocommunity|rwcommunity|com2sec|group|view|access|rouser|rwuser|createUser)' $(echo ${confs:-/dev/null}) 2>/dev/null"
-    if [ -z "$confs" ] || ! _snmp_run; then result "SRV-003|N-A|SNMP 미실행"; return; fi
-    local open
-    open=$(cat $confs 2>/dev/null | grep -vE '^\s*#' | awk 'tolower($1)~/^r[ow]community6?$/ && ($3=="" || $3=="default" || $3=="0.0.0.0/0" || $3=="::/0"){print $1" "$2} tolower($1)~/^com2sec6?$/ && ($3=="default" || $3=="0.0.0.0/0"){print $1" "$2" "$3}' | head -3)
+    evd "SRV-003" "_svc_state snmpd snmpdm snmpdv3ne snmpdv3e"
+    evd "SRV-003" "_show_cfg ${confs:-/etc/snmp/snmpd.conf /etc/snmpd.conf /etc/snmpdv3.conf}"
+    _snmp_run || { result "SRV-003|N-A|SNMP 미실행"; return; }
+    [ -z "$confs" ] && { result "SRV-003|점검불가|snmpd 가 실행 중이나 설정 파일을 찾지 못해 접근통제 확인 불가"; return; }
+    local u; u=$(_unreadable $confs) && { result "SRV-003|점검불가|SNMP 설정 파일 읽기 권한 없음: ${u} (root 로 재점검 필요)"; return; }
+    local cl open n
+    cl=$(_cfg $confs)
+    open=$(echo "$cl" | awk 'tolower($1)~/^r[ow]community6?$/ && ($3=="" || $3=="default" || $3=="0.0.0.0/0" || $3=="::/0"){print $1" "$2} tolower($1)~/^com2sec6?$/ && ($3=="default" || $3=="0.0.0.0/0"){print $1" "$4}')
     # HP-UX get/set-community-name 에 IP: 미지정 = 출발지 무제한, AIX community 주소·마스크 0.0.0.0 = 전체 허용
-    [ "$OS_FAMILY" = "HPUX" ] && open="${open}$(cat $confs 2>/dev/null | grep -vE '^\s*#' | grep -iE '^\s*(get|set)-community-name\s*:' | grep -viE '\bIP:' | awk '{print $1" "$2}' | head -2)"
-    [ "$OS_FAMILY" = "AIX" ] && open="${open}$(cat $confs 2>/dev/null | grep -vE '^\s*#' | awk 'tolower($1)=="community" && (($3=="0.0.0.0"&&$4=="0.0.0.0") || ($5=="0.0.0.0"&&$6=="0.0.0.0")){print $1" "$2}' | head -2)"
-    if [ -n "$open" ]; then result "SRV-003|취약|출발지 제한 없는 community: $(echo "$open" | awk '{print $1" "substr($2,1,2)"***"}' | tr '\n' ',' | sed 's/,$//')"
-    elif cat $confs 2>/dev/null | grep -vE '^\s*#' | grep -qiE '^\s*(rocommunity|rwcommunity|com2sec|rouser|rwuser|(get|set)-community-name)'; then result "SRV-003|양호|SNMP 접근 출발지 지정 또는 v3 사용자 인증"
+    [ "$OS_FAMILY" = "HPUX" ] && open="${open}$(echo "$cl" | grep -iE '^[[:space:]]*(get|set)-community-name[[:space:]]*:' | grep -viE 'IP:' | awk '{print $1" "$2}')"
+    [ "$OS_FAMILY" = "AIX" ] && open="${open}$(echo "$cl" | awk 'tolower($1)=="community" && (($3=="0.0.0.0"&&$4=="0.0.0.0") || ($5=="0.0.0.0"&&$6=="0.0.0.0")){print $1" "$2}')"
+    n=$(echo "$open" | grep -c .)
+    if [ "$n" -gt 0 ]; then result "SRV-003|취약|출발지 제한 없는 community ${n}건: $(echo "$open" | awk '{print $1" "substr($2,1,2)"***"}' | _csv)"
+    elif echo "$cl" | grep -qiE '^[[:space:]]*(rocommunity|rwcommunity|com2sec|rouser|rwuser|(get|set)-community-name)'; then result "SRV-003|양호|SNMP 접근 출발지 지정 또는 v3 사용자 인증"
     else result "SRV-003|수동확인|SNMP 접근통제 설정 수동 확인 ($(echo $confs))"; fi
 }
 
@@ -570,50 +724,59 @@ check_SRV003() {
 # SRV-004: SMTP 서비스 비활성화
 # ================================================================
 check_SRV004() {
-    evd "SRV-004" "ps -ef 2>/dev/null | grep -E 'sendmail|postfix|exim' | grep -v grep"
-    evd "SRV-004" "ss -tlnp 2>/dev/null | grep ':25 ' || netstat -tlnp 2>/dev/null | grep ':25 '"
-    is_running sendmail || is_running postfix || is_running exim || \
-        netstat -tlnp 2>/dev/null | grep -q ":25 " || \
-        ss -tlnp 2>/dev/null | grep -q ":25 " && \
-        result "SRV-004|수동확인|SMTP 서비스 실행 중 (업무상 필요 여부 확인)" && return
-    result "SRV-004|양호|SMTP 서비스 미실행"
+    evd "SRV-004" "_svc_state sendmail postfix exim exim4"
+    evd "SRV-004" "_listen_all"
+    local on=""
+    is_running sendmail && on="${on} sendmail"; is_running postfix && on="${on} postfix"
+    is_running exim && on="${on} exim"; is_running exim4 && on="${on} exim4"
+    [ -n "$(_listen 25)" ] && on="${on} LISTEN:25"
+    if [ -n "$on" ]; then result "SRV-004|수동확인|SMTP 서비스 실행 중:${on} (업무상 필요 여부 확인)"
+    else result "SRV-004|양호|SMTP 서비스 미실행 (sendmail·postfix·exim 미실행, 25번 포트 미수신)$(_portnote)"; fi
 }
 
 # ================================================================
 # SRV-011: 시스템 관리자 FTP 접속 제한
 # ================================================================
 check_SRV011() {
-    evd "SRV-011" "cat /etc/ftpusers /etc/ftpd/ftpusers /etc/vsftpd/ftpusers /etc/vsftpd.ftpusers 2>/dev/null; grep -vE '^\s*#' /etc/inetd.conf 2>/dev/null | grep -w ftp; inetadm 2>/dev/null | grep -i ftp; lssrc -ls inetd 2>/dev/null | grep -i ftp"
-    for f in /etc/ftpusers /etc/ftpd/ftpusers /etc/vsftpd/ftpusers /etc/vsftpd.ftpusers; do
+    # 평가기준: FTP 서비스 사용 시 root(관리자) 계정의 FTP 접속 제한 (ftpusers 등에 root 등록)
+    local fl="/etc/ftpusers /etc/ftpd/ftpusers /etc/vsftpd/ftpusers /etc/vsftpd.ftpusers" f
+    evd "SRV-011" "_svc_state vsftpd proftpd pure-ftpd in.ftpd ftpd; _listen_all; inetadm 2>&1 | grep -i ftp; lssrc -ls inetd 2>&1 | grep -i ftp"
+    evd "SRV-011" "_show_cfg $fl"
+    _ftp_running || { result "SRV-011|N-A|FTP 서비스 미실행"; return; }
+    local found="" miss="" u
+    for f in $fl; do
         [ -f "$f" ] || continue
-        if grep -q "^root" "$f" 2>/dev/null; then
-            result "SRV-011|양호|FTP root 계정 제한 (${f})"
-        else
-            result "SRV-011|취약|FTP root 제한 미설정 (${f})"
-        fi
-        return
+        found="${found} ${f}"
+        [ -r "$f" ] || { u="${u} ${f}"; continue; }
+        grep -qE '^[[:space:]]*root[[:space:]]*$' "$f" 2>/dev/null || miss="${miss} ${f}"
     done
-    _ftp_running || { evd "SRV-011" "ps -ef 2>/dev/null | grep -E 'vsftpd|proftpd|ftpd' | grep -v grep"; result "SRV-011|N-A|FTP 서비스 미실행"; return; }
-    result "SRV-011|취약|ftpusers 파일 없음 (root FTP 접속 제한 불가)"
+    [ -n "$u" ] && { result "SRV-011|점검불가|ftpusers 읽기 권한 없음:${u}"; return; }
+    if [ -n "$miss" ]; then result "SRV-011|취약|FTP root 제한 미설정 (root 항목 없음):${miss}"
+    elif [ -n "$found" ]; then result "SRV-011|양호|FTP root 계정 제한 (${found# })"
+    elif grep -qiE '^[[:space:]]*RootLogin[[:space:]]+off' /etc/proftpd/proftpd.conf /etc/proftpd.conf 2>/dev/null; then result "SRV-011|양호|proftpd RootLogin off"
+    else result "SRV-011|취약|ftpusers 파일 없음 (FTP 실행 중, root FTP 접속 제한 불가)"; fi
 }
 
 # ================================================================
 # SRV-013: Anonymous FTP 제한
 # ================================================================
 check_SRV013() {
-    evd "SRV-013" "grep -i anonymous /etc/vsftpd/vsftpd.conf /etc/vsftpd.conf /etc/proftpd/proftpd.conf /etc/proftpd.conf 2>/dev/null; grep '^ftp:' /etc/passwd 2>/dev/null"
     # 평가기준: FTP 미사용 또는 Anonymous 비활성 → 양호
-    _ftp_running || { result "SRV-013|양호|FTP 서비스 미사용"; return; }
+    evd "SRV-013" "_svc_state vsftpd proftpd pure-ftpd in.ftpd ftpd; _listen_all"
+    evd "SRV-013" "_show_cfg /etc/vsftpd/vsftpd.conf /etc/vsftpd.conf /etc/proftpd/proftpd.conf /etc/proftpd.conf; grep '^ftp:' /etc/passwd 2>&1"
+    _ftp_running || { result "SRV-013|양호|FTP 서비스 미사용$(_portnote)"; return; }
     local f
     for f in /etc/vsftpd/vsftpd.conf /etc/vsftpd.conf; do
         [ -f "$f" ] || continue
-        grep -qiE "^\s*anonymous_enable\s*=\s*YES" "$f" 2>/dev/null && { result "SRV-013|취약|Anonymous FTP 활성화 (${f})"; return; }
-        grep -qiE "^\s*anonymous_enable\s*=" "$f" 2>/dev/null || { result "SRV-013|취약|anonymous_enable 미설정 (vsftpd 기본값 YES) (${f})"; return; }
+        [ -r "$f" ] || { result "SRV-013|점검불가|${f} 읽기 권한 없음"; return; }
+        grep -qiE "^[[:space:]]*anonymous_enable[[:space:]]*=[[:space:]]*YES" "$f" 2>/dev/null && { result "SRV-013|취약|Anonymous FTP 활성화 (${f})"; return; }
+        grep -qiE "^[[:space:]]*anonymous_enable[[:space:]]*=" "$f" 2>/dev/null || { result "SRV-013|취약|anonymous_enable 미설정 (vsftpd 기본값 YES) (${f})"; return; }
         result "SRV-013|양호|Anonymous FTP 비활성화 (${f})"; return
     done
     for f in /etc/proftpd/proftpd.conf /etc/proftpd.conf; do
         [ -f "$f" ] || continue
-        grep -vE '^\s*#' "$f" 2>/dev/null | grep -qi "<Anonymous" && { result "SRV-013|취약|proftpd <Anonymous> 블록 활성 (${f})"; return; }
+        [ -r "$f" ] || { result "SRV-013|점검불가|${f} 읽기 권한 없음"; return; }
+        _cfg "$f" | grep -qi "<Anonymous" && { result "SRV-013|취약|proftpd <Anonymous> 블록 활성 (${f})"; return; }
         result "SRV-013|양호|proftpd Anonymous 미설정 (${f})"; return
     done
     grep -q "^ftp:" /etc/passwd 2>/dev/null && result "SRV-013|취약|ftpd 실행 중이며 ftp(anonymous) 계정 존재" || result "SRV-013|수동확인|FTP 실행 중 - Anonymous 설정 수동 확인"
@@ -623,35 +786,50 @@ check_SRV013() {
 # SRV-014: NFS 접근통제
 # ================================================================
 check_SRV014() {
-    evd "SRV-014" "ls -l /etc/exports /etc/dfs/dfstab 2>/dev/null; cat /etc/exports /etc/dfs/dfstab 2>/dev/null"
-    local exports_file="/etc/exports"
-    [ "$OS_FAMILY" = "SOLARIS" ] && exports_file="/etc/dfs/dfstab"
-    [ "$OS_FAMILY" = "HPUX" ] && [ -z "$(grep -vE '^\s*(#|$)' /etc/exports 2>/dev/null)" ] && [ -f /etc/dfs/dfstab ] && exports_file="/etc/dfs/dfstab"   # HP-UX 11iv3 share 명령
-    evd "SRV-014" "share 2>/dev/null; cat /etc/dfs/sharetab 2>/dev/null; exportfs 2>/dev/null"
-    # 평가기준: NFS 비활성화 또는 적절한 접근통제 → 양호
-    { [ -f "$exports_file" ] && [ -n "$(grep -vE '^\s*(#|$)' "$exports_file" 2>/dev/null)" ]; } || { result "SRV-014|양호|NFS 공유 미사용 (${exports_file} 설정 없음)"; return; }
-    { is_running nfsd || is_running rpc.nfsd || is_running mountd || is_running rpc.mountd || { command -v systemctl >/dev/null 2>&1 && systemctl is-active nfs-server 2>/dev/null | grep -q '^active'; }; } || \
-        { result "SRV-014|양호|NFS 서비스 비활성 (${exports_file} 설정은 존재 - 참고)"; return; }
-    local bad="" p o
-    if [ "$exports_file" = "/etc/dfs/dfstab" ]; then
-        bad=$(grep -vE '^\s*(#|$)' "$exports_file" | grep -vE 'rw=|ro=|access=' | head -2)
-    else
-        bad=$(grep -vE '^\s*(#|$)' "$exports_file" | awk '{ if (NF<2) {print; next} for(i=2;i<=NF;i++){ h=$i; sub(/\(.*/,"",h); if (h=="" || h=="*" || h=="0.0.0.0/0") {print; break} } }' | head -2)
-    fi
-    p=$(get_perm "$exports_file"); o=$(get_owner "$exports_file")
-    { [ "$o" != "root" ] || _perm_over "$p" 644; } && bad="${bad:+$bad / }${exports_file}(${o}:${p})"
-    [ -n "$bad" ] && result "SRV-014|취약|NFS 접근통제 미흡: $(echo "$bad" | head -2 | tr '\n' ' ')" || result "SRV-014|양호|NFS 공유 호스트 지정·설정 파일 root 644 이하"
+    # 평가기준: NFS 비활성화 또는 적절한 접근통제(공유 대상 호스트 지정, 설정 파일 root 644 이하) → 양호
+    local files="/etc/exports" f lines="" bad="" p o x
+    case "$OS_FAMILY" in
+    SOLARIS) files="/etc/dfs/dfstab" ;;
+    HPUX)    files="/etc/exports /etc/dfs/dfstab" ;;   # HP-UX 11iv3 은 share 명령(dfstab)
+    *)       for x in /etc/exports.d/*.exports; do [ -f "$x" ] && files="${files} ${x}"; done ;;
+    esac
+    evd "SRV-014" "_svc_state nfsd rpc.nfsd rpc.mountd mountd nfs-server nfs-kernel-server"
+    evd "SRV-014" "_show_cfg $files; echo '# exportfs -v'; exportfs -v 2>&1; echo '# share'; share 2>&1; cat /etc/dfs/sharetab 2>&1"
+    local rd; rd=$(_unreadable $files) && { result "SRV-014|점검불가|NFS 설정 파일 읽기 권한 없음: ${rd}"; return; }
+    for f in $files; do [ -f "$f" ] && lines="${lines}$(_cfg "$f" | sed "s#^#${f}: #")
+"; done
+    lines=$(echo "$lines" | grep -v '^$')
+    [ -n "$lines" ] || { result "SRV-014|양호|NFS 공유 미사용 (${files} 에 공유 설정 없음)"; return; }
+    is_running nfsd || is_running rpc.nfsd || is_running mountd || is_running rpc.mountd || is_running nfs-server || is_running nfs-kernel-server || \
+        { result "SRV-014|양호|NFS 서비스 비활성 (${files} 설정은 존재 - 참고)"; return; }
+    # 호스트 미지정(*·공란·0.0.0.0/0) 공유 / Solaris·HP-UX share 는 rw=·ro=·access= 없는 공유
+    case "$OS_FAMILY" in
+    SOLARIS|HPUX)
+        bad=$(echo "$lines" | grep -E 'share[[:space:]]|-F[[:space:]]+nfs' | grep -vE 'rw=|ro=|access=|root=' | sed 's/^[^:]*: //') ;;
+    *)  bad=$(echo "$lines" | sed 's/^[^:]*: //' | awk '{ if (NF<2) {print; next} for(i=2;i<=NF;i++){ h=$i; sub(/\(.*/,"",h); if (h=="" || h=="*" || h=="0.0.0.0/0") {print; break} } }') ;;
+    esac
+    command -v exportfs >/dev/null 2>&1 && exportfs -v 2>/dev/null | grep -q '<world>' && bad="${bad}
+exportfs -v: <world> 전체 허용 공유 존재"
+    bad=$(echo "$bad" | grep -v '^$')
+    for f in $files; do
+        [ -f "$f" ] || continue
+        p=$(get_perm "$f"); o=$(get_owner "$f")
+        { [ "$o" != "root" ] || _perm_over "$p" 644; } && bad="${bad:+$bad
+}${f}(${o}:${p})"
+    done
+    if [ -n "$bad" ]; then result "SRV-014|취약|NFS 접근통제 미흡 $(echo "$bad" | grep -c .)건: $(echo "$bad" | _csv)"
+    else result "SRV-014|양호|NFS 공유 호스트 지정·설정 파일 root 644 이하"; fi
 }
 
 # ================================================================
 # SRV-015: 불필요 NFS 비활성화
 # ================================================================
 check_SRV015() {
-    evd "SRV-015" "ps -ef 2>/dev/null | grep -E 'nfsd|nfs-server' | grep -v grep"
-    is_running nfs || is_running nfsd || is_running nfs-server || \
-        is_running nfs-kernel-server && \
-        result "SRV-015|수동확인|NFS 서비스 실행 중 (업무상 필요 여부 확인)" && return
-    result "SRV-015|양호|NFS 서비스 미실행"
+    evd "SRV-015" "_svc_state nfs nfsd rpc.nfsd nfs-server nfs-kernel-server"
+    local on="" s
+    for s in nfs nfsd rpc.nfsd nfs-server nfs-kernel-server; do is_running "$s" && on="${on} ${s}"; done
+    if [ -n "$on" ]; then result "SRV-015|수동확인|NFS 서비스 실행 중:${on} (업무상 필요 여부 확인)"
+    else result "SRV-015|양호|NFS 서비스 미실행"; fi
 }
 
 # ================================================================
@@ -659,7 +837,9 @@ check_SRV015() {
 # ================================================================
 check_SRV016() {
     # 평가기준 15종: rpc.cmsd, rpc.ttdbserverd, sadmind, rusersd, walld, sprayd, rstatd, rpc.nisd, rexd, rpc.pcnfsd, rpc.statd, rpc.ypupdated, rpc.rquotad, kcms_server, cachefsd (업무상 사용 시 예외)
-    evd "SRV-016" "rpcinfo -p 2>/dev/null | head -30; ps -ef 2>/dev/null | grep -E 'rpc\.|sadmind|rusersd|walld|sprayd|rstatd|rexd|kcms|cachefsd' | grep -v grep"
+    local svcs="rpc.cmsd rpc.ttdbserverd sadmind rusersd rpc.rusersd walld rpc.rwalld sprayd rpc.sprayd rstatd rpc.rstatd rpc.nisd rexd rpc.rexd rpc.pcnfsd rpc.ypupdated kcms_server cachefsd rpc.statd rpc.rquotad"
+    evd "SRV-016" "_svc_state $svcs"
+    evd "SRV-016" "rpcinfo -p 2>&1; grep -vE '^[[:space:]]*#' /etc/inetd.conf 2>&1"
     local s bad="" nfs=""
     for s in rpc.cmsd rpc.ttdbserverd sadmind rusersd rpc.rusersd walld rpc.rwalld sprayd rpc.sprayd rstatd rpc.rstatd rpc.nisd rexd rpc.rexd rpc.pcnfsd rpc.ypupdated kcms_server cachefsd; do
         is_running "$s" && bad="${bad} ${s}"
@@ -670,6 +850,7 @@ check_SRV016() {
     local inet; inet=$(grep -vE '^[[:space:]]*#' /etc/inetd.conf 2>/dev/null | grep -oE 'rpc\.(cmsd|ttdbserverd|rusersd|rwalld|sprayd|rstatd|rexd|pcnfsd|ypupdated)|sadmind|kcms_server|cachefsd' | sort -u | tr '\n' ' ')
     [ -n "$inet" ] && bad="${bad} [inetd.conf:${inet% }]"
     if [ "$OS_FAMILY" = "SOLARIS" ]; then
+        evd "SRV-016" "inetadm 2>&1"
         inet=$(_inetd_on rpc/rstat rpc/rusers rpc/spray rpc/wall rpc/rex rpc/cde-calendar-manager rpc/cde-ttdbserver | sed -n 's/^smf://p' | tr '\n' ' ')
         [ -n "$inet" ] && bad="${bad} [${inet% }]"
     fi
@@ -682,41 +863,46 @@ check_SRV016() {
 # SRV-022: 패스워드 미설정 계정 관리
 # ================================================================
 check_SRV022() {
-    evd "SRV-022" "awk -F: '\$2==\"\"' /etc/shadow 2>/dev/null || awk -F: '\$2==\"\"' /etc/passwd 2>/dev/null"
+    local no_pw="" pwf="/etc/shadow" u pwe
+    case "$OS_FAMILY" in AIX) pwf=/etc/security/passwd ;; *) [ -e /etc/shadow ] || pwf=/etc/passwd ;; esac
+    evd "SRV-022" "_pw_status"
+    u=$(_unreadable "$pwf") && { result "SRV-022|점검불가|${pwf} 읽기 권한 없음 - 비밀번호 미설정 계정 확인 불가 (root 로 재점검 필요)"; return; }
     case "$OS_FAMILY" in
     AIX)   # AIX 패스워드 파일 = /etc/security/passwd (스탠자 password = 공란)
-        no_pw=$(awk '/^[^ \t*#][^ \t]*:[ \t]*$/{sub(/:.*/,"");u=$0;next} /^[ \t]+password[ \t]*=/{v=$0;sub(/^[^=]*=[ \t]*/,"",v);sub(/[ \t]+$/,"",v); if(v=="") print u}' /etc/security/passwd 2>/dev/null | head -5)
+        no_pw=$(awk '/^[^ \t*#][^ \t]*:[ \t]*$/{sub(/:.*/,"");u=$0;next} /^[ \t]+password[ \t]*=/{v=$0;sub(/^[^=]*=[ \t]*/,"",v);sub(/[ \t]+$/,"",v); if(v=="") print u}' /etc/security/passwd 2>/dev/null)
         ;;
     HPUX|SOLARIS)
-        no_pw=$( { [ -f /etc/shadow ] && awk -F: '$2 == "" {print $1}' /etc/shadow 2>/dev/null; logins -p 2>/dev/null | awk '{print $1"(logins -p)"}'; } | sort -u | head -5)
+        no_pw=$( { [ -f /etc/shadow ] && awk -F: '$2 == "" {print $1}' /etc/shadow 2>/dev/null; logins -p 2>/dev/null | awk '{print $1"(logins -p)"}'; } | sort -u)
         ;;
     *)
-        [ -f /etc/shadow ] && \
-            no_pw=$(awk -F: '$2 == "" {print $1}' /etc/shadow 2>/dev/null | head -5) || \
-            no_pw=$(awk -F: '$2 == "" {print $1}' /etc/passwd 2>/dev/null | head -5)
+        no_pw=$(awk -F: '$2 == "" {print $1}' "$pwf" 2>/dev/null)
         ;;
     esac
-    _pwe=$(awk -F: '$2=="" && $1!="" {print $1"(passwd 필드 공란)"}' /etc/passwd 2>/dev/null | head -5)
-    [ -n "$_pwe" ] && no_pw="$(printf '%s\n%s' "$no_pw" "$_pwe" | grep -v '^$')"
-    [ -n "$no_pw" ] && result "SRV-022|취약|비밀번호 미설정 계정: $(echo "$no_pw" | _csv)" || \
-        result "SRV-022|양호|비밀번호 미설정 계정 없음"
+    pwe=$(awk -F: '$2=="" && $1!="" {print $1"(passwd 필드 공란)"}' /etc/passwd 2>/dev/null)
+    [ -n "$pwe" ] && no_pw="$(printf '%s\n%s' "$no_pw" "$pwe" | grep -v '^$' | sort -u)"
+    [ -n "$no_pw" ] && result "SRV-022|취약|비밀번호 미설정 계정 $(echo "$no_pw" | grep -c .)건: $(echo "$no_pw" | _sum 10)" || \
+        result "SRV-022|양호|비밀번호 미설정 계정 없음 (${pwf} 전 계정 확인)"
 }
 
 # ================================================================
 # SRV-025: hosts.equiv / .rhosts 설정 제한
 # ================================================================
 check_SRV025() {
-    evd "SRV-025" "ls -la /etc/hosts.equiv /root/.rhosts /.rhosts 2>/dev/null"
-    evd "SRV-025" "cat /etc/hosts.equiv /root/.rhosts 2>/dev/null"
     # 기준: 파일이 없거나 신뢰 호스트 목록만 있으면 양호, '+' 설정·불필요 계정/호스트가 있으면 취약
-    local plus="" entries="" f
-    for f in /etc/hosts.equiv /.rhosts $(awk -F: '$6!=""&&$6!="/"{print $6"/.rhosts"}' /etc/passwd 2>/dev/null | sort -u); do
+    local plus="" entries="" f files na
+    files="/etc/hosts.equiv /.rhosts /root/.rhosts $(awk -F: '$6!=""&&$6!="/"{print $6}' /etc/passwd 2>/dev/null | sort -u | while read -r h; do [ -d "$h" ] && echo "${h%/}/.rhosts"; done | tr '\n' ' ')"
+    files=$(echo $files | tr ' ' '\n' | sort -u | tr '\n' ' ')
+    evd "SRV-025" "_show_exist $files"
+    for f in $files; do
         [ -f "$f" ] || continue
-        grep -vE '^[[:space:]]*(#|$)' "$f" 2>/dev/null | grep -qE '(^|[[:space:]])\+' && plus="${plus} ${f}"
-        [ -n "$(grep -vE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)" ] && entries="${entries} ${f}($(grep -cvE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)줄)"
+        [ -r "$f" ] || { na="${na} ${f}"; continue; }
+        _cfg "$f" | grep -qE '(^|[[:space:]])\+' && plus="${plus} ${f}"
+        [ -n "$(_cfg "$f")" ] && entries="${entries} ${f}($(_cfg "$f" | grep -c .)줄)"
     done
+    na="${na}$(_noaccess_homes | sed 's#.*#& (.rhosts 열람 불가)#' | tr '\n' ' ')"
     if [ -n "$plus" ]; then result "SRV-025|취약|'+' 설정(모든 호스트/계정 신뢰) 존재:${plus}"
     elif [ -n "$entries" ]; then result "SRV-025|수동확인|신뢰 호스트 등록:${entries} - 불필요 계정/호스트 여부 확인"
+    elif [ -n "$(echo $na)" ]; then result "SRV-025|점검불가|열람 권한 없는 경로가 있어 확인 불가:${na} (root 로 재점검 필요)"
     else result "SRV-025|양호|hosts.equiv/.rhosts 미존재 또는 설정 없음(주석만)"; fi
 }
 
@@ -724,34 +910,36 @@ check_SRV025() {
 # SRV-026: root 원격 접속 제한
 # ================================================================
 check_SRV026() {
-    evd "SRV-026" "grep -i PermitRootLogin /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null; sshd -T 2>/dev/null | grep -i '^permitrootlogin'; ssh -V 2>&1; cat /etc/securetty 2>/dev/null | grep -E '^pts' | head -3"
+    local cf sb; cf=$(_sshd_cfg); sb=$(_sshd_bin)
+    evd "SRV-026" "_show_cfg ${cf:-/etc/ssh/sshd_config} $(ls /etc/ssh/sshd_config.d/*.conf 2>/dev/null | tr '\n' ' ') /etc/securetty; echo '# sshd -T'; sshd -T 2>&1 | grep -iE 'permitrootlogin|sshd:|rror|denied'; ssh -V 2>&1"
     case "$OS_FAMILY" in
     AIX)
         # 평가기준(AIX): rlogin 사용 시 root rlogin=true, SSH 사용 시 PermitRootLogin yes → 하나라도 해당하면 취약
+        evd "SRV-026" "grep -A12 '^root:' /etc/security/user 2>&1 | grep -E '^root:|rlogin'; grep -A30 '^default:' /etc/security/user 2>&1 | grep -E '^default:|rlogin'"
         val=$(awk '/^root:/{f=1;next} /^[^ \t*]/{f=0} f&&/rlogin/{sub(/.*=[ \t]*/,"");print;exit}' /etc/security/user 2>/dev/null)
         [ -z "$val" ] && val=$(awk '/^default:/{f=1;next} /^[^ \t*]/{f=0} f&&/rlogin/{sub(/.*=[ \t]*/,"");print;exit}' /etc/security/user 2>/dev/null)
-        ssh_root=$(grep -iE "^\s*PermitRootLogin" "$(_sshd_cfg)" 2>/dev/null | awk '{print $2}' | head -1)
+        ssh_root=$([ -n "$cf" ] && grep -iE "^[[:space:]]*PermitRootLogin" "$cf" 2>/dev/null | awk '{print $2}' | head -1)
         if [ "${val:-true}" != "false" ]; then result "SRV-026|취약|AIX root rlogin=${val:-true(기본)}${ssh_root:+, SSH PermitRootLogin=${ssh_root}}"
-        elif [ "${ssh_root,,}" = "yes" ]; then result "SRV-026|취약|AIX SSH PermitRootLogin=yes"
+        elif [ "$(_lc "$ssh_root")" = "yes" ]; then result "SRV-026|취약|AIX SSH PermitRootLogin=yes"
         else result "SRV-026|양호|AIX root rlogin=false, SSH PermitRootLogin=${ssh_root:-미설정(기본)}"; fi ;;
     SOLARIS)
         # 평가기준(Solaris): Telnet — /etc/default/login CONSOLE=/dev/console 없음/주석 이면 취약, SSH — PermitRootLogin yes 취약
+        evd "SRV-026" "_show_cfg /etc/default/login"
         cons=$(grep -v "^#" /etc/default/login 2>/dev/null | grep "^CONSOLE")
-        ssh_root=$(grep -iE "^\s*PermitRootLogin" "$(_sshd_cfg)" 2>/dev/null | awk '{print $2}' | head -1)
+        ssh_root=$([ -n "$cf" ] && grep -iE "^[[:space:]]*PermitRootLogin" "$cf" 2>/dev/null | awk '{print $2}' | head -1)
         if [ -z "$cons" ]; then result "SRV-026|취약|Solaris CONSOLE=/dev/console 미설정 (Telnet root 원격 접속 가능)${ssh_root:+, PermitRootLogin=${ssh_root}}"
-        elif [ "${ssh_root,,}" = "yes" ]; then result "SRV-026|취약|Solaris SSH PermitRootLogin=yes"
+        elif [ "$(_lc "$ssh_root")" = "yes" ]; then result "SRV-026|취약|Solaris SSH PermitRootLogin=yes"
         else result "SRV-026|양호|Solaris CONSOLE 제한, SSH PermitRootLogin=${ssh_root:-미설정}"; fi ;;
     HPUX)
         # 평가기준(HP-UX): Telnet 사용 시 /etc/securetty 없음·console 주석 → 취약, SSH PermitRootLogin yes → 취약
-        local cf tel="" val sb; cf=$(_sshd_cfg); sb=$(_sshd_bin)
-        evd "SRV-026" "grep -i PermitRootLogin $cf 2>/dev/null; cat /etc/securetty 2>/dev/null"
+        local tel="" val
         [ -n "$sb" ] && val=$("$sb" -T 2>/dev/null | awk 'tolower($1)=="permitrootlogin"{print $2}')
-        [ -z "$val" ] && val=$(grep -iE '^\s*PermitRootLogin' "$cf" 2>/dev/null | awk '{print $2}' | head -1)
+        [ -z "$val" ] && [ -n "$cf" ] && val=$(grep -iE '^[[:space:]]*PermitRootLogin' "$cf" 2>/dev/null | awk '{print $2}' | head -1)
         if is_running telnetd || [ -n "$(_inetd_on telnet; _listen 23)" ]; then
             grep -qE '^[[:space:]]*console[[:space:]]*$' /etc/securetty 2>/dev/null || tel="Telnet 사용 중 /etc/securetty console 미설정"
         fi
-        if [ -n "$tel" ] || [ "${val,,}" = "yes" ]; then result "SRV-026|취약|HP-UX ${tel}${tel:+, }SSH PermitRootLogin=${val:-미확인} (${cf:-sshd_config 미발견})"
-        elif [ -z "$val" ]; then result "SRV-026|수동확인|HP-UX PermitRootLogin 미설정·sshd -T 불가 (${cf:-sshd_config 미발견}) - 기본값 확인(HP-UX Secure Shell 구버전 기본 yes)"
+        if [ -n "$tel" ] || [ "$(_lc "$val")" = "yes" ]; then result "SRV-026|취약|HP-UX ${tel}${tel:+, }SSH PermitRootLogin=${val:-미확인} (${cf:-sshd_config 미발견})"
+        elif [ -z "$val" ]; then result "SRV-026|점검불가|HP-UX PermitRootLogin 미설정·sshd -T 불가 (${cf:-sshd_config 미발견}) - 설정값 확인 불가(HP-UX Secure Shell 구버전 기본 yes)"
         else result "SRV-026|양호|HP-UX PermitRootLogin=${val}, Telnet root 제한"; fi ;;
     *)
         # 평가기준: SSH는 PermitRootLogin yes 일 때만 취약, Telnet 사용 시 securetty 의 pts 허용 여부
@@ -759,8 +947,8 @@ check_SRV026() {
         val=$(sshd -T 2>/dev/null | awk 'tolower($1)=="permitrootlogin"{print $2}' | tail -1)
         if [ -z "$val" ]; then
             src="설정파일"
-            [ -d /etc/ssh/sshd_config.d ] && val=$(grep -rih "^\s*PermitRootLogin" /etc/ssh/sshd_config.d/ 2>/dev/null | awk '{print $2}' | head -1)
-            [ -z "$val" ] && val=$(grep -i "^\s*PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1)
+            [ -d /etc/ssh/sshd_config.d ] && val=$(cat /etc/ssh/sshd_config.d/*.conf 2>/dev/null | grep -i "^[[:space:]]*PermitRootLogin" | awk '{print $2}' | head -1)
+            [ -z "$val" ] && [ -n "$cf" ] && val=$(grep -i "^[[:space:]]*PermitRootLogin" "$cf" 2>/dev/null | awk '{print $2}' | head -1)
         fi
         local telnet_vuln=""
         if is_running telnetd || is_running in.telnetd || [ -n "$(_inetd_on telnet; _listen 23)" ]; then
@@ -770,13 +958,14 @@ check_SRV026() {
             local ov; ov=$( { ssh -V 2>&1; sshd -V 2>&1; rpm -q openssh-server 2>/dev/null; dpkg-query -W -f='OpenSSH_${Version}' openssh-server 2>/dev/null; } | grep -oE 'OpenSSH_[0-9]+\.[0-9]+|openssh-server-[0-9]+\.[0-9]+|OpenSSH_1:[0-9]+\.[0-9]+' | head -1 | grep -oE '[0-9]+\.[0-9]+$')
             if [ -n "$ov" ] && [ "${ov%%.*}" -ge 7 ] 2>/dev/null; then val="prohibit-password"; src="OpenSSH ${ov} 기본값"; fi
         fi
-        case "${val,,}" in
+        case "$(_lc "$val")" in
         yes) result "SRV-026|취약|PermitRootLogin=yes (${src}) - root 원격 접속 허용${telnet_vuln}" ;;
         no|prohibit-password|without-password|forced-commands-only)
             [ -n "$telnet_vuln" ] && result "SRV-026|취약|PermitRootLogin=${val} (${src})${telnet_vuln}" \
                                   || result "SRV-026|양호|PermitRootLogin=${val} (${src})" ;;
-        "") [ -n "$telnet_vuln" ] && result "SRV-026|취약|${telnet_vuln# / }" \
-                                  || result "SRV-026|수동확인|PermitRootLogin 확인 불가 (sshd -T 실패, 설정 없음, OpenSSH 버전 미확인)" ;;
+        "") if [ -n "$telnet_vuln" ]; then result "SRV-026|취약|${telnet_vuln# / }"
+            elif [ -z "$cf" ] && [ -z "$sb" ] && ! is_running sshd && ! is_running ssh; then result "SRV-026|양호|SSH·Telnet 원격 접속 서비스 없음 (sshd 미설치·미실행)"
+            else result "SRV-026|점검불가|PermitRootLogin 설정값 확인 불가 (sshd -T 실패, 설정 파일에 값 없음, OpenSSH 버전 미확인)"; fi ;;
         *)  result "SRV-026|수동확인|PermitRootLogin=${val} (${src})" ;;
         esac ;;
     esac
@@ -787,10 +976,10 @@ check_SRV026() {
 # ================================================================
 check_SRV027() {
     # 평가기준: 방화벽·tcp-wrapper·3rd-party 로 서비스 접근통제 — 규칙 유무로 판단, 없으면 상위 방화벽 등 확인(수동확인)
-    evd "SRV-027" "grep -vE '^\s*(#|\$)' /etc/hosts.allow /etc/hosts.deny 2>/dev/null; grep -vE '^\s*(#|\$)' /var/adm/inetd.sec 2>/dev/null; ipfstat -io 2>/dev/null | head -20; inetadm -p 2>/dev/null | grep tcp_wrappers; lsfilt -a 2>/dev/null | head -20"
-    evd "SRV-027" "firewall-cmd --list-all 2>/dev/null; ufw status numbered 2>/dev/null; iptables -S 2>/dev/null | head -40; nft list ruleset 2>/dev/null | head -40"
+    evd "SRV-027" "_show_cfg /etc/hosts.allow /etc/hosts.deny /var/adm/inetd.sec; inetadm -p 2>&1 | grep tcp_wrappers; ipfstat -io 2>&1; lsfilt -a 2>&1"
+    evd "SRV-027" "firewall-cmd --state 2>&1; firewall-cmd --list-all 2>&1; ufw status numbered 2>&1; iptables -S 2>&1; nft list ruleset 2>&1"
     local tw=0 fw="" n
-    [ -n "$(grep -vE '^\s*(#|$)' /etc/hosts.allow /etc/hosts.deny 2>/dev/null)" ] && tw=1
+    [ -n "$(_cfg /etc/hosts.allow /etc/hosts.deny /var/adm/inetd.sec)" ] && tw=1
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
         n=$( { firewall-cmd --list-rich-rules 2>/dev/null; firewall-cmd --list-sources 2>/dev/null | tr ' ' '\n'; } | grep -c . ); fw="firewalld(zone=$(firewall-cmd --get-default-zone 2>/dev/null), rich/source ${n})"
     elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -798,10 +987,15 @@ check_SRV027() {
     fi
     if [ -z "$fw" ]; then
         n=$(iptables -S 2>/dev/null | grep -c '^-A'); [ "${n:-0}" -gt 0 ] && fw="iptables(${n} rules)"
-        [ -z "$fw" ] && { n=$(nft list ruleset 2>/dev/null | grep -cE '^\s+(ip|tcp|udp|iif|oif|meta|ct)\s'); [ "${n:-0}" -gt 0 ] && fw="nftables(${n} rules)"; }
+        [ -z "$fw" ] && { n=$(nft list ruleset 2>/dev/null | grep -cE '^[[:space:]]+(ip|tcp|udp|iif|oif|meta|ct)[[:space:]]'); [ "${n:-0}" -gt 0 ] && fw="nftables(${n} rules)"; }
         [ -z "$fw" ] && iptables -S 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)' && fw="iptables(INPUT 기본 DROP)"
     fi
+    [ -z "$fw" ] && command -v ipfstat >/dev/null 2>&1 && [ -n "$(ipfstat -io 2>/dev/null | grep -E '^(pass|block)')" ] && fw="ipfilter"
     if [ -n "$fw" ] || [ $tw -eq 1 ]; then result "SRV-027|양호|접근통제 규칙 존재 (tcp-wrapper=$([ $tw -eq 1 ] && echo 설정 || echo 없음), 방화벽=${fw:-없음})"
+    elif [ "$_NONROOT" = 1 ] && ! command -v firewall-cmd >/dev/null 2>&1 && [ -z "$(iptables -S 2>/dev/null)" ]; then
+        result "SRV-027|점검불가|방화벽 규칙 조회 권한 없음 (비root 실행: iptables/nft/firewall-cmd 조회 불가) - root 로 재점검 필요"
+    elif [ -n "${_CLOUD:-}" ] && [ "${_CLOUD:-}" != "없음" ] && [ "${_CLOUD:-}" != "미확인" ]; then
+        result "SRV-027|수동확인|호스트 방화벽·tcp-wrapper 규칙 없음 - ${_CLOUD} 환경: 보안그룹(${_CLOUD_SG:-ID 미확인})의 인바운드 규칙으로 접근통제 시 양호 가능, 규칙 수동 확인 필요"
     else result "SRV-027|수동확인|호스트 방화벽·tcp-wrapper 규칙 없음 - 상위 방화벽·3rd-party 접근통제 여부 확인 (미통제 시 취약)"; fi
 }
 
@@ -809,37 +1003,46 @@ check_SRV027() {
 # SRV-028: 원격 터미널 접속 타임아웃
 # ================================================================
 check_SRV028() {
-    evd "SRV-028" "grep -rh 'TMOUT\\|tmout' /etc/profile /etc/bashrc /etc/bash.bashrc /etc/profile.d/ /root/.bashrc /root/.profile 2>/dev/null | grep -v '^#'"
-    tmout=""
-    for f in /etc/profile /etc/bashrc /etc/bash.bashrc /etc/environment \
-              /root/.bashrc /root/.profile /etc/profile.d/*.sh; do
-        [ -f "$f" ] || continue
-        t=$(grep -h "TMOUT\|tmout" "$f" 2>/dev/null | grep -v "^\s*#" | grep -oE "[0-9]+" | head -1)
-        [ -n "$t" ] && tmout=$t && break
+    # 평가기준: 900초(15분) 이하 양호 (내부 규정이 더 짧으면 그 기준 적용 - 수동 확인)
+    local gfiles="/etc/profile /etc/environment /etc/bashrc /etc/bash.bashrc $(ls /etc/profile.d/*.sh 2>/dev/null | tr '\n' ' ')" ufiles="" h
+    for h in $(awk -F: '$7!~/(nologin|false|sync|shutdown|halt)$/ && $6!="" {print $6}' /etc/passwd 2>/dev/null | sort -u); do
+        h="${h%/}"; ufiles="${ufiles} $h/.profile $h/.bash_profile $h/.bashrc $h/.kshrc"
     done
+    ufiles="${ufiles} /root/.profile /root/.bash_profile /root/.bashrc"; ufiles=$(echo $ufiles | tr ' ' '\n' | sort -u | tr '\n' ' ')
+    evd "SRV-028" "_ls_exist $gfiles; echo '# TMOUT 설정 줄 (전역)'; _tmout_lines $gfiles"
+    evd "SRV-028" "echo '# TMOUT 설정 줄 (계정 홈 파일)'; _tmout_lines $ufiles; echo '# 점검한 홈 파일 수: $(echo $ufiles | wc -w)'"
+    local tmout="" t src="" ov="" l v f
+    # 전역 설정: 파일 적용 순서대로 마지막 대입값이 유효
+    t=$(_tmout_scan $gfiles | tail -1); [ -n "$t" ] && { tmout="${t#*:}"; src="${t%%:*}"; }
     case "$OS_FAMILY" in
-    SOLARIS) [ -z "$tmout" ] && tmout=$(grep "^TIMEOUT" /etc/default/login 2>/dev/null | cut -d= -f2 | tr -d ' ') ;;
+    SOLARIS) [ -z "$tmout" ] && tmout=$(grep "^TIMEOUT" /etc/default/login 2>/dev/null | cut -d= -f2 | tr -d ' ') && src="/etc/default/login(TIMEOUT)" ;;
     AIX)     [ -z "$tmout" ] && tmout=$(grep "^TMOUT\|^tmout" /etc/profile /etc/environment 2>/dev/null | grep -oE "[0-9]+" | head -1) ;;
     esac
-    # 평가기준: 900초(15분) 이하 양호 (내부 규정이 더 짧으면 그 기준 적용 - 수동 확인)
+    # 계정별 홈 파일에서 제한을 풀거나(0·900 초과) 전역 설정이 없을 때 root 에만 설정한 경우
+    for l in $(_tmout_scan $ufiles); do
+        f="${l%%:*}"; v="${l#*:}"
+        if [ "$v" = "0" ] || { [ "$v" -gt 900 ] 2>/dev/null; } || [ -z "$v" ]; then ov="${ov} ${f}(TMOUT=${v:-계산불가})"; fi
+    done
+    local noacc; noacc=$(_noaccess_homes | tr '\n' ' ')
     if [ -z "$tmout" ] || [ "$tmout" = "0" ]; then
-        result "SRV-028|취약|TMOUT 미설정 (세션 타임아웃 없음)"
-    elif [ "$tmout" -le 900 ] 2>/dev/null; then
-        result "SRV-028|양호|TMOUT=${tmout}초 (900초 이하, 내부 규정이 더 짧으면 그 기준으로 확인)"
-    else
-        result "SRV-028|취약|TMOUT=${tmout}초 (900초 초과)"
-    fi
+        if [ -n "$(_tmout_scan $ufiles)" ]; then result "SRV-028|취약|전역 TMOUT 미설정 (계정별 파일에만 설정:$(_tmout_scan $ufiles | _sum 5)) - 전체 계정 미적용"
+        else result "SRV-028|취약|TMOUT 미설정 (세션 타임아웃 없음, 점검 파일: 전역 $(echo $gfiles | wc -w)개·계정 홈 $(echo $ufiles | wc -w)개)"; fi
+    elif [ -n "$ov" ]; then result "SRV-028|취약|전역 TMOUT=${tmout}초(${src})이나 계정 파일에서 해제/초과:${ov}"
+    elif ! [ "$tmout" -le 900 ] 2>/dev/null; then
+        if [ "$tmout" -gt 900 ] 2>/dev/null; then result "SRV-028|취약|TMOUT=${tmout}초 (900초 초과, ${src})"
+        else result "SRV-028|점검불가|TMOUT 값 해석 불가 (${tmout}, ${src})"; fi
+    elif [ -n "$noacc" ]; then result "SRV-028|점검불가|전역 TMOUT=${tmout}초(${src}, 900초 이하)이나 열람 권한 없는 계정 홈의 TMOUT 재정의 확인 불가:${noacc} (root 로 재점검 필요)"
+    else result "SRV-028|양호|TMOUT=${tmout}초 (${src}, 900초 이하, 내부 규정이 더 짧으면 그 기준으로 확인)"; fi
 }
 
 # ================================================================
-# SRV-034: 불필요한 서비스 비활성화 (finger/chargen/daytime 등)
+# SRV-034: automountd 서비스 비활성화 (Solaris 는 dmi 서비스 포함)
 # ================================================================
 check_SRV034() {
     # 평가기준(LINUX 등): 취약한 버전의 automountd 서비스가 불필요하게 활성화 / Solaris 는 dmi 서비스 추가
-    evd "SRV-034" "ps -ef 2>/dev/null | grep -E 'autofs|automount|dmispd|snmpXdmid' | grep -v grep; grep -v '^#' /etc/inetd.conf 2>/dev/null | grep -i automount; systemctl is-active autofs 2>/dev/null; automount -V 2>/dev/null | head -1"
+    evd "SRV-034" "_svc_state automount automountd autofs dmispd snmpXdmid; _cfg /etc/inetd.conf 2>&1 | grep -i automount; automount -V 2>&1"
     local am="" dmi=""
-    { is_running automount || is_running automountd || is_running autofs || grep -v '^#' /etc/inetd.conf 2>/dev/null | grep -qi automount || \
-      { command -v systemctl >/dev/null 2>&1 && systemctl is-active autofs 2>/dev/null | grep -q '^active'; }; } && am="automount($(automount -V 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' || echo 버전미확인))"
+    { is_running automount || is_running automountd || is_running autofs || _cfg /etc/inetd.conf | grep -qi automount; } && am="automount($(automount -V 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' || echo 버전미확인))"
     [ "$OS_FAMILY" = "SOLARIS" ] && { is_running dmispd || is_running snmpXdmid; } && dmi="dmi(dmispd/snmpXdmid)"
     if [ -n "$dmi" ]; then result "SRV-034|취약|DMI 서비스 활성: ${dmi}${am:+ / $am}"
     elif [ -n "$am" ]; then result "SRV-034|수동확인|${am} 활성 - 업무상 필요 여부·취약 버전 여부 확인"
@@ -851,29 +1054,32 @@ check_SRV034() {
 # ================================================================
 check_SRV035() {
     # 평가기준: tftp·talk·ntalk / finger / rexec·rlogin·rsh / echo·discard·daytime·chargen / NIS·NIS+ (tftp 는 백업솔루션 필수 시 예외)
-    evd "SRV-035" "grep -vE '^\s*#' /etc/inetd.conf 2>/dev/null | grep -E 'tftp|talk|finger|exec|login|shell|echo|discard|daytime|chargen'; ls /etc/xinetd.d 2>/dev/null; ps -ef 2>/dev/null | grep -E 'tftp|talk|finger|rexec|rlogin|rsh|ypserv|ypbind|yppasswdd|nisd' | grep -v grep"
+    local names="talkd in.talkd ntalkd in.ntalkd fingerd in.fingerd rexecd in.rexecd rlogind in.rlogind rshd in.rshd ypserv ypbind yppasswdd rpc.nisd tftpd in.tftpd"
+    evd "SRV-035" "_svc_state $names"
+    evd "SRV-035" "_show_cfg /etc/inetd.conf; ls -l /etc/xinetd.d 2>&1; grep -iH 'disable' /etc/xinetd.d/* 2>&1; ss -uln 2>&1"
     local found="" tftp="" s
     for s in talkd in.talkd ntalkd in.ntalkd fingerd in.fingerd rexecd in.rexecd rlogind in.rlogind rshd in.rshd ypserv ypbind yppasswdd rpc.nisd; do
         is_running "$s" && found="${found} ${s}"
     done
     { is_running tftpd || is_running in.tftpd || ss -uln 2>/dev/null | grep -q ':69 '; } && tftp="tftp"
-    if command -v systemctl >/dev/null 2>&1; then
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        evd "SRV-035" "for s in chargen daytime discard echo rsh rlogin rexec finger tftp talk ntalk; do echo \"\$s.socket: \$(systemctl is-active \$s.socket 2>&1)\"; done"
         for s in chargen daytime discard echo rsh rlogin rexec finger tftp talk ntalk; do
             systemctl is-active "${s}.socket" 2>/dev/null | grep -q "^active" && { [ "$s" = tftp ] && tftp="tftp" || found="${found} ${s}.socket"; }
         done
     fi
-    local act; act=$(grep -vE '^\s*#' /etc/inetd.conf 2>/dev/null | awk '{print $1}' | grep -E '^(tftp|talk|ntalk|finger|exec|login|shell|echo|discard|daytime|chargen)$' | tr '\n' ' ')
+    local act; act=$(_cfg /etc/inetd.conf | awk '{print $1}' | grep -E '^(tftp|talk|ntalk|finger|exec|login|shell|echo|discard|daytime|chargen)$' | tr '\n' ' ')
     for s in $act; do [ "$s" = tftp ] && tftp="tftp" || found="${found} [inetd:${s}]"; done
     if [ "$OS_FAMILY" = "SOLARIS" ]; then
         for s in $(_inetd_on tftp talk finger login shell rexec echo discard daytime chargen | sed -n 's/^smf://p'); do
             case "$s" in */tftp/*|*/tftp:*) tftp="tftp" ;; *) found="${found} [smf:${s#svc:/network/}]" ;; esac
         done
-        evd "SRV-035" "inetadm 2>/dev/null | grep -E 'tftp|talk|finger|login|shell|rexec|echo|discard|daytime|chargen'"
+        evd "SRV-035" "inetadm 2>&1"
     fi
     if [ -d /etc/xinetd.d ]; then
         for s in /etc/xinetd.d/*; do
             [ -f "$s" ] || continue
-            grep -qiE 'disable\s*=\s*no' "$s" 2>/dev/null || continue
+            grep -qiE 'disable[[:space:]]*=[[:space:]]*no' "$s" 2>/dev/null || continue
             case "$(basename "$s")" in tftp*) tftp="tftp" ;; chargen*|daytime*|discard*|echo*|rsh|rlogin|rexec|finger|talk|ntalk) found="${found} [xinetd:$(basename "$s")]" ;; esac
         done
     fi
@@ -886,38 +1092,52 @@ check_SRV035() {
 # SRV-062: DNS 정보 노출 방지 (버전 노출)
 # ================================================================
 check_SRV062() {
-    is_running named || { evd "SRV-062" "ps -ef 2>/dev/null | grep named | grep -v grep"; result "SRV-062|N-A|DNS 서비스 미실행"; return; }
-    local nc; nc=$(_named_conf)
-    evd "SRV-062" "echo '$(echo "$nc" | grep -iE 'version' | head -3)'"
-    [ -z "$nc" ] && { result "SRV-062|수동확인|named.conf 위치 확인 필요"; return; }
-    echo "$nc" | grep -qiE '(^|[[:space:]])version\s+("[^0-9"]*"|[^0-9;"]*)\s*;' && result "SRV-062|양호|DNS 버전 노출 차단 (version 문자열 대체)" || result "SRV-062|취약|DNS 버전 노출 차단 미설정 (version \"none\" 권고)"
+    _dns_pre SRV-062 || return
+    local v vv
+    v=$(echo "$_NC" | _dns_stmt version | grep -E '^options')
+    vv=$(echo "$v" | head -1 | cut -d'|' -f2- | tr -d '"')
+    if [ -z "$v" ]; then result "SRV-062|취약|DNS 버전 노출 차단 미설정 (options 에 version \"none\" 없음, 기본 응답에 BIND 버전 노출)"
+    elif echo "$vv" | grep -q '[0-9]'; then result "SRV-062|취약|DNS version 문자열에 버전 포함: ${vv}"
+    else result "SRV-062|양호|DNS 버전 노출 차단 (version \"${vv}\")"; fi
 }
 
 # ================================================================
 # SRV-066: DNS Zone Transfer 제한
 # ================================================================
 check_SRV066() {
-    is_running named || { evd "SRV-066" "ps -ef 2>/dev/null | grep named | grep -v grep"; result "SRV-066|N-A|DNS 미실행"; return; }
-    local nc; nc=$(_named_conf)
-    evd "SRV-066" "echo '$(echo "$nc" | grep -iE 'allow-transfer' | head -5)'"
-    [ -z "$nc" ] && { result "SRV-066|수동확인|named.conf 수동 확인"; return; }
-    if echo "$nc" | grep -qiE 'allow-transfer\s*\{\s*any\s*;'; then result "SRV-066|취약|allow-transfer { any; } - 모든 호스트 Zone Transfer 허용"
-    elif echo "$nc" | grep -qiE 'allow-transfer'; then result "SRV-066|양호|Zone Transfer 허용 대상 지정: $(echo "$nc" | grep -ioE 'allow-transfer\s*\{[^}]*\}' | head -1)"
-    else result "SRV-066|취약|allow-transfer 미설정 (Zone Transfer 제한 없음)"; fi
+    _dns_pre SRV-066 || return
+    local at zones z own glob="" anyv="" miss="" zc=0
+    at=$(echo "$_NC" | _dns_stmt allow-transfer)
+    zones=$(echo "$_NC" | _dns_stmt type | grep -E '^zone' | grep -E '\|(master|slave|primary|secondary)$' | cut -d'|' -f1)
+    anyv=$(echo "$at" | awk -F'|' '{n=split($2,a," "); for(i=1;i<=n;i++) if (a[i]=="any" || a[i]=="0.0.0.0/0" || a[i]=="::/0") {print $1; break}}')
+    glob=$(echo "$at" | grep -E '^(options|view)' | head -1)
+    while IFS= read -r z; do
+        [ -z "$z" ] && continue
+        zc=$((zc+1))
+        own=$(echo "$at" | grep -F "$z|" | head -1)
+        [ -z "$own" ] && [ -z "$glob" ] && miss="${miss}${z}"$'\001'
+    done <<EOF
+$zones
+EOF
+    miss=$(printf '%s' "$miss" | tr '\001' '\n')
+    if [ -n "$anyv" ]; then result "SRV-066|취약|allow-transfer 에 any 포함(모든 호스트 Zone Transfer 허용): $(echo "$anyv" | _csv)"
+    elif [ -n "$miss" ]; then result "SRV-066|취약|allow-transfer 미설정 zone(기본 전체 허용): $(echo "$miss" | _sum 8)"
+    elif [ "$zc" -eq 0 ]; then result "SRV-066|양호|master/slave zone 없음 (캐시·포워딩 전용) - 전송 대상 zone 없음"
+    else result "SRV-066|양호|Zone Transfer 허용 대상 지정 (${zc}개 zone): $(echo "$at" | sed "s/|/=/" | _sum 8)"; fi
 }
 
 # ================================================================
 # SRV-063: DNS Recursive Query 제한 설정 여부
 # ================================================================
 check_SRV063() {
-    is_running named || { evd "SRV-063" "ps -ef 2>/dev/null | grep named | grep -v grep"; result "SRV-063|양호|DNS 서비스 미실행"; return; }
-    local nc; nc=$(_named_conf)
-    evd "SRV-063" "echo '$(echo "$nc" | grep -iE 'recursion|allow-recursion|allow-query-cache' | head -5)'"
-    [ -z "$nc" ] && { result "SRV-063|수동확인|named.conf 위치 확인 필요"; return; }
+    _dns_pre SRV-063 양호 || return
+    local rec ar
+    rec=$(echo "$_NC" | _dns_stmt recursion | grep -E '^(options|view)')
+    ar=$(echo "$_NC" | _dns_stmt allow-recursion)
     # 평가기준: Recursive query 금지 또는 신뢰 호스트만 허용 → 양호 (BIND 9.4+ 기본 allow-recursion 은 localnets/localhost)
-    if echo "$nc" | grep -qiE 'recursion\s+no\s*;'; then result "SRV-063|양호|recursion no"
-    elif echo "$nc" | grep -qiE 'allow-recursion\s*\{\s*any\s*;'; then result "SRV-063|취약|allow-recursion { any; } - 모든 호스트 재귀 질의 허용"
-    elif echo "$nc" | grep -qiE 'allow-recursion'; then result "SRV-063|양호|allow-recursion 신뢰 호스트 한정: $(echo "$nc" | grep -ioE 'allow-recursion\s*\{[^}]*\}' | head -1)"
+    if echo "$ar" | awk -F'|' '{n=split($2,a," "); for(i=1;i<=n;i++) if (a[i]=="any" || a[i]=="0.0.0.0/0") f=1} END{exit !f}'; then result "SRV-063|취약|allow-recursion 에 any 포함 - 모든 호스트 재귀 질의 허용"
+    elif [ -n "$rec" ] && ! echo "$rec" | grep -qE '\|(yes|true|1)$'; then result "SRV-063|양호|recursion no ($(echo "$rec" | sed "s/|/=/" | _csv))"
+    elif [ -n "$ar" ]; then result "SRV-063|양호|allow-recursion 신뢰 호스트 한정: $(echo "$ar" | sed "s/|/=/" | _sum 8)"
     else result "SRV-063|수동확인|recursion 허용 대상 미지정 (BIND 기본 localnets·localhost) - 신뢰 호스트 한정 여부 확인"; fi
 }
 
@@ -925,13 +1145,14 @@ check_SRV063() {
 # SRV-064: DNS 서비스 보안 패치 적용 여부
 # ================================================================
 check_SRV064() {
-    is_running named || { evd "SRV-064" "ps -ef 2>/dev/null | grep named | grep -v grep"; result "SRV-064|양호|DNS 서비스 미실행"; return; }
-    evd "SRV-064" "named -v 2>/dev/null; rpm -qa bind 2>/dev/null; dpkg -l bind9 2>/dev/null | tail -1"
+    is_running named || { evd "SRV-064" "_svc_state named"; result "SRV-064|양호|DNS 서비스 미실행"; return; }
+    evd "SRV-064" "_svc_state named; named -v 2>&1; rpm -q bind 2>&1; dpkg -l bind9 2>&1"
+    local named_ver
     named_ver=$(named -v 2>/dev/null | grep -oE 'BIND [0-9][^ ]*' | head -1)
     if [ -n "$named_ver" ]; then
         result "SRV-064|수동확인|DNS 버전: ${named_ver} - 최신 보안 패치 적용 여부 수동 확인"
     else
-        result "SRV-064|수동확인|DNS 서비스 실행 중 - 버전 및 보안 패치 수동 확인"
+        result "SRV-064|점검불가|named 가 실행 중이나 named -v 로 버전을 확인하지 못함 - 보안 패치 적용 여부 확인 불가"
     fi
 }
 
@@ -957,22 +1178,22 @@ _pw_policy() {
         else [ "${n:-1}" -ge 1 ] 2>/dev/null && cls=$((cls+1)); fi
         who="Solaris" ;;
     HPUX)
-        ml=$(grep -E "^\s*MIN_PASSWORD_LENGTH" /etc/default/security 2>/dev/null | cut -d= -f2 | tr -d ' ')
+        ml=$(grep -E "^[[:space:]]*MIN_PASSWORD_LENGTH" /etc/default/security 2>/dev/null | cut -d= -f2 | tr -d ' ')
         for k in PASSWORD_MIN_LOWER_CASE_CHARS PASSWORD_MIN_UPPER_CASE_CHARS PASSWORD_MIN_DIGIT_CHARS PASSWORD_MIN_SPECIAL_CHARS; do
-            grep -qE "^\s*${k}=[1-9]" /etc/default/security 2>/dev/null && cls=$((cls+1)); done
+            grep -qE "^[[:space:]]*${k}=[1-9]" /etc/default/security 2>/dev/null && cls=$((cls+1)); done
         who="HP-UX" ;;
     *)
         local pam_files f line="" conf="" c neg=0 mcl
         pam_files=$(get_pam_files)
         for f in $pam_files; do
             [ -f "$f" ] || continue
-            line=$(grep -v "^\s*#" "$f" 2>/dev/null | grep -iE "pam_pwquality|pam_cracklib" | head -1)
+            line=$(grep -v "^[[:space:]]*#" "$f" 2>/dev/null | grep -iE "pam_pwquality|pam_cracklib" | head -1)
             [ -n "$line" ] && break
         done
-        [ -f /etc/security/pwquality.conf ] && conf=$(grep -vhE "^\s*(#|$)" /etc/security/pwquality.conf /etc/security/pwquality.conf.d/*.conf 2>/dev/null)
+        conf=$(grep -vhE "^[[:space:]]*(#|$)" /etc/security/pwquality.conf /etc/security/pwquality.conf.d/*.conf 2>/dev/null)
         if [ -z "$line" ] && [ -z "$conf" ]; then echo "0 0 모듈없음"; return; fi
-        _pwv() { local x; x=$(echo "$line" | grep -oE "(^|\s)$1=-?[0-9]+" | tail -1 | cut -d= -f2)
-                 [ -z "$x" ] && x=$(echo "$conf" | grep -E "^\s*$1\s*=" | tail -1 | grep -oE -- '-?[0-9]+'); echo "$x"; }
+        _pwv() { local x; x=$(echo "$line" | grep -oE "(^|[[:space:]])$1=-?[0-9]+" | tail -1 | cut -d= -f2)
+                 [ -z "$x" ] && x=$(echo "$conf" | grep -E "^[[:space:]]*$1[[:space:]]*=" | tail -1 | grep -oE -- '-?[0-9]+'); echo "$x"; }
         ml=$(_pwv minlen); ml=${ml:-9}
         mcl=$(_pwv minclass); mcl=${mcl:-0}
         for c in dcredit ucredit lcredit ocredit; do [ "$(_pwv $c)" -lt 0 ] 2>/dev/null && neg=$((neg+1)); done
@@ -989,14 +1210,14 @@ _pw_policy_ok() {  # 평가기준 복잡도: 2종 10자 이상 또는 3종 8자 
 
 check_SRV069() {
     # 평가기준: 비밀번호 관련 정책(2종 10자/3종 8자 복잡도 + 변경 기간 90일 이하)이 설정되어 있을 경우 양호
-    evd "SRV-069" "grep -E '^PASS_MAX_DAYS|^MAXWEEKS|^maxage|PASSWORD_MAXDAYS|MIN_PASSWORD_LENGTH' /etc/login.defs /etc/default/passwd /etc/security/user /etc/default/security 2>/dev/null; grep -vE '^\s*(#|$)' /etc/security/pwquality.conf 2>/dev/null"
-    local days="" src="" issues="" pol ml cls who
+    evd "SRV-069" "_show_cfg /etc/login.defs /etc/default/passwd /etc/security/user /etc/default/security /etc/security/pwquality.conf $(ls /etc/security/pwquality.conf.d/*.conf 2>/dev/null | tr '\n' ' ') $(get_pam_files)"
+    local days="" src="" issues="" pol ml cls who shadow_na=""
     case "$OS_FAMILY" in
     AIX)     local w; w=$(_aix_default | grep -w "maxage" | grep -oE '[0-9]+' | head -1)
              [ -n "$w" ] && days=$((w*7)); src="maxage=${w:-미설정}주" ;;
     SOLARIS) local w; w=$(grep "^MAXWEEKS" /etc/default/passwd 2>/dev/null | cut -d= -f2 | tr -d ' ')
              [ -n "$w" ] && days=$((w*7)); src="MAXWEEKS=${w:-미설정}주" ;;
-    HPUX)    days=$(grep -E "^\s*PASSWORD_MAXDAYS" /etc/default/security 2>/dev/null | cut -d= -f2 | tr -d ' '); src="PASSWORD_MAXDAYS=${days:-미설정}" ;;
+    HPUX)    days=$(grep -E "^[[:space:]]*PASSWORD_MAXDAYS" /etc/default/security 2>/dev/null | cut -d= -f2 | tr -d ' '); src="PASSWORD_MAXDAYS=${days:-미설정}" ;;
     *)       days=$(grep "^PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}'); src="PASS_MAX_DAYS=${days:-미설정}" ;;
     esac
     if [ -z "$days" ] || [ "$days" = "0" ]; then issues="변경 기간 미설정(${src})"
@@ -1004,11 +1225,15 @@ check_SRV069() {
     pol=$(_pw_policy); ml=${pol%% *}; cls=$(echo "$pol" | awk '{print $2}'); who=$(echo "$pol" | awk '{print $3}')
     if [ "$who" = "모듈없음" ]; then issues="${issues:+$issues / }복잡도 모듈(pam_pwquality/pam_cracklib) 미설정"
     else _pw_policy_ok "$ml" "$cls" || issues="${issues:+$issues / }복잡도 정책 미달(${who}: 최소 ${ml}자, ${cls}종)"; fi
-    if [ "$OS_FAMILY" = "LINUX" ] && [ -r /etc/shadow ]; then
-        local _acc; _acc=$(awk -F: 'NR==FNR{if($7!~/(nologin|false|sync|shutdown|halt)$/)sh[$1]=1;next} ($1 in sh) && $2!~/^[!*]/ && ($5=="" || $5+0>90){print $1"("($5==""?"미설정":$5)")"}' /etc/passwd /etc/shadow 2>/dev/null | head -5 | tr '\n' ' ')
-        [ -n "$_acc" ] && issues="${issues:+$issues / }기존 계정 최대 사용기간 90일 초과/미설정(chage): ${_acc}"
+    if [ "$OS_FAMILY" = "LINUX" ]; then
+        if [ -r /etc/shadow ]; then
+            local _acc; _acc=$(awk -F: 'NR==FNR{if($7!~/(nologin|false|sync|shutdown|halt)$/)sh[$1]=1;next} ($1 in sh) && $2!~/^[!*]/ && ($5=="" || $5+0>90){print $1"("($5==""?"미설정":$5)")"}' /etc/passwd /etc/shadow 2>/dev/null)
+            evd "SRV-069" "echo '# 로그인 가능 계정의 최대 사용기간(shadow 5번째 필드, 잠긴 계정 제외, 90일 초과·미설정만)'; awk -F: 'NR==FNR{if(\$7!~/(nologin|false|sync|shutdown|halt)\$/)sh[\$1]=1;next} (\$1 in sh) && \$2!~/^[!*]/ {print \$1\": \"(\$5==\"\"?\"미설정\":\$5)}' /etc/passwd /etc/shadow 2>&1"
+            [ -n "$_acc" ] && issues="${issues:+$issues / }기존 계정 최대 사용기간 90일 초과/미설정(chage) $(echo "$_acc" | grep -c .)건: $(echo "$_acc" | _sum 5)"
+        else shadow_na="1"; fi
     fi
     if [ -n "$issues" ]; then result "SRV-069|취약|${issues} - 기준: 2종 10자/3종 8자 이상, 변경 기간 90일 이하"
+    elif [ -n "$shadow_na" ]; then result "SRV-069|점검불가|전역 정책은 충족(${src}, ${who}: ${ml}자·${cls}종)하나 /etc/shadow 읽기 권한 없어 기존 계정 사용기간 확인 불가 (root 로 재점검 필요)"
     else result "SRV-069|양호|비밀번호 정책 설정 (${src}, ${who}: 최소 ${ml}자·${cls}종)"; fi
 }
 
@@ -1016,16 +1241,21 @@ check_SRV069() {
 # SRV-070: 취약한 패스워드 저장 방식
 # ================================================================
 check_SRV070() {
-    evd "SRV-070" "awk -F: '{print \$1,substr(\$2,1,4)}' /etc/shadow 2>/dev/null | head -20; grep -E '^ENCRYPT_METHOD' /etc/login.defs 2>/dev/null; grep -E '^CRYPT_(DEFAULT|ALGORITHMS)' /etc/security/policy.conf /etc/default/security 2>/dev/null; grep -E '^[[:space:]]*pwd_algorithm' /etc/security/login.cfg 2>/dev/null; ls -ld /tcb/files/auth 2>/dev/null"
-    local des="" alg weak
+    local des="" alg weak u
+    evd "SRV-070" "_hash_algs; grep -E '^[[:space:]]*(ENCRYPT_METHOD|MD5_CRYPT_ENAB)' /etc/login.defs 2>&1; grep -E '^CRYPT_(DEFAULT|ALGORITHMS)' /etc/security/policy.conf /etc/default/security 2>&1; grep -E '^[[:space:]]*pwd_algorithm' /etc/security/login.cfg 2>&1; ls -ld /tcb/files/auth 2>&1"
     case "$OS_FAMILY" in
     AIX)
         # 판단방법(AIX): login.cfg pwd_algorithm 이 112비트 이상 해시인지, /etc/security/passwd 해시 형식
+        u=$(_unreadable /etc/security/passwd) && { result "SRV-070|점검불가|/etc/security/passwd 읽기 권한 없음"; return; }
         alg=$(_aix_attr usw pwd_algorithm /etc/security/login.cfg)
-        des=$(awk '/^[^ \t*#][^ \t]*:[ \t]*$/{sub(/:.*/,"");u=$0;next} /^[ \t]+password[ \t]*=/{v=$0;sub(/^[^=]*=[ \t]*/,"",v);sub(/[ \t]+$/,"",v); if(v!="" && v!="*" && v!~/^\{/) print u}' /etc/security/passwd 2>/dev/null | head -5 | tr '\n' ' ')
+        des=$(awk '/^[^ \t*#][^ \t]*:[ \t]*$/{sub(/:.*/,"");u=$0;next} /^[ \t]+password[ \t]*=/{v=$0;sub(/^[^=]*=[ \t]*/,"",v);sub(/[ \t]+$/,"",v); if(v!="" && v!="*" && v!~/^\{/) print u}' /etc/security/passwd 2>/dev/null | _sum 5)
         if [ -n "$des" ]; then result "SRV-070|취약|AIX crypt(DES) 해시 계정: ${des}(pwd_algorithm=${alg:-미설정=crypt})"
-        elif [ -z "$alg" ] || [ "$alg" = "crypt" ]; then result "SRV-070|취약|AIX pwd_algorithm 미설정(crypt, 112비트 미만)"
-        else result "SRV-070|양호|AIX pwd_algorithm=${alg}"; fi ;;
+        else
+            case "$alg" in
+            ""|crypt|smd5|ssha1) result "SRV-070|취약|AIX pwd_algorithm=${alg:-미설정(crypt)} - 112비트 이상 안전한 해시(ssha256·ssha512) 아님" ;;
+            *) result "SRV-070|양호|AIX pwd_algorithm=${alg}" ;;
+            esac
+        fi ;;
     HPUX)
         if [ -d /tcb/files/auth ] || [ -f /etc/shadow ]; then
             alg=$(grep -E '^[[:space:]]*CRYPT_DEFAULT' /etc/default/security 2>/dev/null | cut -d= -f2 | tr -d ' ')
@@ -1037,11 +1267,12 @@ check_SRV070() {
             result "SRV-070|취약|/etc/shadow 없음 (평문 패스워드 저장 가능)"
             return
         fi
-        # DES(crypt 13자), MD5($1$) 는 취약 / SHA256($5$)·SHA512($6$)·bcrypt($2*)·yescrypt($y$) 양호
-        des=$(awk -F: '$2!="" && $2!~/^(\$|\*|!|NP$|x$|LK)/ && length($2)==13 {print $1}' /etc/shadow 2>/dev/null | head -5 | tr '\n' ' ')
-        weak=$(awk -F: '$2 ~ /^\$1\$/ {print $1}' /etc/shadow 2>/dev/null | head -5)
-        if [ -n "$des" ]; then result "SRV-070|취약|DES(crypt) 해시 계정: ${des}$( [ "$OS_FAMILY" = SOLARIS ] && echo "(CRYPT_DEFAULT=$(sed -n 's/^CRYPT_DEFAULT=//p' /etc/security/policy.conf 2>/dev/null))")"
-        elif [ -n "$weak" ]; then result "SRV-070|취약|MD5 해시 계정 존재: $(echo "$weak" | _csv)"
+        u=$(_unreadable /etc/shadow) && { result "SRV-070|점검불가|/etc/shadow 읽기 권한 없음 - 해시 방식 확인 불가 (root 로 재점검 필요)"; return; }
+        # DES(crypt 13자), MD5($1$, Solaris $md5$) 는 취약 / SHA256($5$)·SHA512($6$)·bcrypt($2*)·yescrypt($y$) 양호
+        des=$(awk -F: '$2!="" && $2!~/^(\$|\*|!|NP$|x$|LK)/ && length($2)==13 {print $1}' /etc/shadow 2>/dev/null)
+        weak=$(awk -F: '$2 ~ /^\$(1|md5|sunmd5)\$/ {print $1}' /etc/shadow 2>/dev/null)
+        if [ -n "$des" ]; then result "SRV-070|취약|DES(crypt) 해시 계정 $(echo "$des" | grep -c .)건: $(echo "$des" | _sum 5)$( [ "$OS_FAMILY" = SOLARIS ] && echo " (CRYPT_DEFAULT=$(sed -n 's/^CRYPT_DEFAULT=//p' /etc/security/policy.conf 2>/dev/null))")"
+        elif [ -n "$weak" ]; then result "SRV-070|취약|MD5 해시 계정 $(echo "$weak" | grep -c .)건: $(echo "$weak" | _sum 5)"
         else result "SRV-070|양호|shadow 사용, SHA256/SHA512 등 안전한 해시 (DES·MD5 없음)"; fi ;;
     esac
 }
@@ -1051,17 +1282,21 @@ check_SRV070() {
 # ================================================================
 check_SRV073() {
     # 평가기준: 관리자 그룹에 '불필요한' 계정 존재 여부 (인원 수 기준 없음) → 구성원 목록 증적 + 인터뷰
-    evd "SRV-073" "grep -E '^(root|wheel|sudo|admin|system):' /etc/group 2>/dev/null"
-    local grps="root wheel sudo admin"
+    local grps="root wheel sudo admin" grp gid members prim info=""
     [ "$OS_FAMILY" = "BSD" ] && grps="wheel operator"
     [ "$OS_FAMILY" = "AIX" ] && grps="system security"
-    local info="" members
+    evd "SRV-073" "grep -E '^($(echo $grps | tr ' ' '|')):' /etc/group 2>&1; echo '# 기본 그룹이 관리자 그룹인 계정(GID 일치)'; awk -F: '\$3==0 || \$1==\"root\" {print \$1\":\"\$4}' /etc/passwd 2>&1"
     for grp in $grps; do
         members=$(grep "^${grp}:" /etc/group 2>/dev/null | cut -d: -f4)
+        gid=$(grep "^${grp}:" /etc/group 2>/dev/null | cut -d: -f3)
+        prim=""; [ -n "$gid" ] && prim=$(awk -F: -v g="$gid" '$4==g && $1!="root" {print $1}' /etc/passwd 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+        members="${members}${prim:+${members:+,}${prim}(기본그룹)}"
         [ -n "$members" ] && info="${info} ${grp}:[${members}]"
     done
+    local zero; zero=$(awk -F: '$3==0 && $1!="root" {print $1}' /etc/passwd 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+    [ -n "$zero" ] && info="${info} UID0:[${zero}]"
     if [ -z "$info" ]; then
-        result "SRV-073|양호|관리자 그룹에 추가 구성원 없음"
+        result "SRV-073|양호|관리자 그룹(${grps})에 추가 구성원 없음"
     else
         result "SRV-073|수동확인|관리자 그룹 구성원:${info} - 불필요 계정 여부 확인"
     fi
@@ -1072,10 +1307,11 @@ check_SRV073() {
 # ================================================================
 check_SRV074() {
     # 평가기준: 로그인 가능한 계정별 분기(90일) 내 로그인 기록 + 비밀번호 변경 여부 (업무상 사용 여부 확인 필요)
-    evd "SRV-074" "awk -F: '\$7 !~ /(nologin|false|sync|shutdown|halt)\$/ {print \$1,\$3,\$7}' /etc/passwd 2>/dev/null; lastlog 2>/dev/null | head -30"
+    evd "SRV-074" "awk -F: '\$7 !~ /(nologin|false|sync|shutdown|halt)\$/ {print \$1,\$3,\$7}' /etc/passwd 2>&1; echo '# 비밀번호 상태(shadow 3번째 필드=마지막 변경일, 해시 제외)'; awk -F: '{print \$1\": \"(\$2 ~ /^[!*]/ ? \"잠김\" : \"사용\")\", 변경일(1970-01-01 기준 일수)=\"\$3}' /etc/shadow 2>&1; echo '# lastlog'; lastlog 2>&1; lastlog2 2>&1"
+    local u; u=$(_unreadable /etc/shadow) && { result "SRV-074|점검불가|/etc/shadow 읽기 권한 없음 - 비밀번호 변경일·잠금 상태 확인 불가 (root 로 재점검 필요)"; return; }
     local today; today=$(( $(date +%s) / 86400 ))
-    local vuln="" manual="" user sh pw lchg ll lsec now; now=$(date +%s)
-    [ "$OS_FAMILY" = "AIX" ] && evd "SRV-074" "lsuser -a time_last_login lastupdate account_locked ALL 2>/dev/null"
+    local vuln="" manual="" unk="" user sh pw lchg ll lsec now; now=$(date +%s)
+    [ "$OS_FAMILY" = "AIX" ] && evd "SRV-074" "lsuser -a time_last_login lastupdate account_locked ALL 2>&1"
     while IFS=: read -r user _ _ _ _ _ sh; do
         case "$sh" in *nologin|*false|*/sync|*/shutdown|*/halt|"") continue ;; esac
         pw=$(awk -F: -v u="$user" '$1==u{print $2}' /etc/shadow 2>/dev/null)
@@ -1096,18 +1332,20 @@ check_SRV074() {
         *)
             ll=$(lastlog -u "$user" 2>/dev/null | awk 'NR==2')
             [ -z "$ll" ] && command -v lastlog2 >/dev/null 2>&1 && ll=$(lastlog2 -u "$user" 2>/dev/null | awk 'NR==2')
-            if [ -z "$ll" ] && ! command -v lastlog >/dev/null 2>&1 && ! command -v lastlog2 >/dev/null 2>&1; then manual="${manual} ${user}"
+            if [ -z "$ll" ] && ! command -v lastlog >/dev/null 2>&1 && ! command -v lastlog2 >/dev/null 2>&1; then unk="${unk} ${user}(lastlog 명령 없음)"
             elif [ -z "$ll" ] || echo "$ll" | grep -q "Never logged in"; then why="로그인 기록 없음"
             else
                 lsec=$(date -d "$(echo "$ll" | awk '{for(i=NF-5;i<=NF;i++) printf $i" "}')" +%s 2>/dev/null)
-                [ -n "$lsec" ] && [ $(( today - lsec/86400 )) -gt 90 ] && why="최근 로그인 $(( today - lsec/86400 ))일 전"
+                if [ -z "$lsec" ]; then unk="${unk} ${user}(로그인 일시 해석 실패)"
+                elif [ $(( today - lsec/86400 )) -gt 90 ]; then why="최근 로그인 $(( today - lsec/86400 ))일 전"; fi
             fi ;;
         esac
         if [ -n "$lchg" ] && [ "$lchg" -gt 0 ] 2>/dev/null && [ $(( today - lchg )) -gt 90 ]; then why="${why:+$why, }비밀번호 변경 $(( today - lchg ))일 전"; fi
         [ -n "$why" ] && vuln="${vuln} ${user}(${why})"
     done < /etc/passwd
-    [ -n "$manual" ] && evd "SRV-074" "for u in $(echo $manual); do last -1 \$u 2>/dev/null | head -1; done"
-    if [ -n "$vuln" ]; then result "SRV-074|취약|분기 내 로그인/비밀번호 변경 없는 로그인 가능 계정:${vuln} - 업무상 사용 여부 확인"
+    [ -n "$manual" ] && evd "SRV-074" "for u in $(echo $manual); do last -1 \$u 2>&1; done"
+    if [ -n "$vuln" ]; then result "SRV-074|취약|분기 내 로그인/비밀번호 변경 없는 로그인 가능 계정:${vuln}${unk:+ (조회 불가:${unk})} - 업무상 사용 여부 확인"
+    elif [ -n "$unk" ]; then result "SRV-074|점검불가|로그인 기록 조회/해석 불가 계정:${unk}"
     elif [ -n "$manual" ]; then result "SRV-074|수동확인|로그인 기록 자동 조회 불가 계정:${manual} - last 증적으로 90일 내 로그인 확인"
     else result "SRV-074|양호|로그인 가능 계정 모두 분기 내 로그인 및 비밀번호 변경"; fi
 }
@@ -1117,9 +1355,10 @@ check_SRV074() {
 # ================================================================
 check_SRV075() {
     # 평가기준: 모든 계정이 복잡도(2종 10자 / 3종 8자) 만족 — 판단방법: 빈 비밀번호 계정 확인 + 크랙
-    evd "SRV-075" "grep -v '^#' /etc/security/pwquality.conf 2>/dev/null | grep -v '^$'"
-    evd "SRV-075" "grep -i 'pam_pwquality\\|pam_cracklib' /etc/pam.d/system-auth /etc/pam.d/password-auth /etc/pam.d/common-password 2>/dev/null"
-    local empty pol ml cls who
+    evd "SRV-075" "_show_cfg /etc/security/pwquality.conf $(ls /etc/security/pwquality.conf.d/*.conf 2>/dev/null | tr '\n' ' ') $(get_pam_files)"
+    evd "SRV-075" "_pw_status"
+    local empty pol ml cls who u
+    u=$(_unreadable /etc/shadow) && { result "SRV-075|점검불가|/etc/shadow 읽기 권한 없음 - 빈 비밀번호 계정 확인 불가 (root 로 재점검 필요)"; return; }
     empty=$(awk -F: '($2==""){print $1}' /etc/shadow 2>/dev/null | tr '\n' ' ')
     [ -n "$empty" ] && { result "SRV-075|취약|비밀번호 미설정 계정: ${empty}"; return; }
     pol=$(_pw_policy); ml=${pol%% *}; cls=$(echo "$pol" | awk '{print $2}'); who=$(echo "$pol" | awk '{print $3}')
@@ -1145,8 +1384,11 @@ _srv075_judge() {
 # ================================================================
 check_SRV081() {
     # 평가기준: crontab 명령 750 이하 / crontab 파일 others 읽기·쓰기 없음 / at·cron allow·deny 소유자 root·640 이하
-    evd "SRV-081" "ls -alL /usr/bin/crontab /etc/cron.allow /etc/cron.deny /etc/at.allow /etc/at.deny 2>/dev/null; ls -alL /var/spool/cron/crontabs/ /var/spool/cron/ 2>/dev/null"
-    local vuln="" p o f
+    local cfl="/etc/cron.allow /etc/cron.deny /etc/at.allow /etc/at.deny /var/adm/cron/cron.allow /var/adm/cron/cron.deny /var/adm/cron/at.allow /var/adm/cron/at.deny /etc/cron.d/cron.allow /etc/cron.d/cron.deny /etc/cron.d/at.allow /etc/cron.d/at.deny"
+    local sd="" d cex="" vuln="" p o f na=""
+    for d in /var/spool/cron/crontabs /var/spool/cron; do [ -d "$d" ] && { sd="$d"; break; }; done
+    for f in $cfl; do [ -e "$f" ] && cex="${cex} ${f}"; done
+    evd "SRV-081" "ls -alL /usr/bin/crontab /bin/crontab 2>&1; echo '# 접근제어 파일 후보 12개 중 존재 $(echo $cex | wc -w)개'; ${cex:+ls -alL $cex 2>&1}; echo '# crontab 파일 디렉터리: ${sd:-없음}'; ls -alL ${sd:-/var/spool/cron} 2>&1"
     for f in /usr/bin/crontab /bin/crontab; do
         [ -f "$f" ] || continue
         p=$(get_perm "$f"); p=${p: -3}
@@ -1154,22 +1396,24 @@ check_SRV081() {
         { [ "${p:2:1}" != "0" ] || [ $(( ${p:1:1} & 2 )) -ne 0 ]; } 2>/dev/null && vuln="${vuln} ${f}(${p})"
         break
     done
-    for d in /var/spool/cron/crontabs /var/spool/cron; do
-        [ -d "$d" ] || continue
-        for f in "$d"/*; do
-            [ -f "$f" ] || continue
-            p=$(get_perm "$f"); p=${p: -1}
-            [ $(( p & 6 )) -ne 0 ] 2>/dev/null && vuln="${vuln} ${f}(others:${p})"
-        done
-        break
-    done
-    for f in /etc/cron.allow /etc/cron.deny /etc/at.allow /etc/at.deny /var/adm/cron/cron.allow /var/adm/cron/cron.deny /var/adm/cron/at.allow /var/adm/cron/at.deny /etc/cron.d/cron.allow /etc/cron.d/cron.deny /etc/cron.d/at.allow /etc/cron.d/at.deny; do
+    if [ -n "$sd" ]; then
+        if [ ! -r "$sd" ] || [ ! -x "$sd" ]; then na="${sd} 열람 권한 없음"
+        else
+            for f in "$sd"/*; do
+                [ -f "$f" ] || continue
+                p=$(get_perm "$f"); p=${p: -1}
+                [ $(( p & 6 )) -ne 0 ] 2>/dev/null && vuln="${vuln} ${f}(others:${p})"
+            done
+        fi
+    fi
+    for f in $cfl; do
         [ -f "$f" ] || continue
         o=$(get_owner "$f"); p=$(get_perm "$f"); p=${p: -3}
         if [ "$o" != "root" ] || [ "${p:0:1}" -gt 6 ] || [ "${p:1:1}" -gt 4 ] || [ "${p:2:1}" != "0" ]; then vuln="${vuln} ${f}(${o}:${p})"; fi 2>/dev/null
     done
-    [ -n "$vuln" ] && result "SRV-081|취약|cron 관련 파일 권한 과다:${vuln}" \
-                   || result "SRV-081|양호|crontab 명령·crontab 파일·at/cron 접근제어 파일 권한 기준 충족"
+    if [ -n "$vuln" ]; then result "SRV-081|취약|cron 관련 파일 권한 과다:${vuln}"
+    elif [ -n "$na" ]; then result "SRV-081|점검불가|${na} - crontab 파일 권한 확인 불가 (root 로 재점검 필요)"
+    else result "SRV-081|양호|crontab 명령·crontab 파일·at/cron 접근제어 파일 권한 기준 충족"; fi
 }
 
 # ================================================================
@@ -1177,7 +1421,7 @@ check_SRV081() {
 # ================================================================
 check_SRV084() {
     # 평가기준: passwd 644 / shadow 600 / hosts 644 / (x)inetd.conf 600 / syslog.conf 644 / services 644 / hosts.lpd 640, 소유자 root (AIX /etc/security/passwd 600)
-    evd "SRV-084" "ls -la /etc/passwd /etc/shadow /etc/group /etc/hosts /etc/services /etc/rsyslog.conf /etc/syslog.conf /etc/inetd.conf /etc/xinetd.conf /etc/hosts.lpd /etc/security/passwd 2>/dev/null"
+    evd "SRV-084" "ls -la /etc/passwd /etc/shadow /etc/hosts /etc/services /etc/rsyslog.conf /etc/syslog.conf /etc/inetd.conf /etc/xinetd.conf /etc/hosts.lpd /etc/security/passwd 2>&1"
     local vuln="" f max
     for f in /etc/passwd:644 /etc/shadow:600 /etc/hosts:644 /etc/services:644 /etc/rsyslog.conf:644 /etc/syslog.conf:644 \
              /etc/inetd.conf:600 /etc/xinetd.conf:600 /etc/hosts.lpd:640 /etc/security/passwd:600; do
@@ -1188,11 +1432,12 @@ check_SRV084() {
     done
     if [ "$OS_FAMILY" = "HPUX" ] && [ -d /tcb/files/auth ]; then   # 평가기준(HP-UX): /tcb/files/auth/[a-z]/* 664, 소유자 root
         local tn=0
+        evd "SRV-084" "ls -la /tcb/files/auth/[a-z]/* 2>&1"
         for f in /tcb/files/auth/[a-z]/*; do
             [ -f "$f" ] || continue
             { [ "$(get_owner "$f")" != "root" ] || _perm_over "$(get_perm "$f")" 664; } && { tn=$((tn+1)); [ $tn -le 5 ] && vuln="${vuln} ${f}($(get_owner "$f"):$(get_perm "$f"))"; }
         done
-        [ $tn -gt 5 ] && vuln="${vuln} …/tcb 외 $((tn-5))건"
+        [ $tn -gt 5 ] && vuln="${vuln} …/tcb 외 $((tn-5))건(증적 참조)"
     fi
     [ -n "$vuln" ] && result "SRV-084|취약|주요 파일 권한 기준 초과:${vuln}" || result "SRV-084|양호|주요 파일 소유자 root·권한 기준 이하"
 }
@@ -1202,19 +1447,33 @@ check_SRV084() {
 # ================================================================
 check_SRV091() {
     # 평가기준: 불필요하게 SUID·SGID 설정된 파일
-    evd "SRV-091" "_to 30 find / \$_FP \( -perm -4000 -o -perm -2000 \) -type f -print 2>/dev/null | head -40"
-    local dangerous="nmap perl python python3 php ruby bash sh find wget curl nc netcat awk vim gdb strace less more cp mv tar zip" bin bp found="" f nopkg=""
+    local dangerous="nmap perl python python3 php ruby bash sh find wget curl nc netcat awk vim gdb strace less more cp mv tar zip" bin bp found="" f nopkg="" _rc _all _n pkgtool=0
+    _all=$(_to 30 find / $_FP \( -perm -4000 -o -perm -2000 \) -type f -print 2>/dev/null); _rc=$?
+    _all=$(printf '%s\n' "$_all" | grep -vE '^/(proc|sys|var/lib/(docker|containers))')
+    _n=$(printf '%s' "$_all" | grep -c .)
     for bin in $dangerous; do
         bp=$(command -v "$bin" 2>/dev/null); [ -z "$bp" ] && continue
         { [ -u "$bp" ] || [ -g "$bp" ]; } && found="${found} ${bp}"
     done
+    { command -v rpm >/dev/null 2>&1 || command -v dpkg >/dev/null 2>&1; } && pkgtool=1
+    if [ "$pkgtool" = 1 ]; then
+        while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            # usrmerge 배포판은 패키지 DB 에 /bin·/sbin 경로로 등록되어 있어 두 경로 모두 조회
+            { rpm -qf "$f" >/dev/null 2>&1 || dpkg -S "$f" >/dev/null 2>&1 || dpkg -S "${f#/usr}" >/dev/null 2>&1 || dpkg -S "$(readlink -f "$f")" >/dev/null 2>&1; } || nopkg="${nopkg}${f}
+"
+        done <<EOF
+$_all
+EOF
+    fi
+    _SUID_ALL="$_all"; _SUID_NOPKG="$nopkg"
+    evd "SRV-091" "echo '# find 종료코드=${_rc} (124=30초 시간 초과), SUID/SGID 파일 ${_n}개, 패키지 소유 검증 도구=$([ $pkgtool = 1 ] && echo rpm/dpkg || echo 없음)'; printf '%s\\n' \"\$_SUID_ALL\""
+    evd "SRV-091" "echo '# 위험 명령 SUID/SGID: ${found:-없음}'; echo '# 패키지에 속하지 않은 SUID/SGID 파일'; printf '%s' \"\$_SUID_NOPKG\""
     if [ -n "$found" ]; then result "SRV-091|취약|위험 SUID/SGID 파일:${found}"; return; fi
-    while IFS= read -r f; do
-        # usrmerge 배포판은 패키지 DB 에 /bin·/sbin 경로로 등록되어 있어 두 경로 모두 조회
-        { rpm -qf "$f" >/dev/null 2>&1 || dpkg -S "$f" >/dev/null 2>&1 || dpkg -S "${f#/usr}" >/dev/null 2>&1 || dpkg -S "$(readlink -f "$f")" >/dev/null 2>&1; } || nopkg="${nopkg} ${f}"
-    done < <(_to 30 find / $_FP \( -perm -4000 -o -perm -2000 \) -type f -print 2>/dev/null | grep -vE '^/(proc|sys|var/lib/(docker|containers))' | head -200)
-    { command -v rpm >/dev/null 2>&1 || command -v dpkg >/dev/null 2>&1; } || nopkg=""
-    [ -n "$nopkg" ] && result "SRV-091|수동확인|패키지 외 SUID/SGID 파일:$(echo $nopkg | cut -c1-200) - 필요 여부 확인" || result "SRV-091|양호|위험 SUID/SGID 없음, 패키지 기본 파일만 존재"
+    if [ "$_rc" = "124" ]; then result "SRV-091|점검불가|SUID/SGID 파일 검색 시간 초과(30초, 발견 ${_n}개까지만 확인) - 전체 확인 불가"; return; fi
+    if [ "$pkgtool" = 0 ]; then result "SRV-091|수동확인|SUID/SGID 파일 ${_n}개 - 패키지 검증 도구(rpm/dpkg) 없어 필요 여부 자동 판단 불가, 증적 목록 확인"; return; fi
+    nopkg=$(printf '%s' "$nopkg" | grep -v '^$')
+    [ -n "$nopkg" ] && result "SRV-091|수동확인|패키지 외 SUID/SGID 파일 $(echo "$nopkg" | grep -c .)건: $(echo "$nopkg" | _sum 5) - 필요 여부 확인" || result "SRV-091|양호|위험 SUID/SGID 없음, 패키지 기본 파일만 존재 (${_n}개)"
 }
 
 # ================================================================
@@ -1222,18 +1481,18 @@ check_SRV091() {
 # ================================================================
 check_SRV092() {
     # 평가기준: 홈 디렉터리 소유자 불일치·계정간 중복 홈·others 쓰기
-    evd "SRV-092" "awk -F: '\$3>=1000 || \$3>=500{print \$1,\$3,\$6}' /etc/passwd 2>/dev/null | head -30"
-    local vuln="" min_uid dup user uid homedir
+    local vuln="" min_uid dup user uid homedir p
     min_uid=$(awk '/^UID_MIN/{print $2}' /etc/login.defs 2>/dev/null)
     [ -z "$min_uid" ] && case "$OS_FAMILY" in AIX) min_uid=200 ;; SOLARIS|HPUX) min_uid=100 ;; *) min_uid=500 ;; esac   # UNIX 일반 사용자 UID 대역
-    dup=$(awk -F: -v m="$min_uid" '$3>=m && $6!="" && $6!="/"{print $6}' /etc/passwd 2>/dev/null | sort | uniq -d | tr '\n' ' ')
+    evd "SRV-092" "echo '# 기준 UID ${min_uid} 이상 일반 계정: 계정 UID 홈 (홈 소유자·권한)'; awk -F: -v m=${min_uid} '\$3>=m && \$3<60000 {print \$1,\$3,\$6}' /etc/passwd | while read -r u i h; do echo \"\$u \$i \$h (\$(get_owner \"\$h\") \$(get_perm \"\$h\"))\"; done"
+    dup=$(awk -F: -v m="$min_uid" '$3>=m && $3<60000 && $6!="" && $6!="/" && $7!~/(nologin|false|sync|shutdown|halt)$/ {print $6}' /etc/passwd 2>/dev/null | sort | uniq -d | tr '\n' ' ')
     [ -n "$dup" ] && vuln="${vuln} 중복 홈:${dup}"
     while IFS=: read -r user _ uid _ _ homedir _; do
         [ "${uid:-0}" -lt "$min_uid" ] 2>/dev/null && continue
         { [ "${uid:-0}" -ge 60000 ] || [ "${uid:-0}" -lt 0 ]; } 2>/dev/null && continue   # nobody·noaccess 등
         [ -z "$homedir" ] || [ "$homedir" = "/" ] || [ ! -d "$homedir" ] && continue
         [ "$(get_owner "$homedir")" != "$user" ] && vuln="${vuln} ${homedir}(소유자:$(get_owner "$homedir"))"
-        local p; p=$(get_perm "$homedir"); [ $(( ${p: -1} & 2 )) -ne 0 ] && vuln="${vuln} ${homedir}(others 쓰기:${p})"
+        p=$(get_perm "$homedir"); [ -n "$p" ] && [ $(( ${p: -1} & 2 )) -ne 0 ] && vuln="${vuln} ${homedir}(others 쓰기:${p})"
     done < /etc/passwd
     [ -n "$vuln" ] && result "SRV-092|취약|홈 디렉터리 이상:${vuln}" || result "SRV-092|양호|홈 디렉터리 소유자 일치·중복 없음·others 쓰기 없음"
 }
@@ -1242,15 +1501,16 @@ check_SRV092() {
 # SRV-093: world writable 파일
 # ================================================================
 check_SRV093() {
-    evd "SRV-093" "_to 60 find / \$_FP -perm -0002 -type f ! -path '/proc/*' ! -path '/sys/*' ! -path '/dev/*' ! -path '/tmp/*' ! -path '/var/tmp/*' -print 2>/dev/null | head -20"
-    local _ww _rc
+    local _ww _rc cnt
     _ww=$(_to 60 find / $_FP -perm -0002 -type f ! -path "/proc/*" ! -path "/sys/*" \
           ! -path "/dev/*" ! -path "/tmp/*" ! -path "/var/tmp/*" -print 2>/dev/null); _rc=$?
     cnt=$(printf '%s' "$_ww" | grep -c .)
+    _WW_LIST="$_ww"
+    evd "SRV-093" "echo '# find / -perm -0002 -type f (tmp 제외) 종료코드=${_rc} (124=60초 시간 초과), 발견 ${cnt}개'; printf '%s\\n' \"\$_WW_LIST\""
     # timeout(124) 이고 0건이면 검색 미완료 — 양호로 단정하지 않음
-    if [ "$_rc" = "124" ] && [ "${cnt:-0}" -eq 0 ]; then result "SRV-093|수동확인|파일 검색 시간 초과(60초) - world writable 파일 수동 확인"; return; fi
+    if [ "$_rc" = "124" ] && [ "${cnt:-0}" -eq 0 ]; then result "SRV-093|점검불가|파일 검색 시간 초과(60초) - world writable 파일 확인 불가"; return; fi
     [ "${cnt:-0}" -gt 0 ] 2>/dev/null && \
-        result "SRV-093|취약|world writable 파일 ${cnt}개 (tmp 제외)" || \
+        result "SRV-093|취약|world writable 파일 ${cnt}개 (tmp 제외)$([ "$_rc" = 124 ] && echo ', 검색 시간 초과로 일부만 확인'): $(echo "$_ww" | _sum 5)" || \
         result "SRV-093|양호|world writable 파일 없음"
 }
 
@@ -1258,42 +1518,60 @@ check_SRV093() {
 # SRV-108: 로그 접근통제 및 관리
 # ================================================================
 check_SRV108() {
-    evd "SRV-108" "ls -la /var/log/messages /var/log/secure /var/log/auth.log /var/log/syslog /var/log/wtmp /var/log/lastlog 2>/dev/null"
     # 기준: 로그 파일을 소유자 이외 사용자가 수정 가능(그룹/others 쓰기)하면 취약 — 예외: wtmp·lastlog 664, btmp 660 (권한 변경 불가)
-    vuln=""
-    for logf in $(find /var/log /var/adm $( [ "$OS_FAMILY" = "AIX" ] && echo /etc/security ) -type f \( -perm -020 -o -perm -002 \) 2>/dev/null | head -200); do
+    local dirs="" d out err files logf perm vuln="" cnt
+    for d in /var/log /var/adm; do [ -d "$d" ] && dirs="${dirs} ${d}"; done
+    [ "$OS_FAMILY" = "AIX" ] && dirs="$dirs /etc/security"
+    [ -z "$dirs" ] && { evd "SRV-108" "ls -ld /var/log /var/adm 2>&1"; result "SRV-108|점검불가|로그 디렉터리(/var/log·/var/adm)가 없음"; return; }
+    out=$(find $dirs -type f \( -perm -020 -o -perm -002 \) 2>&1)
+    err=$(echo "$out" | grep '^find:')
+    files=$(echo "$out" | grep -v '^find:' | grep -v '^$')
+    cnt=$(echo "$files" | grep -c .)
+    _LOGW_LIST="$files"
+    evd "SRV-108" "ls -la /var/log/messages /var/log/secure /var/log/auth.log /var/log/syslog /var/log/wtmp /var/log/lastlog 2>&1; echo '# ${dirs} 에서 group/others 쓰기 가능한 파일 ${cnt}개 (예외 포함): 권한 소유자 경로'; _pstat \$(printf '%s\\n' \"\$_LOGW_LIST\")"
+    for logf in $files; do
         perm=$(get_perm "$logf")
         case "$(basename "$logf")" in
         wtmp*|lastlog*|btmp*) [ "$(( 0${perm: -1} & 2 ))" -eq 0 ] 2>/dev/null && continue ;;
         esac
         vuln="${vuln} ${logf}(${perm})"
     done
-    [ -n "$vuln" ] && result "SRV-108|취약|소유자 외 쓰기 가능한 로그 파일:${vuln}" || \
-        result "SRV-108|양호|로그 파일 소유자 외 쓰기 권한 없음 (wtmp·lastlog 664, btmp 660 기준 예외)"
+    if [ -n "$vuln" ]; then result "SRV-108|취약|소유자 외 쓰기 가능한 로그 파일 $(echo $vuln | wc -w)건:$(echo $vuln | tr ' ' '\n' | _sum 5)"
+    elif [ -n "$err" ]; then result "SRV-108|점검불가|로그 디렉터리 일부를 탐색하지 못함 ($(echo "$err" | head -1)) - root 로 재점검 필요"
+    else result "SRV-108|양호|로그 파일 소유자 외 쓰기 권한 없음 (wtmp·lastlog 664, btmp 660 기준 예외)"; fi
 }
 
 # ================================================================
 # SRV-109: 주요 이벤트 로그 설정
 # ================================================================
 check_SRV109() {
-    evd "SRV-109" "grep -ihE '^auth|^authpriv|\*\.' /etc/rsyslog.conf /etc/rsyslog.d/*.conf /etc/syslog.conf 2>/dev/null | head -10; cat /etc/default/su 2>/dev/null | grep -E 'SULOG|SYSLOG'"
+    local rf="/etc/rsyslog.conf $(ls /etc/rsyslog.d/*.conf 2>/dev/null | tr '\n' ' ') /etc/syslog.conf /etc/syslog-ng/syslog-ng.conf"
+    evd "SRV-109" "_svc_state rsyslog syslog-ng syslogd systemd-journald; _show_cfg $rf /etc/default/su; ls -ld /var/log/journal 2>&1"
     case "$OS_FAMILY" in
     SOLARIS)
         # 평가기준(Solaris): auth.info 활성 + /etc/default/su SULOG=경로, SYSLOG=YES
         local a=0 s=0
-        grep -vE '^\s*#' /etc/syslog.conf 2>/dev/null | grep -qE 'auth\.(info|debug|\*)|\*\.(info|debug)' && a=1
+        _cfg /etc/syslog.conf | grep -qE 'auth\.(info|debug|\*)|\*\.(info|debug)' && a=1
         grep -qE '^SULOG=' /etc/default/su 2>/dev/null && grep -qE '^SYSLOG=YES' /etc/default/su 2>/dev/null && s=1
         [ $a -eq 1 ] && [ $s -eq 1 ] && result "SRV-109|수동확인|auth.info·SULOG·SYSLOG=YES 설정 - 내부 로그 정책 부합 여부 확인" || result "SRV-109|취약|Solaris auth.info(${a})·/etc/default/su SULOG·SYSLOG=YES(${s}) 미충족" ;;
     AIX|HPUX)
-        grep -vE '^\s*\*|^\s*#' /etc/syslog.conf 2>/dev/null | grep -qiE "^auth|\*\.(info|debug)" && \
+        [ -r /etc/syslog.conf ] || { result "SRV-109|점검불가|/etc/syslog.conf 없음 또는 읽기 불가"; return; }
+        _cfg /etc/syslog.conf | grep -qiE "^auth|\*\.(info|debug)" && \
             result "SRV-109|수동확인|syslog auth 설정 존재 - 내부 로그 기록 정책 부합 여부 확인" || result "SRV-109|취약|syslog auth 로그 미설정" ;;
     *)
-        local f
-        for f in /etc/rsyslog.conf /etc/rsyslog.d/*.conf /etc/syslog.conf; do
+        local f u
+        u=$(_unreadable $rf) && { result "SRV-109|점검불가|syslog 설정 파일 읽기 권한 없음: ${u}"; return; }
+        for f in $rf; do
             [ -f "$f" ] || continue
-            grep -qiE "^auth|^authpriv" "$f" 2>/dev/null && { result "SRV-109|양호|auth/authpriv 로그 설정됨 (${f}) - 내부 로그 정책 부합 여부는 참고 확인"; return; }
+            _cfg "$f" | grep -qiE "^[[:space:]]*(auth|authpriv)|^[[:space:]]*\*\.\*;auth" && { result "SRV-109|양호|auth/authpriv 로그 설정됨 (${f}) - 내부 로그 정책 부합 여부는 참고 확인"; return; }
+            _cfg "$f" | grep -qiE "auth" && [ "$f" = /etc/syslog-ng/syslog-ng.conf ] && { result "SRV-109|양호|syslog-ng auth 로그 설정됨"; return; }
         done
-        [ -f /etc/syslog-ng/syslog-ng.conf ] && grep -qi "auth\|authpriv" /etc/syslog-ng/syslog-ng.conf 2>/dev/null && { result "SRV-109|양호|syslog-ng auth 로그 설정됨"; return; }
+        # syslog 데몬이 없는 journald 전용 배포판(AL2023 등): 인증 로그가 journal 에 기록됨 — 영구 저장(/var/log/journal) 여부로 판단
+        if is_running systemd-journald && ! is_running rsyslog && ! is_running syslog-ng && ! is_running syslogd; then
+            if [ -d /var/log/journal ]; then result "SRV-109|양호|journald 전용(rsyslog 없음), /var/log/journal 영구 저장으로 인증 이벤트 로그 기록"
+            else result "SRV-109|수동확인|journald 전용(rsyslog 없음)이나 영구 저장(/var/log/journal) 없음 - 재부팅 시 로그 소실, Storage=persistent 설정 확인"; fi
+            return
+        fi
         result "SRV-109|취약|auth/authpriv 로그 설정 없음" ;;
     esac
 }
@@ -1302,39 +1580,56 @@ check_SRV109() {
 # SRV-118: 보안패치 적용
 # ================================================================
 check_SRV118() {
-    evd "SRV-118" "uname -r; oslevel -s 2>/dev/null; instfix -i 2>/dev/null | grep -E 'ML|SP' | tail -3; emgr -l 2>/dev/null | head; swlist -l bundle 2>/dev/null | grep -iE 'QPK|HPUX'; showrev -p 2>/dev/null | tail -5; pkg info entire 2>/dev/null | grep -iE 'version|branch'"
-    evd "SRV-118" "rpm -qa --last 2>/dev/null | head -10 || dpkg -l 2>/dev/null | tail -10"
+    # 평가기준: 보안 패치 적용 — 보안 업데이트(security advisory)만 집계. 저장소 캐시 갱신은 최소화(가능하면 캐시 기준), 저장소 접근 실패·미등록은 점검불가
+    case "$OS_FAMILY" in
+    AIX)     evd "SRV-118" "uname -r; oslevel -s 2>&1; instfix -i 2>&1 | grep -E 'ML|SP'; emgr -l 2>&1" ;;
+    HPUX)    evd "SRV-118" "uname -r; swlist -l bundle 2>&1 | grep -iE 'QPK|HPUX'" ;;
+    SOLARIS) evd "SRV-118" "uname -r; cat /etc/release 2>&1; showrev -p 2>&1 | grep -c Patch; pkg info entire 2>&1 | grep -iE 'version|branch'" ;;
+    *)       evd "SRV-118" "uname -r; cat /etc/os-release 2>&1" ;;
+    esac
     case "$OS_FAMILY" in
     LINUX)
-        # 저장소 조회 실패(폐쇄망·미등록)·미지원 패키지 관리자는 건수 0 으로 보지 않고 수동확인
-        _upd_cnt=""; _upd_out=""; _upd_rc=0
+        local _pm="" _cnt="" _rc="" _out="" _mode="" _lines=""
         if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
             _pm=$(command -v dnf >/dev/null 2>&1 && echo dnf || echo yum)
-            _upd_out=$(timeout 120 $_pm -q check-update 2>/dev/null); _upd_rc=$?
-            # check-update: 100=업데이트 있음, 0=없음, 그 외(1 등)=저장소 오류
-            case "$_upd_rc" in 100) _upd_cnt=$(echo "$_upd_out" | grep -cE "^[a-zA-Z0-9]") ;; 0) _upd_cnt=0 ;; esac
-        elif command -v apt-get >/dev/null 2>&1; then
-            # apt-get update 는 저장소 접근 실패(W: Failed to fetch)에도 0 을 반환 → 출력으로 실패 판별
-            _upd_out=$(timeout 120 apt-get update 2>&1); _upd_rc=$?
-            if [ "$_upd_rc" -eq 0 ] && ! echo "$_upd_out" | grep -qE "^Err:|Failed to fetch|Some index files failed|Temporary failure resolving"; then
-                _upd_cnt=$(apt-get -s upgrade 2>/dev/null | grep -c "^Inst ")
+            evd "SRV-118" "$_pm repolist 2>&1"
+            # check-update --security: 100=보안 업데이트 있음, 0=없음, 그 외(1 등)=저장소 오류. 먼저 캐시 기준(-C)으로 조회하고, 캐시가 없을 때만 메타데이터를 갱신
+            _mode="캐시 기준(-C)"
+            _out=$(_to 120 $_pm -q -C --security check-update 2>&1); _rc=$?
+            if [ "$_rc" != 0 ] && [ "$_rc" != 100 ]; then
+                _mode="메타데이터 갱신 포함"
+                _out=$(_to 120 $_pm -q --security check-update 2>&1); _rc=$?
             fi
+            _lines=$(echo "$_out" | grep -E '^[A-Za-z0-9_.+-]+\.[A-Za-z0-9_]+[[:space:]]+[0-9]' )
+            case "$_rc" in 100) _cnt=$(echo "$_lines" | grep -c .) ;; 0) _cnt=0 ;; esac
+            # 활성 저장소 없음(미등록)은 0건으로 보지 않음
+            [ "$_cnt" = 0 ] && [ "$($_pm repolist 2>/dev/null | awk 'NR>1' | grep -c .)" = 0 ] && _cnt=""
+        elif command -v apt-get >/dev/null 2>&1; then
+            _pm="apt"; _mode="로컬 패키지 목록 기준(apt-get update 미수행)"
+            local _lst; _lst=$(ls /var/lib/apt/lists 2>/dev/null | grep -c 'Packages\|Release')
+            evd "SRV-118" "apt-cache policy 2>&1 | grep -iE 'security|origin' ; ls -l /var/lib/apt/periodic/update-success-stamp 2>&1"
+            if [ "${_lst:-0}" -gt 0 ] && apt-cache policy 2>/dev/null | grep -qi 'security'; then
+                _out=$(apt-get -s upgrade 2>&1); _rc=$?
+                [ "$_rc" = 0 ] && { _lines=$(echo "$_out" | grep '^Inst ' | grep -i 'security'); _cnt=$(echo "$_lines" | grep -c .); }
+            else _rc="보안 저장소 미등록 또는 패키지 목록 없음"; fi
         elif command -v zypper >/dev/null 2>&1; then
-            _upd_out=$(timeout 120 zypper -q --non-interactive list-updates 2>/dev/null); _upd_rc=$?
-            [ "$_upd_rc" -eq 0 ] && _upd_cnt=$(echo "$_upd_out" | grep -c "^v ")
+            _pm="zypper"; _mode="캐시 기준(--no-refresh)"
+            _out=$(_to 120 zypper -q --non-interactive --no-refresh list-patches --category security 2>&1); _rc=$?
+            [ "$_rc" = 0 ] && { _lines=$(echo "$_out" | grep -E '^[^|]*\|[^|]*\|[[:space:]]*security'); _cnt=$(echo "$_lines" | grep -c .); }
         fi
-        evd "SRV-118" "echo 'package manager rc=${_upd_rc} upgradable=${_upd_cnt:-조회 실패}'"
-        if [ -z "$_upd_cnt" ]; then
-            result "SRV-118|수동확인|패키지 저장소 조회 실패(폐쇄망·저장소 미등록 등) 또는 미지원 패키지 관리자 - 보안패치 적용 현황·검토 절차 수동 확인"
-        elif [ "${_upd_cnt:-0}" -gt 0 ] 2>/dev/null; then
-            result "SRV-118|취약|미적용 보안패치 ${_upd_cnt}건 (수동 확인 병행 권고)"
-        elif [ "${_upd_cnt:-0}" -eq 0 ] 2>/dev/null; then
-            result "SRV-118|양호|패키지 매니저 기준 미적용 업데이트 없음"
+        _SEC_LINES="$_lines"; _SEC_OUT=""; [ -z "$_cnt" ] && _SEC_OUT="$_out"
+        evd "SRV-118" "echo '# 패키지 관리자=${_pm:-없음}, 조회 방식=${_mode:-없음}, 종료코드=${_rc:-없음}, 보안 업데이트=${_cnt:-조회 실패}건'; printf '%s\\n' \"\$_SEC_LINES\"; printf '%s\\n' \"\$_SEC_OUT\""
+        if [ -z "$_pm" ]; then
+            result "SRV-118|점검불가|지원하는 패키지 관리자(dnf·yum·apt·zypper)를 찾지 못함 - 보안패치 적용 현황 자동 확인 불가"
+        elif [ -z "$_cnt" ]; then
+            result "SRV-118|점검불가|${_pm} 보안 업데이트 조회 실패 (rc=${_rc}: 저장소 접근 실패·미등록·폐쇄망 등) - 보안패치 적용 현황 수동 확인 필요"
+        elif [ "$_cnt" -gt 0 ] 2>/dev/null; then
+            result "SRV-118|취약|미적용 보안 업데이트 ${_cnt}건 (${_pm}, ${_mode}): $(echo "$_lines" | awk '{print $1=="Inst"?$2:$1}' | _sum 5)"
         else
-            result "SRV-118|수동확인|보안패치 적용 현황 수동 확인 필요"
+            result "SRV-118|양호|미적용 보안 업데이트 없음 (${_pm}, ${_mode})"
         fi ;;
     *)
-        result "SRV-118|수동확인|보안패치 적용 현황 수동 확인 필요" ;;
+        result "SRV-118|수동확인|보안패치 적용 현황 수동 확인 필요 (${OS_FAMILY} 는 증적의 패치 레벨 확인)" ;;
     esac
 }
 
@@ -1343,16 +1638,20 @@ check_SRV118() {
 # ================================================================
 check_SRV121() {
     # 평가기준: PATH 에 '.', '::'(빈 항목) 또는 불필요한 임의 경로
-    evd "SRV-121" "echo \$PATH; grep -rhE '^\s*(export\s+)?PATH=' /root/.bashrc /root/.bash_profile /root/.profile /etc/profile /etc/environment /etc/bashrc /etc/profile.d/*.sh 2>/dev/null"
+    local files="/root/.bashrc /root/.bash_profile /root/.profile /etc/profile /etc/environment /etc/bashrc /etc/bash.bashrc $(ls /etc/profile.d/*.sh 2>/dev/null | tr '\n' ' ')"
+    [ "$(awk -F: '$1=="root"{print $6}' /etc/passwd 2>/dev/null)" = "/" ] && files="$files /.profile /.bash_profile /.bashrc /.kshrc"   # UNIX root 홈 '/'
+    local ex="" f
+    for f in $files; do [ -f "$f" ] && ex="${ex} ${f}"; done
+    evd "SRV-121" "echo \"현재 실행 셸 PATH=\$PATH\"; _ls_exist $files; echo '# PATH 대입 줄'; grep -nHE '^[[:space:]]*(export[[:space:]]+)?PATH=' ${ex:-/dev/null} 2>&1"
     local bad="" v e
     while IFS= read -r v; do
-        v=$(echo "$v" | sed -E 's/^\s*(export\s+)?PATH=//; s/["'"'"']//g')
+        v=$(echo "$v" | sed -E 's/^[[:space:]]*(export[[:space:]]+)?PATH=//; s/["'"'"']//g')
         [ -z "$v" ] && continue
         case ":$v:" in *"::"*) bad="${bad} [빈 항목] ${v}"; continue ;; esac
         local IFS=':'; for e in $v; do
             case "$e" in .|./*) bad="${bad} [.] ${v}"; break ;; esac
         done; unset IFS
-    done < <( { grep -rhE '^\s*(export\s+)?PATH=' /root/.bashrc /root/.bash_profile /root/.profile /etc/profile /etc/environment /etc/bashrc /etc/profile.d/*.sh 2>/dev/null; echo "PATH=$PATH"; } )
+    done < <( { grep -hE '^[[:space:]]*(export[[:space:]]+)?PATH=' $files 2>/dev/null; echo "PATH=$PATH"; } )
     [ -n "$bad" ] && result "SRV-121|취약|PATH 에 현재 디렉터리(.) 또는 빈 항목:$(echo "$bad" | cut -c1-200)" || result "SRV-121|양호|PATH 에 '.'·'::' 미포함"
 }
 
@@ -1361,63 +1660,72 @@ check_SRV121() {
 # ================================================================
 check_SRV122() {
     # 평가기준: 모든 계정·설정 파일 umask 가 022 이상(group·others 쓰기 금지)
-    evd "SRV-122" "umask; grep -rhE '^\s*umask|^UMASK' /etc/profile /etc/bashrc /etc/login.defs /etc/profile.d/*.sh /root/.bashrc /root/.profile 2>/dev/null"
-    local vals v bad=""
-    local _homes; _homes=$(awk -F: '$7!~/(nologin|false)$/ && $6!="" && $6!="/"{print $6}' /etc/passwd 2>/dev/null | sort -u)
-    vals=$( { grep -rhE '^\s*umask\s+[0-7]+|^\s*UMASK\s+[0-7]+' /etc/profile /etc/bashrc /etc/bash.bashrc /etc/login.defs /etc/profile.d/*.sh $(for h in $_homes; do echo "$h/.profile $h/.bashrc $h/.bash_profile $h/.kshrc $h/.cshrc"; done) 2>/dev/null | grep -oE '[0-7]{2,4}';
+    local hf="" h files vals v bad="" cur na
+    for h in $(awk -F: '$7!~/(nologin|false|sync|shutdown|halt)$/ && $6!="" {print $6}' /etc/passwd 2>/dev/null | sort -u); do
+        h="${h%/}"; hf="${hf} $h/.profile $h/.bashrc $h/.bash_profile $h/.kshrc $h/.cshrc"
+    done
+    files="/etc/profile /etc/bashrc /etc/bash.bashrc /etc/login.defs $(ls /etc/profile.d/*.sh 2>/dev/null | tr '\n' ' ')${hf}"
+    cur="${_UMASK_ORIG:-$(umask)}"
+    evd "SRV-122" "echo '현재 로그인 셸 umask=${cur}'; echo '# 파일별 umask 설정 (주석 제외)'; _umask_scan $files; echo '# 점검 파일 수: $(echo $files | wc -w)'"
+    vals=$( { _umask_scan $files | sed 's/^.*: //'
               [ "$OS_FAMILY" = "AIX" ] && awk '/^[^ \t*#][^ \t]*:[ \t]*$/{next} /^[ \t]+umask[ \t]*=/{v=$0;sub(/^[^=]*=[ \t]*/,"",v);print v}' /etc/security/user 2>/dev/null;
               [ "$OS_FAMILY" = "HPUX" ] && sed -n 's/^[[:space:]]*UMASK=\([0-7]*\).*/\1/p' /etc/default/security 2>/dev/null; } | sort -u)
-    [ "$OS_FAMILY" = "AIX" ] && evd "SRV-122" "lsuser -a umask ALL 2>/dev/null"
-    [ -z "$vals" ] && vals=$(umask 2>/dev/null)
+    [ "$OS_FAMILY" = "AIX" ] && evd "SRV-122" "lsuser -a umask ALL 2>&1"
+    [ -z "$vals" ] && vals="$cur"
     for v in $vals; do
-        (( (8#$v & 8#022) == 8#022 )) || bad="${bad} ${v}"
+        (( (8#$v & 8#022) == 8#022 )) 2>/dev/null || bad="${bad} ${v}"
     done
-    [ -n "$bad" ] && result "SRV-122|취약|group/others 쓰기 허용 umask:${bad} (022 이상 필요, 조건부 설정 포함)" || result "SRV-122|양호|umask $(echo $vals) (022 이상)"
+    na=$(_noaccess_homes | tr '\n' ' ')
+    if [ -n "$bad" ]; then result "SRV-122|취약|group/others 쓰기 허용 umask:${bad} (022 이상 필요, 조건부 설정 포함; 설정 위치는 증적 참조)"
+    elif [ -n "$na" ]; then result "SRV-122|점검불가|열람 권한 없는 홈 디렉터리의 umask 확인 불가: ${na}(root 로 재점검 필요) - 확인된 값: $(echo $vals)"
+    else result "SRV-122|양호|umask $(echo $vals) (022 이상)"; fi
 }
 
 # ================================================================
 # SRV-127: 로그인 실패 횟수 접속 제한
 # ================================================================
 check_SRV127() {
-    # 평가기준: 계정 잠금 임계값 설정이 존재하면 양호 (횟수는 내부 규정 확인)
-    evd "SRV-127" "grep -i 'pam_faillock\\|pam_tally' /etc/pam.d/system-auth /etc/pam.d/password-auth /etc/pam.d/common-auth 2>/dev/null"
-    evd "SRV-127" "cat /etc/security/faillock.conf 2>/dev/null | grep -v '^#' | grep -v '^$'"
+    # 평가기준: 계정 잠금 임계값 설정이 존재하면 양호 (횟수는 내부 규정 확인) — 5회 초과는 사실상 미설정과 같아 수동확인
+    evd "SRV-127" "_show_cfg /etc/security/faillock.conf $(get_pam_files)"
     local val="" label=""
     case "$OS_FAMILY" in
     AIX)     label="AIX loginretries";      val=$(_aix_attr default loginretries)
-             evd "SRV-127" "lsuser -a loginretries ALL 2>/dev/null"
+             evd "SRV-127" "lsuser -a loginretries ALL 2>&1"
              local z; z=$(awk '/^[^ \t*#][^ \t]*:[ \t]*$/{sub(/:.*/,"");st=$0;next} st!="default" && st!="root" && /^[ \t]+loginretries[ \t]*=[ \t]*0[ \t]*$/{print st}' /etc/security/user 2>/dev/null | tr '\n' ' ')
              [ -n "$z" ] && [ "${val:-0}" -gt 0 ] 2>/dev/null && { result "SRV-127|취약|AIX loginretries=${val}(default)이나 계정별 0 재정의: ${z}"; return; } ;;
     SOLARIS) # 평가기준(SOL): policy.conf LOCK_AFTER_RETRIES=YES + /etc/default/login RETRIES 설정
-             evd "SRV-127" "grep -E 'LOCK_AFTER_RETRIES' /etc/security/policy.conf 2>/dev/null; grep -E 'RETRIES' /etc/default/login 2>/dev/null"
+             evd "SRV-127" "_show_cfg /etc/security/policy.conf /etc/default/login"
              if grep -qE '^[[:space:]]*LOCK_AFTER_RETRIES=YES' /etc/security/policy.conf 2>/dev/null; then
                  val=$(sed -n 's/^[[:space:]]*RETRIES=\([0-9]*\).*/\1/p' /etc/default/login 2>/dev/null | tail -1)
                  label="Solaris LOCK_AFTER_RETRIES=YES, RETRIES"
              else label="Solaris LOCK_AFTER_RETRIES 미설정(≠YES)"; val=""; fi ;;
     HPUX)    # Trusted Mode: /tcb/files/auth/system/default u_maxtries#N / Non Trusted: AUTH_MAXTRIES (/etc/default/security, /var/adm/userdb/*)
+             evd "SRV-127" "_show_cfg /etc/default/security; grep -H u_maxtries /tcb/files/auth/system/default 2>&1"
              if [ -f /tcb/files/auth/system/default ]; then label="HP-UX u_maxtries(Trusted)"; val=$(grep -oE 'u_maxtries#[0-9]+' /tcb/files/auth/system/default 2>/dev/null | head -1 | cut -d'#' -f2)
-             else label="HP-UX AUTH_MAXTRIES"; val=$(grep -hE "^\s*AUTH_MAXTRIES" /etc/default/security /var/adm/userdb/* 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' '); fi ;;
+             else label="HP-UX AUTH_MAXTRIES"; val=$(grep -hE "^[[:space:]]*AUTH_MAXTRIES" /etc/default/security /var/adm/userdb/* 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' '); fi ;;
     *)
-        local pam_files f d found=0
+        local pam_files f d="" found=0 pamval=""
         pam_files=$(get_pam_files)
         for f in $pam_files; do
             [ -f "$f" ] || continue
-            if grep -v "^\s*#" "$f" 2>/dev/null | grep -qi "pam_faillock"; then
+            if _cfg "$f" | grep -qi "pam_faillock"; then
                 label="pam_faillock"; found=1
-                val=$(grep -v "^\s*#" "$f" | grep -i "pam_faillock" | grep -oE 'deny=[0-9]+' | cut -d= -f2 | head -1)
+                pamval=$(_cfg "$f" | grep -i "pam_faillock" | grep -oE 'deny=[0-9]+' | cut -d= -f2 | head -1)
                 break
             fi
         done
-        if [ -f /etc/security/faillock.conf ]; then
-            d=$(grep -v "^\s*#" /etc/security/faillock.conf 2>/dev/null | grep -E "^\s*deny\s*=" | grep -oE '[0-9]+' | head -1)
-            [ -n "$d" ] && { val=$d; label="faillock.conf deny"; }
-            [ $found -eq 1 ] && [ -z "$val" ] && { val=3; label="pam_faillock(기본 deny=3)"; }
+        # pam 줄의 deny= 옵션이 faillock.conf 보다 우선, 둘 다 없으면 pam_faillock 기본값 3
+        d=$(_cfg /etc/security/faillock.conf | grep -E "^[[:space:]]*deny[[:space:]]*=" | grep -oE '[0-9]+' | tail -1)
+        if [ $found -eq 1 ]; then
+            if [ -n "$pamval" ]; then val=$pamval; label="pam_faillock deny"
+            elif [ -n "$d" ]; then val=$d; label="faillock.conf deny"
+            else val=3; label="pam_faillock(기본 deny=3)"; fi
         fi
-        if [ $found -eq 0 ] && [ -z "$d" ]; then
+        if [ $found -eq 0 ]; then
             for f in $pam_files; do
                 [ -f "$f" ] || continue
-                if grep -v "^\s*#" "$f" 2>/dev/null | grep -qi "pam_tally"; then
-                    label="pam_tally2"; val=$(grep -v "^\s*#" "$f" | grep -i "pam_tally" | grep -oE 'deny=[0-9]+' | cut -d= -f2 | head -1); break
+                if _cfg "$f" | grep -qi "pam_tally"; then
+                    label="pam_tally2"; val=$(_cfg "$f" | grep -i "pam_tally" | grep -oE 'deny=[0-9]+' | cut -d= -f2 | head -1); break
                 fi
             done
         fi ;;
@@ -1427,7 +1735,7 @@ check_SRV127() {
     elif [ "$val" -le 5 ] 2>/dev/null; then
         result "SRV-127|양호|${label}=${val}회 설정"
     else
-        result "SRV-127|양호|${label}=${val}회 설정 (5회 초과 - 내부 규정 기준 확인)"
+        result "SRV-127|수동확인|${label}=${val}회 설정 - 5회 초과, 내부 규정 기준 확인 필요"
     fi
 }
 
@@ -1435,26 +1743,28 @@ check_SRV127() {
 # SRV-131: su 명령어 그룹 제한
 # ================================================================
 check_SRV131() {
-    evd "SRV-131" "grep -v '^#' /etc/pam.d/su 2>/dev/null; ls -l /bin/su /usr/bin/su 2>/dev/null; awk '/^(root|default):/,/^\$/' /etc/security/user 2>/dev/null | grep sugroups; grep -i SU_ROOT_GROUP /etc/default/security 2>/dev/null; grep -i su_group /etc/pam.conf 2>/dev/null"
+    evd "SRV-131" "_show_cfg /etc/pam.d/su /etc/default/security /etc/pam.conf; ls -l /bin/su /usr/bin/su 2>&1; grep -E '^(root|default):|sugroups' /etc/security/user 2>&1"
     local su p
     su=$(ls /bin/su /usr/bin/su 2>/dev/null | head -1); p=$(get_perm "$su")
     case "$OS_FAMILY" in
     AIX)
         local g; g=$(awk '/^root:/{f=1;next} /^[^ \t*]/{f=0} f&&/sugroups/{sub(/.*=[ \t]*/,"");print;exit}' /etc/security/user 2>/dev/null)
         [ -z "$g" ] && g=$(awk '/^default:/{f=1;next} /^[^ \t*]/{f=0} f&&/sugroups/{sub(/.*=[ \t]*/,"");print;exit}' /etc/security/user 2>/dev/null)
-        [ -n "$g" ] && [ "${g^^}" != "ALL" ] && result "SRV-131|양호|AIX sugroups=${g}" || result "SRV-131|취약|AIX sugroups=${g:-미설정} (ALL/미설정)" ;;
+        [ -n "$g" ] && [ "$(_uc "$g")" != "ALL" ] && result "SRV-131|양호|AIX sugroups=${g}" || result "SRV-131|취약|AIX sugroups=${g:-미설정} (ALL/미설정)" ;;
     HPUX)
-        local g; g=$(grep -E '^\s*SU_ROOT_GROUP' /etc/default/security 2>/dev/null | cut -d= -f2 | tr -d ' ')
-        [ -n "$g" ] && [ "${g^^}" != "ALL" ] && result "SRV-131|양호|HP-UX SU_ROOT_GROUP=${g}" || result "SRV-131|취약|HP-UX SU_ROOT_GROUP 미지정" ;;
+        local g; g=$(grep -E '^[[:space:]]*SU_ROOT_GROUP' /etc/default/security 2>/dev/null | cut -d= -f2 | tr -d ' ')
+        [ -n "$g" ] && [ "$(_uc "$g")" != "ALL" ] && result "SRV-131|양호|HP-UX SU_ROOT_GROUP=${g}" || result "SRV-131|취약|HP-UX SU_ROOT_GROUP 미지정" ;;
     SOLARIS)
-        if grep -vE '^\s*#' /etc/pam.conf 2>/dev/null | grep -q su_group; then result "SRV-131|양호|pam.conf su_group 설정"
+        if _cfg /etc/pam.conf | grep -q su_group; then result "SRV-131|양호|pam.conf su_group 설정"
         elif [ -n "$p" ] && [ $(( ${p: -1} & 1 )) -eq 0 ]; then result "SRV-131|양호|${su} others 실행 권한 없음 (${p}, 그룹=$(ls -l "$su" | awk '{print $4}'))"
-        else result "SRV-131|취약|${su:-su} others 실행 가능 (${p:-미확인})"; fi ;;
+        elif [ -z "$p" ]; then result "SRV-131|점검불가|su 명령의 권한을 확인하지 못함 (pam.conf su_group 설정도 없음)"
+        else result "SRV-131|취약|${su} others 실행 가능 (${p})"; fi ;;
     *)
-        if grep -vE '^\s*#' /etc/pam.d/su 2>/dev/null | grep -qE '^\s*auth\s+(required|requisite)\s+\S*pam_wheel\.so'; then
-            result "SRV-131|양호|su pam_wheel required 설정 (그룹=$(grep -vE '^\s*#' /etc/pam.d/su | grep -oE 'group=\S+' | cut -d= -f2 | head -1 | sed 's/^$/wheel/'))"
+        if _cfg /etc/pam.d/su | grep -qE '^[[:space:]]*auth[[:space:]]+(required|requisite)[[:space:]]+[^[:space:]]*pam_wheel\.so'; then
+            result "SRV-131|양호|su pam_wheel required 설정 (그룹=$(_cfg /etc/pam.d/su | grep -oE 'group=[^[:space:]]+' | cut -d= -f2 | head -1 | sed 's/^$/wheel/'))"
         elif [ -n "$p" ] && [ $(( ${p: -1} & 1 )) -eq 0 ]; then result "SRV-131|양호|${su} others 실행 권한 없음 (${p})"
-        else result "SRV-131|취약|su pam_wheel(required) 미설정, ${su} others 실행 가능 (${p:-미확인})"; fi ;;
+        elif [ -z "$p" ]; then result "SRV-131|점검불가|su 명령(/bin/su·/usr/bin/su)의 권한을 확인하지 못함 (pam_wheel 설정도 없음)"
+        else result "SRV-131|취약|su pam_wheel(required) 미설정, ${su} others 실행 가능 (${p})"; fi ;;
     esac
 }
 
@@ -1466,11 +1776,16 @@ check_SRV133() {
     local allow=/etc/cron.allow deny=/etc/cron.deny
     { [ "$OS_FAMILY" = "AIX" ] || [ "$OS_FAMILY" = "HPUX" ]; } && { allow=/var/adm/cron/cron.allow; deny=/var/adm/cron/cron.deny; }
     [ "$OS_FAMILY" = "SOLARIS" ] && { allow=/etc/cron.d/cron.allow; deny=/etc/cron.d/cron.deny; }
-    evd "SRV-133" "ls -la $allow $deny 2>/dev/null; echo '[allow]'; cat $allow 2>/dev/null; echo '[deny]'; cat $deny 2>/dev/null"
-    local a_cnt d_cnt
-    a_cnt=$(grep -vcE '^\s*(#|$)' "$allow" 2>/dev/null); d_cnt=$(grep -vcE '^\s*(#|$)' "$deny" 2>/dev/null)
+    evd "SRV-133" "ls -la $allow $deny 2>&1; echo '[allow]'; cat $allow 2>&1; echo '[deny]'; cat $deny 2>&1"
+    local a_cnt d_cnt u
+    u=$(_unreadable $allow $deny) && { result "SRV-133|점검불가|${u} 읽기 권한 없음"; return; }
+    a_cnt=$(_cfg "$allow" | grep -c .); d_cnt=$(_cfg "$deny" | grep -c .)
     if [ -f "$allow" ] && [ "${a_cnt:-0}" -gt 0 ]; then result "SRV-133|양호|${allow} 허용 계정 ${a_cnt}개 관리"
-    elif [ ! -f "$allow" ] && [ ! -f "$deny" ]; then result "SRV-133|양호|cron.allow/cron.deny 모두 없음 (root만 cron 사용 가능)"
+    elif [ ! -f "$allow" ] && [ ! -f "$deny" ]; then
+        case "$OS_DISTRO" in
+        UBUNTU|DEBIAN) result "SRV-133|취약|cron.allow/cron.deny 모두 없음 (Debian 계열은 모든 계정 cron 사용 가능)" ;;
+        *) result "SRV-133|양호|cron.allow/cron.deny 모두 없음 (root만 cron 사용 가능)" ;;
+        esac
     elif [ ! -f "$allow" ] && [ "${d_cnt:-0}" -eq 0 ]; then result "SRV-133|취약|cron.allow 없고 cron.deny 비어 있음 (모든 계정 cron 사용 가능)"
     elif [ ! -f "$allow" ]; then result "SRV-133|양호|${deny} 거부 계정 ${d_cnt}개 관리"
     else result "SRV-133|수동확인|${allow} 존재하나 허용 계정 없음 (cron 사용 불가) - 의도 확인"; fi
@@ -1480,9 +1795,10 @@ check_SRV133() {
 # SRV-142: 중복 UID 계정 제한
 # ================================================================
 check_SRV142() {
-    evd "SRV-142" "awk -F: '{print \$3}' /etc/passwd 2>/dev/null | sort | uniq -d"
-    dup=$(awk -F: '{print $3}' /etc/passwd 2>/dev/null | sort | uniq -d)
-    [ -n "$dup" ] && result "SRV-142|취약|중복 UID 발견: $(echo "$dup" | head -5)" || \
+    evd "SRV-142" "echo '# UID:계정 (전체, UID 순)'; awk -F: '{print \$3\":\"\$1}' /etc/passwd | sort -n"
+    local dup
+    dup=$(awk -F: '{c[$3]++; n[$3]=n[$3] (n[$3]==""?"":",") $1} END{for(u in c) if (c[u]>1) print "UID "u"("n[u]")"}' /etc/passwd 2>/dev/null | sort)
+    [ -n "$dup" ] && result "SRV-142|취약|중복 UID 발견 $(echo "$dup" | grep -c .)건: $(echo "$dup" | _sum 5)" || \
         result "SRV-142|양호|중복 UID 없음"
 }
 
@@ -1491,34 +1807,39 @@ check_SRV142() {
 # ================================================================
 check_SRV144() {
     # 평가기준: /dev 에 존재하지 않는 불필요 device(일반) 파일 (mqueue, shm 예외)
-    evd "SRV-144" "find /dev \\( -path /dev/shm -o -path /dev/mqueue \\) -prune -o -type f -print 2>/dev/null | head -20"
-    local fl; fl=$(find /dev \( -path /dev/shm -o -path /dev/mqueue \) -prune -o -type f -print 2>/dev/null | head -10)
-    [ -n "$fl" ] && result "SRV-144|취약|/dev 내 일반 파일: $(echo "$fl" | tr '\n' ' ' | cut -c1-200)" || result "SRV-144|양호|/dev 불필요 일반 파일 없음 (shm·mqueue 제외)"
+    local fl cnt
+    fl=$(find /dev \( -path /dev/shm -o -path /dev/mqueue \) -prune -o -type f -print 2>/dev/null)
+    cnt=$(printf '%s' "$fl" | grep -c .)
+    _DEVF_LIST="$fl"
+    evd "SRV-144" "echo '# /dev 아래 일반 파일(shm·mqueue 제외) ${cnt}개'; printf '%s\\n' \"\$_DEVF_LIST\""
+    [ "$cnt" -gt 0 ] && result "SRV-144|취약|/dev 내 일반 파일 ${cnt}개: $(echo "$fl" | _sum 5)" || result "SRV-144|양호|/dev 불필요 일반 파일 없음 (shm·mqueue 제외)"
 }
 
 # ================================================================
 # SRV-158: 불필요 Telnet 서비스 비활성화
 # ================================================================
 check_SRV158() {
-    evd "SRV-158" "grep -vE '^\s*#' /etc/inetd.conf 2>/dev/null | grep -w telnet; inetadm 2>/dev/null | grep -i telnet; lssrc -ls inetd 2>/dev/null | grep -i telnet; ss -tln 2>/dev/null | grep ':23 '; netstat -an 2>/dev/null | grep -E '[.:]23[[:space:]].*LISTEN'"
+    evd "SRV-158" "_svc_state telnetd in.telnetd; _listen_all; echo \"inetd·xinetd·SMF 활성 telnet: $(_inetd_on telnet | tr '\n' ' ')\"; inetadm 2>&1 | grep -i telnet; lssrc -ls inetd 2>&1 | grep -i telnet"
     local on; on=$( { _inetd_on telnet; _listen 23 | awk '{print "LISTEN:23"}'; } | tr '\n' ' ')
     if is_running telnetd || is_running in.telnetd || [ -n "$on" ]; then result "SRV-158|취약|Telnet 서비스 활성 (${on:-telnetd 프로세스})"
-    else result "SRV-158|양호|Telnet 서비스 미실행"; fi
+    else result "SRV-158|양호|Telnet 서비스 미실행$(_portnote)"; fi
 }
 
 # ================================================================
 # SRV-161: ftpusers 파일의 소유자 및 권한 설정 적절성
 # ================================================================
 check_SRV161() {
-    evd "SRV-161" "ls -la /etc/ftpusers /etc/ftpd/ftpusers /etc/vsftpd/ftpusers /etc/vsftpd/user_list /etc/vsftpd.ftpusers /etc/vsftpd.user_list 2>/dev/null"
-    local f found="" bad="" p o
-    for f in /etc/ftpusers /etc/ftpd/ftpusers /etc/vsftpd/ftpusers /etc/vsftpd/user_list /etc/vsftpd.ftpusers /etc/vsftpd.user_list; do
+    local fl="/etc/ftpusers /etc/ftpd/ftpusers /etc/vsftpd/ftpusers /etc/vsftpd/user_list /etc/vsftpd.ftpusers /etc/vsftpd.user_list"
+    local f found="" bad="" p o ex=""
+    for f in $fl; do [ -f "$f" ] && ex="${ex} ${f}"; done
+    evd "SRV-161" "echo '# ftpusers 계열 파일 $(echo $ex | wc -w)개 존재 (후보 6개)'; _pstat $ex; _svc_state vsftpd proftpd in.ftpd ftpd"
+    for f in $fl; do
         [ -f "$f" ] || continue
         found="${found} ${f}"; p=$(get_perm "$f"); o=$(get_owner "$f")
         { [ "$o" != "root" ] || _perm_over "$p" 640; } && bad="${bad} ${f}(소유자:${o},권한:${p})"
     done
     if [ -z "$found" ]; then
-        _ftp_running && result "SRV-161|취약|ftpusers 파일 없음 (FTP 실행 중)" || result "SRV-161|양호|FTP 서비스 미실행"
+        _ftp_running && result "SRV-161|취약|ftpusers 파일 없음 (FTP 실행 중)" || result "SRV-161|양호|FTP 서비스 미실행 (ftpusers 파일 없음)"
         return
     fi
     [ -n "$bad" ] && result "SRV-161|취약|ftpusers 소유자/권한 이상:${bad}" || result "SRV-161|양호|${found# } 소유자=root, 권한 640 이하"
@@ -1529,15 +1850,21 @@ check_SRV161() {
 # ================================================================
 check_SRV163() {
     # 평가기준: 로그온 시 경고 메시지 미출력 또는 문구 내 시스템 버전 정보 노출 시 취약
-    evd "SRV-163" "grep -iE '^\s*Banner' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null; for f in /etc/issue /etc/issue.net /etc/motd; do echo \"# \$f\"; head -5 \$f 2>/dev/null; done; grep -i herald /etc/security/login.cfg 2>/dev/null"
-    local files="" f txt="" ver
+    local cf; cf=$(_sshd_cfg)
+    evd "SRV-163" "sshd -T 2>&1 | grep -iE 'banner|sshd:|rror'; _show_cfg ${cf:-/etc/ssh/sshd_config} $(ls /etc/ssh/sshd_config.d/*.conf 2>/dev/null | tr '\n' ' '); for f in /etc/issue /etc/issue.net /etc/motd; do echo \"# \$f\"; cat \$f 2>&1; done; grep -i herald /etc/security/login.cfg 2>&1"
+    local files="" f txt="" ver sshon=0 sbf=""
     local sb; sb=$(sshd -T 2>/dev/null | awk 'tolower($1)=="banner"{print $2}')
-    [ -z "$sb" ] && sb=$(grep -vE '^\s*#' $(_sshd_cfg) /etc/ssh/sshd_config.d/*.conf 2>/dev/null | grep -iE '^\S*:?\s*Banner' | awk '{print $NF}' | tail -1)
-    [ -n "$sb" ] && [ "$sb" != "none" ] && [ -f "$sb" ] && files="$sb"
+    [ -z "$sb" ] && sb=$( { [ -n "$cf" ] && grep -vE '^[[:space:]]*#' "$cf"; cat /etc/ssh/sshd_config.d/*.conf 2>/dev/null | grep -vE '^[[:space:]]*#'; } | grep -iE '^[[:space:]]*Banner' | awk '{print $NF}' | tail -1)
+    { [ -n "$cf" ] || is_running sshd || is_running ssh; } && sshon=1
+    [ -n "$sb" ] && [ "$sb" != "none" ] && [ -s "$sb" ] && { files="$sb"; sbf="$sb"; }
     for f in /etc/issue /etc/issue.net /etc/motd; do [ -s "$f" ] && files="${files} ${f}"; done
-    [ "$OS_FAMILY" = "AIX" ] && txt=$(grep -vE '^\s*\*' /etc/security/login.cfg 2>/dev/null | grep -i 'herald' | head -1)
+    [ "$OS_FAMILY" = "AIX" ] && txt=$(grep -vE '^[[:space:]]*\*' /etc/security/login.cfg 2>/dev/null | grep -i 'herald' | head -1)
     for f in $files; do txt="${txt}"$'\n'"$(cat "$f" 2>/dev/null)"; done
-    if [ -z "$(echo "$txt" | tr -d '[:space:]')" ]; then result "SRV-163|취약|로그온 경고 메시지(배너) 미설정"; return; fi
+    if [ -z "$(echo "$txt" | tr -d '[:space:]')" ]; then result "SRV-163|취약|로그온 경고 메시지(배너) 미설정 (sshd Banner·/etc/issue·/etc/motd 모두 비어 있음)"; return; fi
+    # SSH 로 접속하는 서버는 sshd Banner 가 로그인 전 경고 문구 (/etc/issue 는 콘솔·텔넷에만 표시)
+    if [ "$sshon" = 1 ] && [ "$OS_FAMILY" != "AIX" ] && [ -z "$sbf" ]; then
+        result "SRV-163|취약|SSH 사용 중이나 sshd Banner 미설정(${sb:-none}) - /etc/issue 등은 SSH 로그인 시 표시되지 않음 ($(echo $files))"; return
+    fi
     ver=$(echo "$txt" | grep -oiE 'SunOS[^ ]*|Solaris [0-9.]+|AIX( Version)? [0-9.]+|HP-UX|HP Release [A-Z]?\.?[0-9.]+|Ubuntu [0-9.]+|CentOS[^[:cntrl:]]*[0-9]|Red Hat[^[:cntrl:]]*[0-9]|Rocky[^[:cntrl:]]*[0-9]|Debian[^[:cntrl:]]*[0-9]|\\r|\\v|Kernel [0-9]' | head -1)
     if [ -n "$ver" ]; then result "SRV-163|취약|배너에 시스템 버전 정보 노출 (${ver}) - $(echo $files)"
     elif echo "$txt" | grep -qiE 'authori[sz]ed|unauthori[sz]ed|warning|경고|허가|불법|monitor'; then result "SRV-163|양호|경고 문구 배너 설정 ($(echo $files))"
@@ -1572,23 +1899,24 @@ check_SRV165() {
 # SRV-175: NTP 설정
 # ================================================================
 check_SRV175() {
-    evd "SRV-175" "chronyc tracking 2>/dev/null || ntpq -p 2>/dev/null || timedatectl 2>/dev/null | grep -i synch"
-    # chrony
-    command -v chronyc >/dev/null 2>&1 && \
-        chronyc tracking 2>/dev/null | grep -q "Reference ID" && \
-        result "SRV-175|양호|chronyc NTP 동기화 활성" && return
-    # ntpq
-    command -v ntpq >/dev/null 2>&1 && \
-        ntpq -p 2>/dev/null | grep -q "^\*" && \
-        result "SRV-175|양호|ntpq 활성 피어 확인" && return
-    # timedatectl
-    command -v timedatectl >/dev/null 2>&1 && \
-        timedatectl 2>/dev/null | grep -q "synchronized: yes" && \
-        result "SRV-175|양호|timedatectl NTP 동기화 활성" && return
-    # AIX
-    [ "$OS_FAMILY" = "AIX" ] && grep -q "server" /etc/ntp.conf 2>/dev/null && \
-        result "SRV-175|수동확인|AIX ntp.conf 서버 설정됨 (동기화 상태 확인)" && return
-    result "SRV-175|취약|NTP 동기화 설정 미확인"
+    # 평가기준: 시간 동기화를 위한 NTP 설정 — 데몬이 상위 서버와 실제 동기화된 상태인지 확인
+    evd "SRV-175" "_svc_state chronyd chrony ntpd ntp xntpd systemd-timesyncd; chronyc tracking 2>&1; chronyc sources 2>&1; ntpq -pn 2>&1; timedatectl 2>&1; lssrc -ls xntpd 2>&1"
+    evd "SRV-175" "_show_cfg /etc/chrony.conf /etc/chrony/chrony.conf /etc/ntp.conf /etc/inet/ntp.conf /etc/systemd/timesyncd.conf"
+    local synced="" cfgd="" ct
+    if command -v chronyc >/dev/null 2>&1; then
+        ct=$(chronyc tracking 2>/dev/null)
+        # 동기화 안 됨: 'Leap status : Not synchronised' 또는 Reference ID 00000000 / Stratum 0
+        echo "$ct" | grep -qiE 'Leap status[[:space:]]*:[[:space:]]*Normal' && ! echo "$ct" | grep -qE 'Reference ID[[:space:]]*:[[:space:]]*0{8}' && synced="chrony($(echo "$ct" | awk -F': ' '/^Reference ID/{print $2}'))"
+    fi
+    [ -z "$synced" ] && command -v ntpq >/dev/null 2>&1 && ntpq -pn 2>/dev/null | grep -qE '^[*o]' && synced="ntpd 활성 피어"
+    [ -z "$synced" ] && command -v timedatectl >/dev/null 2>&1 && timedatectl 2>/dev/null | grep -qiE '(System clock|NTP) synchronized:[[:space:]]*yes' && synced="timedatectl(systemd-timesyncd 등)"
+    [ -n "$(_cfg /etc/chrony.conf /etc/chrony/chrony.conf /etc/ntp.conf /etc/inet/ntp.conf | grep -iE '^[[:space:]]*(server|pool|peer)[[:space:]]')" ] && cfgd="ntp/chrony 서버 설정"
+    [ -z "$cfgd" ] && grep -qE '^[[:space:]]*NTP=[^[:space:]]' /etc/systemd/timesyncd.conf 2>/dev/null && cfgd="timesyncd NTP= 설정"
+    if [ -n "$synced" ]; then result "SRV-175|양호|NTP 동기화 확인: ${synced}"
+    elif [ -n "$cfgd" ]; then
+        if is_running chronyd || is_running ntpd || is_running xntpd || is_running systemd-timesyncd; then result "SRV-175|수동확인|NTP 데몬 실행·서버 설정(${cfgd})이나 동기화 상태를 확인하지 못함 - 증적의 sources/tracking 확인"
+        else result "SRV-175|취약|NTP 서버는 설정(${cfgd})되었으나 동기화 데몬 미실행"; fi
+    else result "SRV-175|취약|NTP 동기화 설정 없음 (chrony·ntpd·systemd-timesyncd 서버 설정·동기화 상태 모두 확인되지 않음)"; fi
 }
 
 # ================================================================
@@ -1596,15 +1924,17 @@ check_SRV175() {
 # ================================================================
 check_SRV177() {
     # 평가기준: sudo 접근 제한 — 불필요한 사용자가 sudo 권한을 가지는지 확인
-    evd "SRV-177" "ls -l /etc/sudoers; grep -vE '^\s*(#|Defaults|\$)' /etc/sudoers /etc/sudoers.d/* 2>/dev/null"
-    command -v sudo >/dev/null 2>&1 || [ -f /etc/sudoers ] || { result "SRV-177|양호|sudo 미설치"; return; }
+    local sf="/etc/sudoers $(ls /etc/sudoers.d/* 2>/dev/null | tr '\n' ' ')" u
+    evd "SRV-177" "command -v sudo 2>&1; ls -l $sf 2>&1; grep -vE '^[[:space:]]*(#|Defaults|\$)' $sf 2>&1"
+    command -v sudo >/dev/null 2>&1 || [ -f /etc/sudoers ] || { result "SRV-177|양호|sudo 미설치 (sudoers 없음)"; return; }
+    u=$(_unreadable $sf) && { result "SRV-177|점검불가|sudoers 읽기 권한 없음: ${u} (root 로 재점검 필요)"; return; }
     local rules all="" who="" np=""
-    rules=$(grep -hvE '^\s*(#|Defaults|$)|^\s*(User|Runas|Host|Cmnd)_Alias|^\s*@include|^\s*#include' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | grep -E '=')
+    rules=$(grep -hvE '^[[:space:]]*(#|Defaults|$)|^[[:space:]]*(User|Runas|Host|Cmnd)_Alias|^[[:space:]]*@include|^[[:space:]]*#include' $sf 2>/dev/null | grep -E '=')
     all=$(echo "$rules" | awk '$1=="ALL" || $1=="%users" || $1=="%everyone" || $1=="%staff"{print $1}' | sort -u | tr '\n' ' ')
     who=$(echo "$rules" | awk '$1!="root"{print $1}' | sort -u | tr '\n' ' ')
     np=$(echo "$rules" | grep -c 'NOPASSWD')
     if [ -n "$all" ]; then result "SRV-177|취약|모든(또는 일반 사용자 그룹) 사용자 sudo 허용: ${all}"
-    elif [ -n "$who" ]; then result "SRV-177|수동확인|sudo 권한 보유: ${who}(NOPASSWD 규칙 ${np}건) - 불필요 사용자 여부 확인"
+    elif [ -n "$(echo $who)" ]; then result "SRV-177|수동확인|sudo 권한 보유: ${who}(NOPASSWD 규칙 ${np}건) - 불필요 사용자 여부 확인"
     else result "SRV-177|양호|root 외 sudo 권한 없음"; fi
 }
 
@@ -1612,15 +1942,15 @@ check_SRV177() {
 # SRV-179: EoS 시스템 장비 교체 (자동 판정)
 # ================================================================
 check_SRV179() {
-    evd "SRV-179" "uname -srm; cat /etc/os-release 2>/dev/null | head -5; oslevel -s 2>/dev/null; swlist -l product 2>/dev/null | grep -E '^\s*HP-UX' | head -3; pkg info entire 2>/dev/null | grep -iE 'version|branch'; cat /etc/release 2>/dev/null | head -2"
+    local EOS_SCRIPT product="" version="" _PY _eo eos_result eos_desc
     EOS_SCRIPT="$(dirname "$0")/eos_checker.py"
     [ -f "$EOS_SCRIPT" ] || EOS_SCRIPT="$(dirname "$0")/../converter/eos_checker.py"   # 저장소 구조 그대로 실행 시
+    evd "SRV-179" "uname -srm; cat /etc/os-release 2>&1; oslevel -s 2>&1; swlist -l product 2>&1 | grep -E '^[[:space:]]*HP-UX'; pkg info entire 2>&1 | grep -iE 'version|branch'; cat /etc/release 2>&1; ls -l ${EOS_SCRIPT} 2>&1"
     [ ! -f "$EOS_SCRIPT" ] && {
-        result "SRV-179|수동확인|eos_checker.py 없음 - 수동 확인 필요"
+        result "SRV-179|점검불가|eos_checker.py 를 찾지 못해 EoS 자동 판정 불가 - 수동 확인 필요"
         return
     }
 
-    product="" version=""
     case "$OS_FAMILY" in
     AIX)
         product="aix"; version="${OS_MAJOR}.$(uname -r)"
@@ -1653,29 +1983,34 @@ check_SRV179() {
         AMZN)
             product="amazon-linux"; version="$OS_MAJOR" ;;
         *)
-            result "SRV-179|수동확인|OS ${OS_DISTRO} ${OS_MAJOR} EoS 수동 확인"
+            result "SRV-179|수동확인|OS ${OS_DISTRO} ${OS_MAJOR} EoS 수동 확인 (EoS 데이터에 없는 배포판)"
             return ;;
         esac ;;
     *)
-        result "SRV-179|수동확인|OS 종류 미탐지 - 수동 확인"
+        result "SRV-179|점검불가|OS 종류(${OS_FAMILY})를 판별하지 못해 EoS 확인 불가"
         return ;;
     esac
 
     _PY=$(command -v python3 2>/dev/null || { [ -x /usr/libexec/platform-python ] && echo /usr/libexec/platform-python; } || command -v python 2>/dev/null)
-    if [ -z "$_PY" ]; then result "SRV-179|수동확인|python 미설치 - ${product} ${version} EoS 여부 수동 확인"; return; fi
-    _eo=$("$_PY" "$EOS_SCRIPT" "$product" "$version" 2>/dev/null)   # 인터넷 연결 시 endoflife.date 조회, 아니면 내장 데이터
+    if [ -z "$_PY" ]; then result "SRV-179|점검불가|python 미설치로 EoS 판정 도구 실행 불가 - ${product} ${version} EoS 여부 수동 확인"; return; fi
+    # 점검 대상 서버에서 외부(endoflife.date) 접속을 하지 않도록 --no-api: 내장 EoS 데이터로만 판정 (폐쇄망 정책)
+    _eo=$("$_PY" "$EOS_SCRIPT" --no-api "$product" "$version" 2>&1)
+    _EOS_OUT="$_eo"
+    evd "SRV-179" "echo '# eos_checker.py --no-api ${product} ${version}'; printf '%s\\n' \"\$_EOS_OUT\""
     eos_result=$(echo "$_eo" | grep "^결과:" | awk '{print $2}')
     eos_desc=$(echo "$_eo" | grep "^설명:" | cut -d: -f2- | sed "s/^ *//;s/ *$//")
-    [ -z "$eos_result" ] && { result "SRV-179|수동확인|EoS 판정 실패 - 수동 확인"; return; }
-    result "SRV-179|${eos_result}|${eos_desc}"
+    [ -z "$eos_result" ] && { result "SRV-179|점검불가|EoS 판정 도구 결과를 해석하지 못함 (${product} ${version}) - 수동 확인"; return; }
+    result "SRV-179|${eos_result}|${eos_desc} (내장 EoS 데이터 기준, 외부 조회 안 함)"
 }
 
 # ================================================================
 # SRV-087: C 컴파일러 권한
 # ================================================================
 check_SRV087() {
-    local _cc_list; _cc_list=$(for c in /usr/bin/gcc /usr/bin/cc /usr/bin/g++ /usr/local/bin/gcc /usr/vac/bin/xlc /usr/vac/bin/cc /opt/aCC/bin/aCC /opt/ansic/bin/cc /opt/SUNWspro/bin/cc /opt/developerstudio*/bin/cc /usr/sfw/bin/gcc $(command -v cc gcc 2>/dev/null); do echo "$c"; done | sort -u)   # /usr/ucb/cc 는 Studio 미설치 시 동작하지 않는 래퍼라 제외
-    evd "SRV-087" "ls -laL $(echo $_cc_list) 2>/dev/null"
+    local _cc_list _cc_ex="" c _all=0
+    _cc_list=$(for c in /usr/bin/gcc /usr/bin/cc /usr/bin/g++ /usr/local/bin/gcc /usr/vac/bin/xlc /usr/vac/bin/cc /opt/aCC/bin/aCC /opt/ansic/bin/cc /opt/SUNWspro/bin/cc /opt/developerstudio*/bin/cc /usr/sfw/bin/gcc $(command -v cc gcc 2>/dev/null); do echo "$c"; done | sort -u)   # /usr/ucb/cc 는 Studio 미설치 시 동작하지 않는 래퍼라 제외
+    for c in $_cc_list; do _all=$((_all+1)); [ -e "$c" ] && _cc_ex="${_cc_ex} ${c}"; done
+    evd "SRV-087" "echo '# C 컴파일러 후보 경로 ${_all}개 중 존재 $(echo $_cc_ex | wc -w)개'; $([ -n "$_cc_ex" ] && echo "ls -laL ${_cc_ex}" || echo "command -v gcc cc 2>&1")"
     _cc_vuln=""
     for cc in $_cc_list; do
         [ -x "$cc" ] || continue
@@ -1701,7 +2036,13 @@ check_SRV087() {
 # ================================================================
 _smtp_type=""  # sendmail / postfix / exim / ""
 _smtp_cf=""
-_smtp_pids() { ps -ef 2>/dev/null | grep -v grep | grep -v defunct | grep -E "$1" | awk '{print $2}'; }
+_smtp_pids() {   # MTA PID 목록 — 프로세스 이름(comm) 기준 (인자에 sendmail 등이 들어간 vim·grep 은 제외)
+    case "$1" in
+    sendmail) _pid_comm | awk '$2=="sendmail" || $2=="sm-mta" {print $1}' ;;
+    postfix*) _pid_comm | awk '($2=="master" && /postfix/) || $2=="postfix" {print $1}' ;;
+    exim)     _pid_comm | awk '$2 ~ /^exim4?$/ {print $1}' ;;
+    esac
+}
 _in_container_only() {   # 모든 PID 가 '점검 스크립트와 다른' 컨테이너 cgroup 이면 참 (/proc 없는 UNIX 는 거짓 = 호스트 서비스)
     local p any=0 self; self=$(cat /proc/self/cgroup 2>/dev/null)
     for p in "$@"; do any=1; [ -r "/proc/$p/cgroup" ] || return 1
@@ -1734,8 +2075,7 @@ _ver_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,
 _smtp_running() {
     _detect_smtp
     [ -n "$_smtp_type" ] && return 0
-    ss -tlnp 2>/dev/null | grep -q "[.:]25 " && return 0
-    netstat -tlnp 2>/dev/null | grep -q ":25 " && return 0
+    [ -n "$(_listen 25)" ] && return 0
     return 1
 }
 
@@ -1743,17 +2083,19 @@ _smtp_running() {
 # SRV-005: SMTP EXPN/VRFY 제한
 # ================================================================
 check_SRV005() {
-    _smtp_running || { evd "SRV-005" "ps -ef 2>/dev/null | grep -E 'smtp|postfix|sendmail' | grep -v grep"; result "SRV-005|N-A|SMTP 서비스 미실행"; return; }
+    _smtp_gate SRV-005 || return
     _detect_smtp
-    evd "SRV-005" "postconf disable_vrfy_command 2>/dev/null; grep -i PrivacyOptions $_smtp_cf 2>/dev/null"
+    evd "SRV-005" "postconf disable_vrfy_command 2>&1; _smtp_cf_show '^[[:space:]]*O[[:space:]]+PrivacyOptions'"
     case "$_smtp_type" in
     postfix)
-        local val=$(postconf -h disable_vrfy_command 2>/dev/null)
+        command -v postconf >/dev/null 2>&1 || { result "SRV-005|점검불가|postfix 실행 중이나 postconf 명령을 찾지 못함"; return; }
+        local val; val=$(postconf -h disable_vrfy_command 2>/dev/null)
         [ "$val" = "yes" ] && result "SRV-005|양호|postfix disable_vrfy_command=yes" || \
             result "SRV-005|취약|postfix disable_vrfy_command=${val:-no}" ;;
     sendmail)
+        [ -f "$_smtp_cf" ] || { result "SRV-005|점검불가|sendmail 설정 파일(sendmail.cf)을 찾지 못함"; return; }
         # 평가기준: noexpn 과 novrfy 또는 goaway
-        local po; po=$(grep -iE '^\s*O\s+PrivacyOptions' "$_smtp_cf" 2>/dev/null | tail -1)
+        local po; po=$(grep -iE '^[[:space:]]*O[[:space:]]+PrivacyOptions' "$_smtp_cf" 2>/dev/null | tail -1)
         if echo "$po" | grep -qi "goaway" || { echo "$po" | grep -qi "noexpn" && echo "$po" | grep -qi "novrfy"; }; then
             result "SRV-005|양호|sendmail PrivacyOptions EXPN·VRFY 제한 (${po##*=})"
         else result "SRV-005|취약|sendmail PrivacyOptions noexpn·novrfy(또는 goaway) 미설정 (${po##*=})"; fi ;;
@@ -1765,17 +2107,19 @@ check_SRV005() {
 # SRV-006: SMTP 로그 수준
 # ================================================================
 check_SRV006() {
-    _smtp_running || { evd "SRV-006" "ps -ef 2>/dev/null | grep -E 'smtp|postfix|sendmail' | grep -v grep"; result "SRV-006|N-A|SMTP 서비스 미실행"; return; }
+    _smtp_gate SRV-006 || return
     _detect_smtp
-    evd "SRV-006" "postconf debug_peer_level syslog_facility 2>/dev/null; grep -i LogLevel $_smtp_cf 2>/dev/null"
+    evd "SRV-006" "postconf debug_peer_level syslog_facility 2>&1; _smtp_cf_show '^[[:space:]]*O[[:space:]]+LogLevel'"
     case "$_smtp_type" in
     postfix)
+        command -v postconf >/dev/null 2>&1 || { result "SRV-006|점검불가|postfix 실행 중이나 postconf 명령을 찾지 못함"; return; }
         # 평가기준: debug_peer_level 2 이상 (기본 2)
-        local dl=$(postconf -h debug_peer_level 2>/dev/null)
+        local dl; dl=$(postconf -h debug_peer_level 2>/dev/null)
         [ "${dl:-2}" -ge 2 ] 2>/dev/null && result "SRV-006|양호|postfix debug_peer_level=${dl:-2(기본)}" || result "SRV-006|취약|postfix debug_peer_level=${dl} (2 이상 필요)" ;;
     sendmail)
+        [ -f "$_smtp_cf" ] || { result "SRV-006|점검불가|sendmail 설정 파일(sendmail.cf)을 찾지 못함"; return; }
         # 평가기준: LogLevel 9 이상 (미설정 시 기본 9)
-        local lv=$(grep -iE "^\s*O\s+LogLevel" "$_smtp_cf" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+        local lv; lv=$(grep -iE "^[[:space:]]*O[[:space:]]+LogLevel" "$_smtp_cf" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
         [ "${lv:-9}" -ge 9 ] 2>/dev/null && result "SRV-006|양호|sendmail LogLevel=${lv:-9(기본)}" || result "SRV-006|취약|sendmail LogLevel=${lv} (9 이상 필요)" ;;
     *) result "SRV-006|수동확인|${_smtp_type:-SMTP} 로그 수준 수동 확인" ;;
     esac
@@ -1785,15 +2129,16 @@ check_SRV006() {
 # SRV-007: SMTP 보안패치
 # ================================================================
 check_SRV007() {
-    _smtp_running || { evd "SRV-007" "ps -ef 2>/dev/null | grep -E 'smtp|postfix|sendmail' | grep -v grep"; result "SRV-007|N-A|SMTP 서비스 미실행"; return; }
+    _smtp_gate SRV-007 || return
     _detect_smtp
     local ver=""
     case "$_smtp_type" in
-    postfix) ver=$(postconf -h mail_version 2>/dev/null); evd "SRV-007" "postconf mail_version 2>/dev/null" ;;
+    postfix) ver=$(postconf -h mail_version 2>/dev/null); evd "SRV-007" "postconf mail_version 2>&1" ;;
     sendmail) ver=$(sendmail -d0.1 </dev/null 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
-              [ -z "$ver" ] && ver=$(sed -n 's/^DZ\([0-9][0-9.]*\).*/\1/p' "$_smtp_cf" 2>/dev/null | head -1)
-              evd "SRV-007" "sendmail -d0.1 </dev/null 2>&1 | head -1; grep '^DZ' $_smtp_cf 2>/dev/null" ;;
-    exim) ver=$( { exim -bV 2>/dev/null || exim4 -bV 2>/dev/null; } | grep -oE 'version [0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 | awk '{print $2}'); evd "SRV-007" "exim -bV 2>/dev/null | head -1; exim4 -bV 2>/dev/null | head -1" ;;
+              [ -z "$ver" ] && [ -f "$_smtp_cf" ] && ver=$(sed -n 's/^DZ\([0-9][0-9.]*\).*/\1/p' "$_smtp_cf" 2>/dev/null | head -1)
+              evd "SRV-007" "sendmail -d0.1 </dev/null 2>&1; _smtp_cf_show '^DZ'" ;;
+    exim) ver=$( { exim -bV 2>/dev/null || exim4 -bV 2>/dev/null; } | grep -oE 'version [0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 | awk '{print $2}'); evd "SRV-007" "exim -bV 2>&1; exim4 -bV 2>&1" ;;
+    *) evd "SRV-007" "echo 'MTA 종류 미식별'" ;;
     esac
     # 평가기준 판단방법 최소 버전: Sendmail 8.14.9 / Postfix 2.5.13·2.6.10·2.7.4·2.8.3 / Exim 4.94.2 — 미만이면 알려진 취약점 미패치
     local min=""
@@ -1802,19 +2147,21 @@ check_SRV007() {
     exim) min="4.94.2" ;;
     postfix) case "$ver" in 2.5.*) min="2.5.13" ;; 2.6.*) min="2.6.10" ;; 2.7.*) min="2.7.4" ;; 2.8.*) min="2.8.3" ;; [01].*|2.[0-4].*) min="2.5.13" ;; esac ;;
     esac
-    if [ -n "$ver" ] && [ -n "$min" ] && _ver_lt "$ver" "$min"; then result "SRV-007|취약|${_smtp_type} ${ver} - 평가기준 최소 버전 ${min} 미만 (보안 패치 미적용)"
-    else result "SRV-007|수동확인|${_smtp_type} 버전=${ver:-미확인}${min:+ (평가기준 최소 ${min} 이상)} - 최신 버전·내부 패치 절차 확인"; fi
+    if [ -z "$ver" ]; then result "SRV-007|점검불가|${_smtp_type:-SMTP} 버전을 확인하지 못함 (sendmail -d0.1·postconf·exim -bV 실패) - 보안 패치 수준 확인 불가"
+    elif [ -n "$min" ] && _ver_lt "$ver" "$min"; then result "SRV-007|취약|${_smtp_type} ${ver} - 평가기준 최소 버전 ${min} 미만 (보안 패치 미적용)"
+    else result "SRV-007|수동확인|${_smtp_type} 버전=${ver}${min:+ (평가기준 최소 ${min} 이상)} - 최신 버전·내부 패치 절차 확인"; fi
 }
 
 # ================================================================
 # SRV-008: SMTP DoS 방지
 # ================================================================
 check_SRV008() {
-    _smtp_running || { evd "SRV-008" "ps -ef 2>/dev/null | grep -E 'smtp|postfix|sendmail' | grep -v grep"; result "SRV-008|N-A|SMTP 서비스 미실행"; return; }
+    _smtp_gate SRV-008 || return
     _detect_smtp
-    evd "SRV-008" "postconf message_size_limit header_size_limit default_process_limit local_destination_concurrency_limit smtpd_recipient_limit 2>/dev/null; grep -iE 'MaxDaemonChildren|ConnectionRateThrottle|MinFreeBlocks|MaxHeadersLength|MaxMessageSize' $_smtp_cf 2>/dev/null"
+    evd "SRV-008" "postconf message_size_limit header_size_limit default_process_limit local_destination_concurrency_limit smtpd_recipient_limit 2>&1; _smtp_cf_show 'MaxDaemonChildren|ConnectionRateThrottle|MinFreeBlocks|MaxHeadersLength|MaxMessageSize'"
     case "$_smtp_type" in
     postfix)
+        command -v postconf >/dev/null 2>&1 || { result "SRV-008|점검불가|postfix 실행 중이나 postconf 명령을 찾지 못함"; return; }
         # 평가기준: 5개 파라미터는 기본값이 있어 미설정도 양호, 0(해제) 이면 취약
         local p z=""
         for p in message_size_limit header_size_limit default_process_limit local_destination_concurrency_limit smtpd_recipient_limit; do
@@ -1822,9 +2169,10 @@ check_SRV008() {
         done
         [ -n "$z" ] && result "SRV-008|취약|postfix 제한 해제(0):${z}" || result "SRV-008|양호|postfix DoS 제한 파라미터 기본값/설정값 유지 (0 해제 없음)" ;;
     sendmail)
+        [ -f "$_smtp_cf" ] || { result "SRV-008|점검불가|sendmail 설정 파일(sendmail.cf)을 찾지 못함"; return; }
         local p miss=""
         for p in MaxDaemonChildren ConnectionRateThrottle MinFreeBlocks MaxHeadersLength MaxMessageSize; do
-            grep -qiE "^\s*O\s+${p}\s*=" "$_smtp_cf" 2>/dev/null || miss="${miss} ${p}"
+            grep -qiE "^[[:space:]]*O[[:space:]]+${p}[[:space:]]*=" "$_smtp_cf" 2>/dev/null || miss="${miss} ${p}"
         done
         [ -n "$miss" ] && result "SRV-008|취약|sendmail DoS 방지 파라미터 미설정:${miss}" || result "SRV-008|양호|sendmail DoS 방지 파라미터 5종 설정" ;;
     *) result "SRV-008|수동확인|${_smtp_type:-SMTP} DoS 방지 설정 수동 확인" ;;
@@ -1835,22 +2183,26 @@ check_SRV008() {
 # SRV-009: SMTP 릴레이 제한
 # ================================================================
 check_SRV009() {
-    _smtp_running || { evd "SRV-009" "ps -ef 2>/dev/null | grep -E 'smtp|postfix|sendmail' | grep -v grep"; result "SRV-009|N-A|SMTP 서비스 미실행"; return; }
+    _smtp_gate SRV-009 || return
     _detect_smtp
-    evd "SRV-009" "postconf smtpd_relay_restrictions smtpd_recipient_restrictions mynetworks 2>/dev/null; grep -iE 'promiscuous_relay|relay_entire_domain|relay_local_from' $_smtp_cf /etc/mail/sendmail.mc 2>/dev/null; sendmail -d0.1 -bv root 2>/dev/null | head -1"
+    local mc=""; [ -f /etc/mail/sendmail.mc ] && mc="/etc/mail/sendmail.mc"
+    evd "SRV-009" "postconf smtpd_relay_restrictions smtpd_recipient_restrictions mynetworks 2>&1; _smtp_cf_show 'promiscuous_relay|relay_entire_domain|relay_local_from|^[[:space:]]*V[0-9]'; ${mc:+grep -iE 'promiscuous_relay|relay_entire_domain|relay_local_from' $mc 2>&1}"
     case "$_smtp_type" in
     postfix)
-        local mn=$(postconf -h mynetworks 2>/dev/null) rr=$(postconf -h smtpd_relay_restrictions 2>/dev/null)
-        if echo "$mn $rr" | grep -qE '0\.0\.0\.0/0|static:all|\bpermit\s*(,|$)'; then result "SRV-009|취약|postfix 릴레이 전체 허용 (mynetworks=${mn})"
+        command -v postconf >/dev/null 2>&1 || { result "SRV-009|점검불가|postfix 실행 중이나 postconf 명령을 찾지 못함"; return; }
+        local mn rr; mn=$(postconf -h mynetworks 2>/dev/null); rr=$(postconf -h smtpd_relay_restrictions 2>/dev/null)
+        if echo "$mn $rr" | grep -qE '0\.0\.0\.0/0|static:all|(^|[^[:alnum:]_])permit[[:space:]]*(,|$)'; then result "SRV-009|취약|postfix 릴레이 전체 허용 (mynetworks=${mn})"
         else result "SRV-009|양호|postfix 릴레이 제한 (relay_restrictions=${rr:-기본 reject_unauth_destination})"; fi ;;
     sendmail)
+        [ -f "$_smtp_cf" ] || { result "SRV-009|점검불가|sendmail 설정 파일(sendmail.cf)을 찾지 못함"; return; }
         # 평가기준: 8.9 이상은 promiscuous_relay 비활성(기본)이면 양호, 8.9 미만은 access 파일 접근통제
         local ver; ver=$(sendmail -d0.1 -bv root 2>/dev/null | grep -oE 'Version [0-9]+\.[0-9]+' | awk '{print $2}' | head -1)
         [ -z "$ver" ] && ver=$(sed -n 's/^DZ\([0-9]*\.[0-9]*\).*/\1/p' "$_smtp_cf" 2>/dev/null | head -1)   # sendmail.cf 버전 매크로
-        if grep -qiE 'promiscuous_relay|relay_entire_domain' "$_smtp_cf" /etc/mail/sendmail.mc 2>/dev/null; then result "SRV-009|취약|sendmail promiscuous_relay/relay_entire_domain 설정"
+        if { grep -vE '^[[:space:]]*#' "$_smtp_cf"; [ -n "$mc" ] && grep -vE '^[[:space:]]*dnl' "$mc"; } 2>/dev/null | grep -qiE 'promiscuous_relay|relay_entire_domain'; then result "SRV-009|취약|sendmail promiscuous_relay/relay_entire_domain 설정"
         elif [ -n "$ver" ] && { [ "${ver%%.*}" -gt 8 ] || { [ "${ver%%.*}" -eq 8 ] && [ "${ver#*.}" -ge 9 ]; }; } 2>/dev/null; then result "SRV-009|양호|sendmail ${ver} (8.9 이상 기본 릴레이 차단)"
-        elif [ -f /etc/mail/access ]; then result "SRV-009|수동확인|sendmail ${ver:-버전 미확인} - /etc/mail/access 릴레이 접근통제 확인"
-        else result "SRV-009|취약|sendmail ${ver:-버전 미확인} (8.9 미만 추정) - access 접근통제 파일 없음"; fi ;;
+        elif [ -z "$ver" ]; then result "SRV-009|점검불가|sendmail 버전을 확인하지 못함 (sendmail -d0.1 -bv·DZ 매크로 실패) - 릴레이 기본 차단 여부 확인 불가"
+        elif [ -f /etc/mail/access ]; then result "SRV-009|수동확인|sendmail ${ver} - /etc/mail/access 릴레이 접근통제 확인"
+        else result "SRV-009|취약|sendmail ${ver} (8.9 미만) - access 접근통제 파일 없음"; fi ;;
     *) result "SRV-009|수동확인|${_smtp_type:-SMTP} 릴레이 제한 수동 확인" ;;
     esac
 }
@@ -1859,22 +2211,25 @@ check_SRV009() {
 # SRV-010: SMTP 일반사용자 실행 방지
 # ================================================================
 check_SRV010() {
-    _smtp_running || { evd "SRV-010" "ps -ef 2>/dev/null | grep -E 'smtp|postfix|sendmail' | grep -v grep"; result "SRV-010|N-A|SMTP 서비스 미실행"; return; }
+    _smtp_gate SRV-010 || return
     _detect_smtp
-    evd "SRV-010" "ls -lL \$(postconf -h command_directory 2>/dev/null)/postsuper /usr/sbin/postsuper /usr/sbin/exim /usr/sbin/exim4 2>/dev/null; grep -i PrivacyOptions $_smtp_cf 2>/dev/null"
+    evd "SRV-010" "ls -lL \$(postconf -h command_directory 2>/dev/null)/postsuper /usr/sbin/postsuper /usr/sbin/exim /usr/sbin/exim4 2>&1; _smtp_cf_show '^[[:space:]]*O[[:space:]]+PrivacyOptions'"
     case "$_smtp_type" in
     postfix)
         # 평가기준: postsuper 실행 파일 others 실행 권한 → 일반 사용자 queue 처리 가능
-        local ps="$(postconf -h command_directory 2>/dev/null)/postsuper"; [ -f "$ps" ] || ps=/usr/sbin/postsuper
-        if [ ! -f "$ps" ]; then result "SRV-010|수동확인|postsuper 실행 파일 확인 불가"
-        else local p=$(get_perm "$ps"); [ $(( ${p: -1} & 1 )) -ne 0 ] && result "SRV-010|취약|${ps} others 실행 권한 (${p})" || result "SRV-010|양호|${ps} others 실행 권한 없음 (${p})"; fi ;;
+        local ps; ps="$(postconf -h command_directory 2>/dev/null)/postsuper"; [ -f "$ps" ] || ps=/usr/sbin/postsuper
+        if [ ! -f "$ps" ]; then result "SRV-010|점검불가|postsuper 실행 파일을 찾지 못함"
+        else local p; p=$(get_perm "$ps"); [ $(( ${p: -1} & 1 )) -ne 0 ] && result "SRV-010|취약|${ps} others 실행 권한 (${p})" || result "SRV-010|양호|${ps} others 실행 권한 없음 (${p})"; fi ;;
     sendmail)
-        grep -iE '^\s*O\s+PrivacyOptions' "$_smtp_cf" 2>/dev/null | grep -qi "restrictqrun" && \
+        [ -f "$_smtp_cf" ] || { result "SRV-010|점검불가|sendmail 설정 파일(sendmail.cf)을 찾지 못함"; return; }
+        grep -iE '^[[:space:]]*O[[:space:]]+PrivacyOptions' "$_smtp_cf" 2>/dev/null | grep -qi "restrictqrun" && \
             result "SRV-010|양호|sendmail PrivacyOptions restrictqrun 설정" || \
             result "SRV-010|취약|sendmail restrictqrun 미설정" ;;
     exim)
-        local ex=$(command -v exim exim4 2>/dev/null | head -1); local p=$(get_perm "$ex")
-        [ -n "$ex" ] && [ $(( ${p: -1} & 1 )) -ne 0 ] && result "SRV-010|취약|${ex} others 실행 권한 (${p})" || result "SRV-010|양호|exim others 실행 권한 없음 (${p:-미확인})" ;;
+        local ex p; ex=$(command -v exim exim4 2>/dev/null | head -1); p=$(get_perm "$ex")
+        if [ -z "$ex" ] || [ -z "$p" ]; then result "SRV-010|점검불가|exim 실행 파일 또는 권한을 확인하지 못함"
+        elif [ $(( ${p: -1} & 1 )) -ne 0 ]; then result "SRV-010|취약|${ex} others 실행 권한 (${p})"
+        else result "SRV-010|양호|exim others 실행 권한 없음 (${p})"; fi ;;
     *) result "SRV-010|수동확인|${_smtp_type:-SMTP} 일반사용자 실행 방지 수동 확인" ;;
     esac
 }
@@ -1884,16 +2239,19 @@ check_SRV010() {
 # ================================================================
 check_SRV012() {
     # 평가기준: .netrc 내부에 아이디·패스워드 등 민감 정보 (전 계정 홈)
-    local homes f found="" sens=""
+    local homes f found="" sens="" files="" na
     homes=$(awk -F: '$6!=""{print $6}' /etc/passwd 2>/dev/null | sort -u)
-    for f in $(for h in $homes /root; do echo "${h%/}/.netrc"; done | sort -u); do
+    files=$(for h in $homes /root; do [ -d "$h" ] && echo "${h%/}/.netrc"; done | sort -u | tr '\n' ' ')   # 홈 디렉터리가 있는 계정만 (/nonexistent 등 제외)
+    evd "SRV-012" "_ls_exist $files; _netrc_show $files"
+    for f in $files; do
         [ -f "$f" ] || continue
         found="${found} ${f}"
-        grep -qiE '\b(login|password)\b' "$f" 2>/dev/null && sens="${sens} ${f}"
+        grep -qiE '(^|[^[:alnum:]_])(login|password)([^[:alnum:]_]|$)' "$f" 2>/dev/null && sens="${sens} ${f}"
     done
-    evd "SRV-012" "echo '${found:- (없음)}'"
+    na=$(_noaccess_homes | tr '\n' ' ')
     if [ -n "$sens" ]; then result "SRV-012|취약|.netrc 에 계정·비밀번호 정보:${sens}"
     elif [ -n "$found" ]; then result "SRV-012|수동확인|.netrc 파일 존재(login/password 미발견):${found} - 내용 확인"
+    elif [ -n "$(echo $na)" ]; then result "SRV-012|점검불가|열람 권한 없는 홈 디렉터리의 .netrc 확인 불가: ${na}(root 로 재점검 필요)"
     else result "SRV-012|양호|.netrc 파일 미존재"; fi
 }
 
@@ -1901,41 +2259,45 @@ check_SRV012() {
 # SRV-021: FTP 접근통제
 # ================================================================
 check_SRV021() {
-    _ftp_running || { evd "SRV-021" "ps -ef 2>/dev/null | grep -E 'vsftpd|proftpd|ftpd' | grep -v grep"; result "SRV-021|N-A|FTP 서비스 미실행"; return; }
-    evd "SRV-021" "grep -iE 'tcp_wrappers|listen_address' /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf 2>/dev/null; grep -iE 'vsftpd|ftp|ALL' /etc/hosts.allow /etc/hosts.deny 2>/dev/null; grep -iA3 '<Limit LOGIN>' /etc/proftpd/proftpd.conf /etc/proftpd.conf 2>/dev/null"
+    _ftp_running || { evd "SRV-021" "_svc_state vsftpd proftpd pure-ftpd in.ftpd ftpd; _listen_all"; result "SRV-021|N-A|FTP 서비스 미실행"; return; }
+    evd "SRV-021" "_show_cfg /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf /etc/hosts.allow /etc/hosts.deny /etc/ftpaccess.ctl /etc/ftpd/ftphosts; grep -iA3 '<Limit LOGIN>' /etc/proftpd/proftpd.conf /etc/proftpd.conf 2>&1"
     # 평가기준: 특정 IP/호스트에서만 접속하도록 접근제어
     local conf tw hw
     conf=$(ls /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf 2>/dev/null | head -1)
     if [ -n "$conf" ]; then
-        tw=$(grep -iE "^\s*tcp_wrappers" "$conf" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
-        hw=$(grep -vE '^\s*#' /etc/hosts.allow /etc/hosts.deny 2>/dev/null | grep -iE 'vsftpd|^\s*ALL\s*:' | head -2)
-        [ "${tw^^}" = "YES" ] && [ -n "$hw" ] && { result "SRV-021|양호|vsftpd tcp_wrappers=YES + hosts.allow/deny 규칙"; return; }
+        tw=$(grep -iE "^[[:space:]]*tcp_wrappers" "$conf" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
+        hw=$(_cfg /etc/hosts.allow /etc/hosts.deny | grep -iE 'vsftpd|^[[:space:]]*ALL[[:space:]]*:' | head -2)
+        [ "$(_uc "$tw")" = "YES" ] && [ -n "$hw" ] && { result "SRV-021|양호|vsftpd tcp_wrappers=YES + hosts.allow/deny 규칙"; return; }
     fi
-    grep -vE '^\s*#' /etc/proftpd/proftpd.conf /etc/proftpd.conf 2>/dev/null | grep -iA3 "<Limit LOGIN>" | grep -qiE "Allow from|Deny from" && { result "SRV-021|양호|proftpd <Limit LOGIN> 접근 IP 제한"; return; }
+    # proftpd: <Limit LOGIN> 에서 특정 주소만 Allow ('Allow from all' 은 제한 아님)
+    for f in /etc/proftpd/proftpd.conf /etc/proftpd.conf; do
+        [ -f "$f" ] || continue
+        _cfg "$f" | grep -iA6 "<Limit LOGIN>" | grep -iE "Allow[[:space:]]+from" | grep -viE "Allow[[:space:]]+from[[:space:]]+all" | grep -q . && { result "SRV-021|양호|proftpd <Limit LOGIN> 접근 IP 제한 (${f})"; return; }
+    done
     # 평가기준 판단방법(UNIX): AIX /etc/ftpaccess.ctl, HP-UX /etc/ftpd/ftphosts·ftpaccess, SOL /etc/ftpd/ftpaccess
-    evd "SRV-021" "grep -vE '^\s*(#|\$)' /etc/ftpaccess.ctl /etc/ftpd/ftphosts 2>/dev/null; grep -iE '^\s*(allow|deny|class)' /etc/ftpd/ftpaccess 2>/dev/null"
-    grep -qiE '^\s*(allow|deny)\s*:' /etc/ftpaccess.ctl 2>/dev/null && { result "SRV-021|양호|AIX /etc/ftpaccess.ctl allow/deny 설정"; return; }
-    grep -qiE '^\s*(allow|deny)\s' /etc/ftpd/ftphosts 2>/dev/null && { result "SRV-021|양호|/etc/ftpd/ftphosts allow/deny 설정"; return; }
+    grep -qiE '^[[:space:]]*(allow|deny)[[:space:]]*:' /etc/ftpaccess.ctl 2>/dev/null && { result "SRV-021|양호|AIX /etc/ftpaccess.ctl allow/deny 설정"; return; }
+    grep -qiE '^[[:space:]]*(allow|deny)[[:space:]]' /etc/ftpd/ftphosts 2>/dev/null && { result "SRV-021|양호|/etc/ftpd/ftphosts allow/deny 설정"; return; }
     result "SRV-021|수동확인|FTP 접근 IP 제한(tcp_wrappers 규칙·방화벽) 수동 확인 (vsftpd tcp_wrappers=${tw:-미설정})"
 }
 
 # ================================================================
-# SRV-037: TFTP 서비스
+# SRV-037: 취약한 FTP 서비스 비활성화 (FTPS 등 암호화 적용 시 양호)
 # ================================================================
 check_SRV037() {
     # 평가기준: FTP 서비스 활성 시 취약 (FTPS 등 통신 암호화 적용 시 양호)
-    evd "SRV-037" "ps -ef 2>/dev/null | grep -E 'vsftpd|proftpd|pure-ftpd|ftpd' | grep -v grep; ss -tln 2>/dev/null | grep ':21 '; grep -iE '^\s*(ssl_enable|force_local_logins_ssl|force_local_data_ssl)' /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf 2>/dev/null; grep -iE '^\s*TLS(Engine|Required)' /etc/proftpd/proftpd.conf /etc/proftpd/tls.conf 2>/dev/null"
+    evd "SRV-037" "_svc_state vsftpd proftpd pure-ftpd in.ftpd ftpd; _listen_all; _show_cfg /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf /etc/proftpd/proftpd.conf /etc/proftpd/tls.conf"
     _ftp_running || { result "SRV-037|양호|FTP 서비스 비활성"; return; }
     local conf
     conf=$(ls /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf 2>/dev/null | head -1)
     if [ -n "$conf" ] && is_running vsftpd; then
-        if grep -qiE '^\s*ssl_enable\s*=\s*YES' "$conf" && ! grep -qiE '^\s*force_local_logins_ssl\s*=\s*NO' "$conf"; then result "SRV-037|양호|vsftpd FTPS(ssl_enable=YES) 적용"
+        if grep -qiE '^[[:space:]]*ssl_enable[[:space:]]*=[[:space:]]*YES' "$conf" && ! grep -qiE '^[[:space:]]*force_local_logins_ssl[[:space:]]*=[[:space:]]*NO' "$conf"; then result "SRV-037|양호|vsftpd FTPS(ssl_enable=YES) 적용"
         else result "SRV-037|취약|vsftpd 평문 FTP 서비스 활성 (ssl_enable 미설정 또는 SSL 로그인 강제 해제)"; fi
     elif is_running proftpd; then
-        if grep -hiE '^\s*TLSEngine\s+on' /etc/proftpd/proftpd.conf /etc/proftpd/tls.conf 2>/dev/null | grep -q . && grep -hiE '^\s*TLSRequired\s+on' /etc/proftpd/proftpd.conf /etc/proftpd/tls.conf 2>/dev/null | grep -q .; then
+        if grep -hiE '^[[:space:]]*TLSEngine[[:space:]]+on' /etc/proftpd/proftpd.conf /etc/proftpd/tls.conf 2>/dev/null | grep -q . && grep -hiE '^[[:space:]]*TLSRequired[[:space:]]+on' /etc/proftpd/proftpd.conf /etc/proftpd/tls.conf 2>/dev/null | grep -q .; then
             result "SRV-037|양호|proftpd TLSEngine on + TLSRequired on"
         else result "SRV-037|취약|proftpd 평문 FTP 허용 (TLSRequired 미설정)"; fi
-    else result "SRV-037|취약|FTP 서비스 활성 (FTPS 적용 확인 불가 - 적용 시 수동 판정 변경)"; fi
+    elif is_running vsftpd; then result "SRV-037|점검불가|vsftpd 가 실행 중이나 vsftpd.conf 를 찾지 못해 FTPS(ssl_enable) 적용 여부 확인 불가"
+    else result "SRV-037|점검불가|FTP 서비스 활성이나 지원하는 FTP 데몬(vsftpd·proftpd)이 아니어서 FTPS 적용 여부 자동 확인 불가 - 수동 확인 필요"; fi
 }
 
 # ================================================================
@@ -1943,7 +2305,7 @@ check_SRV037() {
 # ================================================================
 check_SRV082() {
     # 평가기준: /usr /bin /sbin /etc /var 에 others 쓰기 권한이 있으면 취약
-    evd "SRV-082" "ls -alLd /usr /bin /sbin /etc /var 2>/dev/null"
+    evd "SRV-082" "ls -alLd /usr /bin /sbin /etc /var 2>&1"
     local vuln="" d p
     for d in /usr /bin /sbin /etc /var; do
         [ -e "$d" ] || continue
@@ -1959,13 +2321,22 @@ check_SRV082() {
 # ================================================================
 check_SRV083() {
     # 평가기준: 시스템 스타트업 스크립트에 others 쓰기 권한 존재 시 취약 (소유자는 참고)
-    evd "SRV-083" "ls -ld /etc/init.d /etc/rc.d /etc/rc.local 2>/dev/null; ls -la /etc/init.d/ /etc/systemd/system/*.service 2>/dev/null | head -20"
-    local vuln="" f p
+    local vuln="" f p d list="" unres="" cnt=0
+    list=$( { for d in /etc/init.d /etc/rc.d/init.d /etc/rc.d/rc2.d /etc/rc.d/rc3.d /etc/rc2.d /etc/rc3.d /sbin/init.d /sbin/rc2.d /sbin/rc3.d; do [ -d "$d" ] && ls -1 "$d" 2>/dev/null | sed "s#^#$d/#"; done; ls /etc/rc.local /etc/systemd/system/*.service /usr/lib/systemd/system/*.service /lib/systemd/system/*.service 2>/dev/null; } | sort -u)
+    _SU_LIST="$list"
+    evd "SRV-083" "echo '# 점검 대상 스타트업 스크립트: 권한 소유자 경로'; printf '%s\\n' \"\$_SU_LIST\" | while IFS= read -r f; do [ -n \"\$f\" ] && echo \"\$(get_perm \"\$f\") \$(get_owner \"\$f\") \$f\"; done"
     while IFS= read -r f; do
+        [ -n "$f" ] || continue
         [ -f "$f" ] || continue
-        p=$(get_perm "$f"); [ $(( ${p: -1} & 2 )) -ne 0 ] && vuln="${vuln} ${f}(${p}, 소유자=$(get_owner "$f"))"
-    done < <( { for d in /etc/init.d /etc/rc.d/init.d /etc/rc.d/rc2.d /etc/rc.d/rc3.d /etc/rc2.d /etc/rc3.d /sbin/init.d /sbin/rc2.d /sbin/rc3.d; do [ -d "$d" ] && ls -1 "$d" 2>/dev/null | sed "s#^#$d/#"; done; ls /etc/rc.local /etc/systemd/system/*.service 2>/dev/null; } | sort -u | head -300)
-    [ -n "$vuln" ] && result "SRV-083|취약|others 쓰기 가능 스타트업 스크립트:${vuln}" || result "SRV-083|양호|스타트업 스크립트 others 쓰기 권한 없음"
+        cnt=$((cnt+1))
+        p=$(get_perm "$f")
+        [ -z "$p" ] && { unres="${unres} ${f}"; continue; }   # 대상이 없는 심볼릭 링크 등
+        [ $(( ${p: -1} & 2 )) -ne 0 ] && vuln="${vuln} ${f}(${p}, 소유자=$(get_owner "$f"))"
+    done <<EOF
+$list
+EOF
+    if [ -n "$vuln" ]; then result "SRV-083|취약|others 쓰기 가능 스타트업 스크립트:${vuln}"
+    else result "SRV-083|양호|스타트업 스크립트 ${cnt}개 others 쓰기 권한 없음${unres:+ (권한 조회 불가 링크 $(echo $unres | wc -w)건 제외)}"; fi
 }
 
 # ================================================================
@@ -1973,34 +2344,43 @@ check_SRV083() {
 # ================================================================
 check_SRV094() {
     # 평가기준: crontab 에서 실행하는 참조 파일에 others 쓰기 권한이 있으면 취약
-    evd "SRV-094" "cat /etc/crontab /etc/cron.d/* /var/spool/cron/* /var/spool/cron/crontabs/* 2>/dev/null | grep -vE '^\s*(#|$)' | head -30"
-    local vuln="" refs f p
-    refs=$( { cat /etc/crontab /etc/cron.d/* 2>/dev/null | grep -vE '^\s*(#|$|[A-Z_]+=)' | awk '{for(i=7;i<=NF;i++) print $i}'
-              cat /var/spool/cron/* /var/spool/cron/crontabs/* 2>/dev/null | grep -vE '^\s*(#|$|[A-Z_]+=)' | awk '{for(i=6;i<=NF;i++) print $i}'
-              ls /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/* 2>/dev/null
-            } | grep -E '^/' | sort -u)
+    local sysf="/etc/crontab $(ls /etc/cron.d/* 2>/dev/null | tr '\n' ' ')" usrf="" d f refs p vuln="" n na=""
+    for d in /var/spool/cron/crontabs /var/spool/cron; do
+        [ -d "$d" ] || continue
+        [ -r "$d" ] && [ -x "$d" ] || { na="${d} 열람 권한 없음"; continue; }
+        usrf="${usrf} $(ls "$d"/* 2>/dev/null | tr '\n' ' ')"
+    done
+    refs=$( {
+        for f in $sysf; do [ -f "$f" ] && _cfg "$f" | grep -vE '^[[:space:]]*[A-Za-z_]+=' | awk '{s=7; if ($1 ~ /^@/) s=3; for(i=s;i<=NF;i++) print $i}'; done
+        for f in $usrf; do [ -f "$f" ] && _cfg "$f" | grep -vE '^[[:space:]]*[A-Za-z_]+=' | awk '{s=6; if ($1 ~ /^@/) s=2; for(i=s;i<=NF;i++) print $i}'; done
+        ls /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/* 2>/dev/null
+    } | sed 's/^[<>;|&("'"'"']*//; s/[;|&)"'"'"']*$//' | grep -E '^/' | sort -u)
+    evd "SRV-094" "_show_cfg $sysf $usrf"
+    evd "SRV-094" "echo '# 참조 파일 (권한 소유자 경로)'; _pstat $(echo $refs)"
     for f in $refs; do
         [ -f "$f" ] || continue
         p=$(get_perm "$f"); p=${p: -1}
-        [ $(( ${p:-0} & 2 )) -ne 0 ] 2>/dev/null && vuln="${vuln} ${f}"
+        [ -n "$p" ] && [ $(( p & 2 )) -ne 0 ] 2>/dev/null && vuln="${vuln} ${f}"
     done
-    local n; n=$(echo "$refs" | grep -c .)
-    [ -n "$vuln" ] && result "SRV-094|취약|crontab 참조파일 others 쓰기 권한:${vuln}" || \
-        result "SRV-094|양호|crontab 참조파일 ${n}개 others 쓰기 권한 없음"
+    n=$(echo "$refs" | grep -c .)
+    if [ -n "$vuln" ]; then result "SRV-094|취약|crontab 참조파일 others 쓰기 권한:${vuln}"
+    elif [ -n "$na" ]; then result "SRV-094|점검불가|${na} - 사용자 crontab 참조 파일 확인 불가 (root 로 재점검 필요)"
+    else result "SRV-094|양호|crontab 참조파일 ${n}개 others 쓰기 권한 없음"; fi
 }
 
 # ================================================================
 # SRV-095: 소유자/그룹 없는 파일
 # ================================================================
 check_SRV095() {
-    evd "SRV-095" "_to 60 find / \$_FP \\( -nouser -o -nogroup \\) ! -path '/proc/*' ! -path '/sys/*' -print 2>/dev/null | head -10"
-    local found="" _rc
-    found=$(set -o pipefail; _to 60 find / $_FP \( -nouser -o -nogroup \) ! -path "/proc/*" ! -path "/sys/*" ! -path "/dev/*" ! -path "/run/*" ! -path "/var/lib/docker/*" ! -path "/var/lib/containers/*" -print 2>/dev/null | head -10); _rc=$?
-    [ "$_rc" = "141" ] && _rc=0   # head 조기 종료(SIGPIPE)는 정상
-    if [ -n "$found" ]; then
-        result "SRV-095|취약|소유자/그룹 없는 파일 존재: $(echo "$found" | tr '\n' ',' | head -c 150)"
+    local found _rc cnt
+    found=$(_to 60 find / $_FP \( -nouser -o -nogroup \) ! -path "/proc/*" ! -path "/sys/*" ! -path "/dev/*" ! -path "/run/*" ! -path "/var/lib/docker/*" ! -path "/var/lib/containers/*" -print 2>/dev/null); _rc=$?
+    cnt=$(printf '%s' "$found" | grep -c .)
+    _NOUSER_LIST="$found"
+    evd "SRV-095" "echo '# find / ( -nouser -o -nogroup ) 종료코드=${_rc} (124=60초 시간 초과), 발견 ${cnt}개'; printf '%s\\n' \"\$_NOUSER_LIST\""
+    if [ "$cnt" -gt 0 ]; then
+        result "SRV-095|취약|소유자/그룹 없는 파일 ${cnt}개: $(echo "$found" | _sum 5)"
     elif [ "$_rc" = "124" ]; then
-        result "SRV-095|수동확인|파일 검색 시간 초과(60초) - 소유자 없는 파일 수동 확인"
+        result "SRV-095|점검불가|파일 검색 시간 초과(60초) - 소유자 없는 파일 확인 불가"
     else
         result "SRV-095|양호|소유자/그룹 없는 파일 없음"
     fi
@@ -2011,41 +2391,64 @@ check_SRV095() {
 # ================================================================
 check_SRV096() {
     # 평가기준: 사용자 환경 파일에 others 권한(읽기/쓰기/실행)이 하나라도 있으면 취약
-    evd "SRV-096" "for h in \$(awk -F: '\$7!~/(nologin|false)\$/{print \$6}' /etc/passwd | sort -u); do ls -l \$h/.profile \$h/.bashrc \$h/.bash_profile \$h/.kshrc \$h/.cshrc \$h/.login \$h/.*shrc 2>/dev/null; done | sort -u | head -40"
-    local vuln="" user uid homedir sh df p o
+    # 판단: 배포판 기본 환경파일은 644(others 읽기)이므로 others 쓰기 권한 또는 소유자(해당 계정·root 외) 이상만 취약, others 읽기만 있으면 근거에 표시하고 양호
+    local vuln="" ro="" gw="" user uid homedir sh df p o n=0 nf=0 hd
+    local fl=".profile .login .bash_profile .bash_login .bashrc .kshrc .cshrc .zshrc .zprofile .zshenv .bash_logout"
+    evd "SRV-096" "echo '# 로그인 가능 계정 환경파일: 권한 소유자 경로'; awk -F: '\$7!~/(nologin|false|sync|shutdown|halt)\$/ && \$6!=\"\" {print \$1\":\"\$6}' /etc/passwd | while IFS=: read -r u h; do h=\${h%/}; for f in $fl; do _pstat \"\$h/\$f\"; done; done"
     while IFS=: read -r user _ uid _ _ homedir sh; do
-        case "$sh" in *nologin|*false) continue ;; esac
-        [ -z "$homedir" ] || [ "$homedir" = "/" ] || [ ! -d "$homedir" ] && continue
-        for df in "$homedir"/.profile "$homedir"/.login "$homedir"/.bash_profile "$homedir"/.bash_login "$homedir"/.*shrc; do
+        case "$sh" in *nologin|*false|*/sync|*/shutdown|*/halt) continue ;; esac
+        [ -z "$homedir" ] && continue
+        [ "$homedir" = "/" ] && [ "$user" != "root" ] && continue
+        [ -d "$homedir" ] || continue
+        n=$((n+1)); hd="${homedir%/}"
+        for df in $fl; do
+            df="$hd/$df"
             [ -f "$df" ] || continue
+            nf=$((nf+1))
             p=$(get_perm "$df"); o=$(get_owner "$df")
-            [ "${p: -1}" != "0" ] && vuln="${vuln} ${df}(${p})"
+            [ $(( ${p: -1} & 2 )) -ne 0 ] 2>/dev/null && vuln="${vuln} ${df}(others 쓰기:${p})"
+            [ $(( ${p: -1} & 1 )) -ne 0 ] 2>/dev/null && vuln="${vuln} ${df}(others 실행:${p})"
+            [ $(( ${p: -1} & 4 )) -ne 0 ] 2>/dev/null && ro="${ro} ${df}(${p})"
+            [ $(( ${p: -2:1} & 2 )) -ne 0 ] 2>/dev/null && gw="${gw} ${df}(${p})"
             [ "$o" != "$user" ] && [ "$o" != "root" ] && vuln="${vuln} ${df}(소유자=${o})"
         done
     done < /etc/passwd
-    [ -n "$vuln" ] && result "SRV-096|취약|사용자 환경파일 others 권한/소유자 이상:${vuln}" || \
-        result "SRV-096|양호|사용자 환경파일 others 권한 없음"
+    local na; na=$(_noaccess_homes | tr '\n' ' ')
+    local note=""
+    [ -n "$ro" ] && note=" [참고: others 읽기만 있는 파일 $(echo $ro | wc -w)건(배포판 기본 644) - 쓰기 권한 없어 양호 처리]"
+    [ -n "$gw" ] && note="${note} [참고: group 쓰기 $(echo $gw | wc -w)건]"
+    if [ -n "$vuln" ]; then result "SRV-096|취약|사용자 환경파일 others 쓰기/실행 권한 또는 소유자 이상:${vuln}${note}"
+    elif [ -n "$(echo $na)" ]; then result "SRV-096|점검불가|열람 권한 없는 홈 디렉터리의 환경파일 확인 불가: ${na}(root 로 재점검 필요)${note}"
+    else result "SRV-096|양호|환경파일 ${nf}개(계정 ${n}개) others 쓰기·실행 권한 및 소유자 이상 없음${note}"; fi
 }
 
 # ================================================================
 # SRV-112: Cron 로깅 설정
 # ================================================================
 check_SRV112() {
-    evd "SRV-112" "grep -i cron /etc/rsyslog.conf /etc/rsyslog.d/*.conf /etc/syslog.conf 2>/dev/null | grep -v '^#'; grep CRONLOG /etc/default/cron 2>/dev/null"
-    local found=0
-    grep -rqiE "^\s*cron" /etc/rsyslog.conf /etc/rsyslog.d/*.conf /etc/syslog.conf 2>/dev/null && found=1
-    [ "$OS_FAMILY" = "AIX" ] && grep -vE '^\s*(#|\*)' /etc/syslog.conf 2>/dev/null | grep -qi "cron" && found=1
-    [ "$OS_FAMILY" = "SOLARIS" ] && grep -q '^CRONLOG=YES' /etc/default/cron 2>/dev/null && found=1
-    [ $found -eq 1 ] && result "SRV-112|양호|cron 로그 기록 설정 (syslog 또는 CRONLOG=YES)" || \
-        result "SRV-112|취약|cron 로그 기록 미설정"
+    local rf="/etc/rsyslog.conf $(ls /etc/rsyslog.d/*.conf 2>/dev/null | tr '\n' ' ') /etc/syslog.conf"
+    evd "SRV-112" "_show_cfg $rf /etc/default/cron; ls -l /var/log/cron /var/log/cron.log /var/adm/cron/log 2>&1; _svc_state rsyslog syslogd systemd-journald"
+    local rules u found="" explicit catch
+    u=$(_unreadable $rf) && { result "SRV-112|점검불가|syslog 설정 읽기 권한 없음: ${u}"; return; }
+    rules=$(_cfg $rf)
+    # (a) cron 전용 규칙 (cron.none 제외)  (b) cron 을 제외하지 않는 포괄 규칙(*.*, *.info 등)이 파일에 기록
+    explicit=$(echo "$rules" | grep -iE '(^|[;,[:space:]])cron\.[^n[:space:]][^[:space:]]*[[:space:]]+-?[/@]|^[[:space:]]*cron\.[^n[:space:]]')
+    catch=$(echo "$rules" | grep -E '^[[:space:]]*\*\.(\*|debug|info|notice)[^[:space:]]*[[:space:]]+-?/' | grep -vi 'cron\.none')
+    [ -n "$explicit" ] && found="cron 전용 규칙"
+    [ -z "$found" ] && [ -n "$catch" ] && found="포괄 규칙(*.* 등)으로 cron 로그 기록"
+    [ "$OS_FAMILY" = "AIX" ] || [ "$OS_FAMILY" = "HPUX" ] && [ -f /var/adm/cron/log ] && found="${found:-cron 자체 로그 /var/adm/cron/log}"
+    [ "$OS_FAMILY" = "SOLARIS" ] && grep -q '^CRONLOG=YES' /etc/default/cron 2>/dev/null && found="CRONLOG=YES"
+    [ -z "$found" ] && is_running systemd-journald && ! is_running rsyslog && [ -d /var/log/journal ] && found="journald 영구 저장(syslog 데몬 없음)"
+    [ -n "$found" ] && result "SRV-112|양호|cron 로그 기록 설정 (${found})" || \
+        result "SRV-112|취약|cron 로그 기록 미설정 (cron 전용 규칙·포괄 규칙·CRONLOG 모두 없음)"
 }
 
 # ================================================================
 # SRV-115: 로그 검토/보고
 # ================================================================
 check_SRV115() {
-    evd "SRV-115" "ls -la /var/log/messages /var/log/secure /var/log/auth.log /var/log/syslog 2>/dev/null | head -5"
-    evd "SRV-115" "last -5 2>/dev/null"
+    evd "SRV-115" "ls -la /var/log/messages /var/log/secure /var/log/auth.log /var/log/syslog 2>&1"
+    evd "SRV-115" "last -5 2>&1"
     result "SRV-115|수동확인|로그 검토 수행 여부 수동 확인"
 }
 
@@ -2055,14 +2458,13 @@ check_SRV115() {
 check_SRV134() {
     case "$OS_FAMILY" in
     SOLARIS)
-        evd "SRV-134" "grep noexec_user_stack /etc/system 2>/dev/null; sxadm status nxstack 2>/dev/null"
+        evd "SRV-134" "grep noexec_user_stack /etc/system 2>&1; sxadm status nxstack 2>&1"
         if [ "${OS_MAJOR:-10}" -ge 11 ] 2>/dev/null && sxadm status nxstack 2>/dev/null | grep -qi "enabled"; then result "SRV-134|양호|Solaris 11 sxadm nxstack enabled"
-        elif grep -qE '^\s*set\s+noexec_user_stack\s*=\s*1' /etc/system 2>/dev/null; then result "SRV-134|양호|/etc/system noexec_user_stack=1"
+        elif grep -qE '^[[:space:]]*set[[:space:]]+noexec_user_stack[[:space:]]*=[[:space:]]*1' /etc/system 2>/dev/null; then result "SRV-134|양호|/etc/system noexec_user_stack=1"
         else result "SRV-134|취약|스택 실행 방지 미설정 (noexec_user_stack / sxadm nxstack)"; fi ;;
     *)
-        evd "SRV-134" "grep -o -m1 -w nx /proc/cpuinfo 2>/dev/null"
-        if grep -q "nx" /proc/cpuinfo 2>/dev/null; then result "SRV-134|양호|CPU NX 비트 지원 (스택 실행 방지 활성)"
-        else result "SRV-134|N-A|Linux 커널 기본 NX 보호 (확인 불필요)"; fi ;;
+        evd "SRV-134" "grep -o -m1 -w nx /proc/cpuinfo 2>&1; uname -s"
+        result "SRV-134|N-A|평가대상 아님 (Solaris 전용 스택 실행 방지 항목)" ;;
     esac
 }
 
@@ -2073,12 +2475,12 @@ check_SRV135() {
     case "$OS_FAMILY" in
     SOLARIS)
         # 평가기준(Solaris): TCP_STRONG_ISS=2 양호, 0/1 취약
-        evd "SRV-135" "grep TCP_STRONG_ISS /etc/default/inetinit 2>/dev/null; ipadm show-prop -p _strong_iss tcp 2>/dev/null"
-        local v; v=$(grep -E '^\s*TCP_STRONG_ISS' /etc/default/inetinit 2>/dev/null | cut -d= -f2 | tr -d ' ')
+        evd "SRV-135" "grep TCP_STRONG_ISS /etc/default/inetinit 2>&1; ipadm show-prop -p _strong_iss tcp 2>&1"
+        local v; v=$(grep -E '^[[:space:]]*TCP_STRONG_ISS' /etc/default/inetinit 2>/dev/null | cut -d= -f2 | tr -d ' ')
         [ -z "$v" ] && v=$(ipadm show-prop -p _strong_iss -co current tcp 2>/dev/null)
-        case "$v" in 2) result "SRV-135|양호|TCP_STRONG_ISS=2" ;; 0|1) result "SRV-135|취약|TCP_STRONG_ISS=${v} (2 필요)" ;; *) result "SRV-135|수동확인|TCP_STRONG_ISS 확인 불가" ;; esac ;;
+        case "$v" in 2) result "SRV-135|양호|TCP_STRONG_ISS=2" ;; 0|1) result "SRV-135|취약|TCP_STRONG_ISS=${v} (2 필요)" ;; *) result "SRV-135|점검불가|TCP_STRONG_ISS 값을 확인하지 못함 (inetinit·ipadm 조회 실패)" ;; esac ;;
     *)
-        evd "SRV-135" "sysctl net.ipv4.tcp_syncookies net.ipv4.conf.all.accept_redirects net.ipv4.conf.all.accept_source_route 2>/dev/null"
+        evd "SRV-135" "uname -s"
         result "SRV-135|N-A|평가대상 아님 (Solaris 전용 TCP_STRONG_ISS)" ;;
     esac
 }
@@ -2087,8 +2489,8 @@ check_SRV135() {
 # SRV-147: 네트워크 모니터링 서비스
 # ================================================================
 check_SRV147() {
-    # 평가기준: 불필요한 네트워크 모니터링 서비스(SNMP 등)가 '실행 중'이면 취약 (판단방법: ps -ef | grep snmp)
-    evd "SRV-147" "ps -ef 2>/dev/null | grep -E '[s]nmpd|[t]cpdump|[t]shark|[w]ireshark|[n]map' ; which tcpdump tshark wireshark nmap 2>/dev/null"
+    # 평가기준: 불필요한 네트워크 모니터링 서비스가 '실행 중'이면 취약 — 스니핑 도구(tcpdump 등) 실행은 취약, SNMP(snmpd)는 SRV-001·003 에서 버전·접근통제를 점검하므로 여기서는 업무상 필요 여부 확인(수동확인)
+    evd "SRV-147" "_svc_state snmpd tcpdump tshark wireshark nmap dumpcap; command -v tcpdump tshark wireshark nmap 2>&1"
     local run_mon run_snmp inst=""
     run_snmp=$(_snmp_run && echo snmpd)
     run_mon=$(_comm | grep -xE 'tcpdump|tshark|wireshark|nmap|dumpcap' | sort -u | tr '\n' ' ')
@@ -2103,8 +2505,8 @@ check_SRV147() {
 # ================================================================
 check_SRV164() {
     # 평가기준: 구성원이 존재하지 않는 GID(보조 구성원도 없고 어떤 계정의 기본 그룹도 아닌 그룹) 존재 시 취약
-    evd "SRV-164" "awk -F: '\$4==\"\"{print \$1\":\"\$3}' /etc/group 2>/dev/null | head -40; awk -F: '{print \$4}' /etc/passwd | sort -u | tr '\n' ' '"
-    local umin; umin=$(awk '/^\s*GID_MIN/{print $2}' /etc/login.defs 2>/dev/null)
+    evd "SRV-164" "echo '# 구성원 목록이 빈 그룹(그룹:GID)'; awk -F: '\$4==\"\"{print \$1\":\"\$3}' /etc/group 2>&1; echo '# 계정이 기본 그룹으로 쓰는 GID'; awk -F: '{print \$4}' /etc/passwd | sort -un | tr '\n' ' '"
+    local umin; umin=$(awk '/^[[:space:]]*GID_MIN/{print $2}' /etc/login.defs 2>/dev/null)
     [ -z "$umin" ] && case "$OS_FAMILY" in AIX) umin=200 ;; SOLARIS|HPUX) umin=100 ;; *) umin=1000 ;; esac   # UNIX 신규 그룹 GID 대역
     local pg; pg=" $(awk -F: '{print $4}' /etc/passwd 2>/dev/null | sort -u | tr '\n' ' ') "
     local empty_user="" empty_sys=0 g gid mem
@@ -2122,29 +2524,48 @@ check_SRV164() {
 # SRV-166: 숨김 파일/디렉터리
 # ================================================================
 check_SRV166() {
-    evd "SRV-166" "find /home /root -maxdepth 2 -name '.*' ! -name '.bashrc' ! -name '.bash_profile' ! -name '.profile' ! -name '.bash_logout' ! -name '.ssh' ! -name '.bash_history' -type f 2>/dev/null | head -10"
-    result "SRV-166|수동확인|불필요 숨김 파일 수동 확인"
+    # 평가기준: 불필요한 숨김 파일 또는 디렉터리 — 로그인 가능 계정 홈의 최상위 숨김 항목 중 환경 표준 파일 외를 목록화
+    local h list="" l all="" n=0
+    for h in $(awk -F: '$7!~/(nologin|false|sync|shutdown|halt)$/ && $6!="" && $6!="/" {print $6}' /etc/passwd 2>/dev/null | sort -u) /root; do
+        [ -d "$h" ] && [ -r "$h" ] && [ -x "$h" ] || continue
+        n=$((n+1))
+        l=$(find "$h/." ! -name . -prune -name '.*' ! -name '.bashrc' ! -name '.bash_profile' ! -name '.bash_login' ! -name '.profile' ! -name '.bash_logout' ! -name '.ssh' ! -name '.bash_history' ! -name '.cache' ! -name '.config' ! -name '.local' ! -name '.viminfo' ! -name '.lesshst' ! -name '.sudo_as_admin_successful' ! -name '.selected_editor' ! -name '.gnupg' ! -name '.zshrc' ! -name '.kshrc' ! -name '.cshrc' ! -name '.login' ! -name '.sh_history' ! -name '.wget-hsts' ! -name '.python_history' 2>/dev/null | sed 's#/\./#/#')
+        [ -n "$l" ] && list="${list}${l}
+"
+    done
+    list=$(printf '%s' "$list" | sort -u | grep -v '^$')
+    _HIDDEN_LIST="$list"
+    local na; na=$(_noaccess_homes | tr '\n' ' ')
+    evd "SRV-166" "echo '# 점검한 홈 디렉터리 ${n}개, 표준 환경 파일 외 숨김 항목 $(printf '%s\n' "$list" | grep -c .)개 (열람 불가 홈: ${na:-없음})'; printf '%s\\n' \"\$_HIDDEN_LIST\""
+    if [ -n "$list" ]; then result "SRV-166|수동확인|표준 환경 파일 외 숨김 파일/디렉터리 $(echo "$list" | grep -c .)건: $(echo "$list" | _sum 5) - 불필요 여부 확인"
+    elif [ -n "$(echo $na)" ]; then result "SRV-166|점검불가|열람 권한 없는 홈 디렉터리 확인 불가: ${na}(root 로 재점검 필요)"
+    else result "SRV-166|양호|홈 디렉터리 ${n}개에 표준 환경 파일 외 숨김 항목 없음"; fi
 }
 
 # ================================================================
 # SRV-170: SMTP 정보 노출
 # ================================================================
 check_SRV170() {
-    _smtp_running || { evd "SRV-170" "ps -ef 2>/dev/null | grep -E 'smtp|postfix|sendmail' | grep -v grep"; result "SRV-170|N-A|SMTP 서비스 미실행"; return; }
+    _smtp_gate SRV-170 || return
     _detect_smtp
-    evd "SRV-170" "postconf smtpd_banner 2>/dev/null; grep -i SmtpGreetingMessage $_smtp_cf 2>/dev/null; exim -bP smtp_banner 2>/dev/null"
+    evd "SRV-170" "postconf smtpd_banner 2>&1; _smtp_cf_show 'SmtpGreetingMessage'; exim -bP smtp_banner 2>&1"
     case "$_smtp_type" in
     postfix)
-        local ban=$(postconf -h smtpd_banner 2>/dev/null)
+        command -v postconf >/dev/null 2>&1 || { result "SRV-170|점검불가|postfix 실행 중이나 postconf 명령을 찾지 못함"; return; }
+        local ban; ban=$(postconf -h smtpd_banner 2>/dev/null)
+        [ -z "$ban" ] && { result "SRV-170|점검불가|postconf smtpd_banner 조회 결과 없음"; return; }
         echo "$ban" | grep -qiE 'mail_version|version|[0-9]+\.[0-9]+' && result "SRV-170|취약|postfix 배너에 버전 정보 노출: ${ban}" || result "SRV-170|양호|SMTP 배너 버전 정보 노출 없음 (${ban})" ;;
     sendmail)
+        [ -f "$_smtp_cf" ] || { result "SRV-170|점검불가|sendmail 설정 파일(sendmail.cf)을 찾지 못함"; return; }
         # 평가기준: SmtpGreetingMessage 에 $v 포함 시 버전 노출 — 미설정 시 기본값('$j Sendmail $v/$Z; $b')도 노출
-        local greet=$(grep -iE "^\s*O\s+SmtpGreetingMessage" "$_smtp_cf" 2>/dev/null | tail -1)
+        local greet; greet=$(grep -iE "^[[:space:]]*O[[:space:]]+SmtpGreetingMessage" "$_smtp_cf" 2>/dev/null | tail -1)
         if [ -z "$greet" ]; then result "SRV-170|취약|SmtpGreetingMessage 미설정 (기본 인사말에 버전 \$v 포함)"
         elif echo "$greet" | grep -qE '\$v|\$Z'; then result "SRV-170|취약|sendmail 배너에 버전(\$v/\$Z) 노출"
         else result "SRV-170|양호|sendmail 배너 버전 미노출"; fi ;;
     exim)
-        exim -bP smtp_banner 2>/dev/null | grep -q 'version_number' && result "SRV-170|취약|exim smtp_banner 에 \$version_number 포함" || result "SRV-170|양호|exim 배너 버전 미노출" ;;
+        local eb; eb=$(exim -bP smtp_banner 2>/dev/null || exim4 -bP smtp_banner 2>/dev/null)
+        [ -z "$eb" ] && { result "SRV-170|점검불가|exim -bP smtp_banner 조회 실패"; return; }
+        echo "$eb" | grep -q 'version_number' && result "SRV-170|취약|exim smtp_banner 에 \$version_number 포함" || result "SRV-170|양호|exim 배너 버전 미노출" ;;
     *) result "SRV-170|수동확인|${_smtp_type:-SMTP} 배너 정보 수동 확인" ;;
     esac
 }
@@ -2153,28 +2574,31 @@ check_SRV170() {
 # SRV-171: FTP 배너 정보 노출
 # ================================================================
 check_SRV171() {
-    _ftp_running || { evd "SRV-171" "ps -ef 2>/dev/null | grep -E 'vsftpd|proftpd|ftpd' | grep -v grep"; result "SRV-171|N-A|FTP 서비스 미실행"; return; }
-    evd "SRV-171" "grep -iE 'ftpd_banner|banner_file|ServerIdent' /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf /etc/proftpd/proftpd.conf /etc/proftpd.conf 2>/dev/null"
-    local c b
+    _ftp_running || { evd "SRV-171" "_svc_state vsftpd proftpd pure-ftpd in.ftpd ftpd; _listen_all"; result "SRV-171|N-A|FTP 서비스 미실행"; return; }
+    local c b bf bt
+    c=$(ls /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf 2>/dev/null | head -1)
+    bf=$([ -n "$c" ] && grep -iE '^[[:space:]]*banner_file[[:space:]]*=' "$c" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d ' ')
+    evd "SRV-171" "_show_cfg ${c:-/etc/vsftpd.conf} /etc/proftpd/proftpd.conf /etc/proftpd.conf /etc/ftpd/ftpaccess; ${bf:+echo \"# banner_file ${bf}\"; cat ${bf} 2>&1}"
     if is_running vsftpd; then
-        c=$(ls /etc/vsftpd.conf /etc/vsftpd/vsftpd.conf 2>/dev/null | head -1)
-        b=$(grep -iE '^\s*(ftpd_banner|banner_file)\s*=' "$c" 2>/dev/null | tail -1)
-        if [ -z "$b" ]; then result "SRV-171|취약|vsftpd 배너 미설정 (기본 배너에 vsFTPd 버전 노출)"
-        elif echo "$b" | grep -qiE 'vsftpd|[0-9]+\.[0-9]+\.[0-9]+'; then result "SRV-171|취약|vsftpd 배너에 서비스명·버전 노출: ${b}"
-        else result "SRV-171|양호|vsftpd 배너 설정 (${b%%=*})"; fi
+        [ -n "$c" ] || { result "SRV-171|점검불가|vsftpd 가 실행 중이나 vsftpd.conf 를 찾지 못함"; return; }
+        b=$(grep -iE '^[[:space:]]*ftpd_banner[[:space:]]*=' "$c" 2>/dev/null | tail -1)
+        bt=""; [ -n "$bf" ] && [ -r "$bf" ] && bt=$(cat "$bf" 2>/dev/null)
+        if [ -z "$b" ] && [ -z "$bt" ]; then result "SRV-171|취약|vsftpd 배너 미설정 (기본 배너에 vsFTPd 버전 노출)"
+        elif echo "${b} ${bt}" | grep -qiE 'vsftpd|[0-9]+\.[0-9]+\.[0-9]+'; then result "SRV-171|취약|vsftpd 배너에 서비스명·버전 노출: ${b:-banner_file ${bf}}"
+        else result "SRV-171|양호|vsftpd 배너 설정 (${b:+ftpd_banner}${bt:+ banner_file ${bf}}) 서비스명·버전 미노출"; fi
     elif is_running proftpd; then
-        b=$(grep -hiE '^\s*ServerIdent' /etc/proftpd/proftpd.conf /etc/proftpd.conf 2>/dev/null | tail -1)
-        if echo "$b" | grep -qiE 'ServerIdent\s+off|ServerIdent\s+on\s+"'; then result "SRV-171|양호|proftpd ${b}"
+        b=$(grep -hiE '^[[:space:]]*ServerIdent' /etc/proftpd/proftpd.conf /etc/proftpd.conf 2>/dev/null | tail -1)
+        if echo "$b" | grep -qiE 'ServerIdent[[:space:]]+off|ServerIdent[[:space:]]+on[[:space:]]+"'; then result "SRV-171|양호|proftpd ${b}"
         else result "SRV-171|취약|proftpd ServerIdent 미설정 (기본 'ProFTPD x.y.z Server' 노출)"; fi
     elif [ -f /etc/ftpd/ftpaccess ]; then   # HP-UX·Solaris in.ftpd(wu-ftpd 계열) greeting
-        b=$(grep -iE '^\s*greeting' /etc/ftpd/ftpaccess 2>/dev/null | awk '{print tolower($2)}' | tail -1)
+        b=$(grep -iE '^[[:space:]]*greeting' /etc/ftpd/ftpaccess 2>/dev/null | awk '{print tolower($2)}' | tail -1)
         case "$b" in
         brief|terse|text) result "SRV-171|양호|ftpaccess greeting ${b} (버전 미노출)" ;;
         full) result "SRV-171|취약|ftpaccess greeting full (서비스명·버전 노출)" ;;
         *) result "SRV-171|수동확인|ftpaccess greeting 미설정 - 접속 배너 서비스명·버전 노출 확인" ;;
         esac
     else
-        [ "$OS_FAMILY" = "AIX" ] && evd "SRV-171" "dspcat /usr/lib/nls/msg/\${LANG:-C}/ftpd.cat 2>/dev/null | grep -i 'ftp server' | head -3"
+        [ "$OS_FAMILY" = "AIX" ] && evd "SRV-171" "dspcat /usr/lib/nls/msg/\${LANG:-C}/ftpd.cat 2>&1 | grep -i 'ftp server'"
         result "SRV-171|수동확인|FTP 배너 서비스명·버전 노출 수동 확인"; fi
 }
 
@@ -2182,17 +2606,20 @@ check_SRV171() {
 # SRV-173: DNS 동적 업데이트
 # ================================================================
 check_SRV173() {
-    is_running named || { evd "SRV-173" "ps -ef 2>/dev/null | grep named | grep -v grep"; result "SRV-173|N-A|DNS 서비스 미실행"; return; }
-    local nc; nc=$(_named_conf)
-    evd "SRV-173" "echo '$(echo "$nc" | grep -iE 'allow-update' | head -5)'"
-    echo "$nc" | grep -qiE 'allow-update\s*\{\s*any\s*;' && result "SRV-173|취약|DNS allow-update any 설정됨" || result "SRV-173|양호|DNS 동적 업데이트 제한됨"
+    _dns_pre SRV-173 || return
+    local au bad
+    au=$(echo "$_NC" | _dns_stmt allow-update)
+    bad=$(echo "$au" | awk -F'|' '{n=split($2,a," "); for(i=1;i<=n;i++) if (a[i]=="any" || a[i]=="0.0.0.0/0" || a[i]=="::/0") {print $1; break}}')
+    if [ -n "$bad" ]; then result "SRV-173|취약|DNS allow-update any 설정됨: $(echo "$bad" | _csv)"
+    elif [ -n "$au" ]; then result "SRV-173|양호|DNS 동적 업데이트 대상 제한: $(echo "$au" | sed "s/|/=/" | _sum 8)"
+    else result "SRV-173|양호|allow-update 미설정 (동적 업데이트 기본 거부)"; fi
 }
 
 # ================================================================
 # SRV-174: 불필요 DNS 서비스
 # ================================================================
 check_SRV174() {
-    evd "SRV-174" "ps -ef 2>/dev/null | grep -E 'named|dnsmasq' | grep -v grep | head -5"
+    evd "SRV-174" "_svc_state named dnsmasq"
     # 평가기준: DNS 서비스가 실행 중이지 않거나 업무상 필요한 경우 양호
     if is_running named || is_running dnsmasq; then
         result "SRV-174|수동확인|DNS 서비스 실행 중 - 업무 필요성 확인"
@@ -2205,37 +2632,26 @@ check_SRV174() {
 # SRV-176: 비밀번호 저장 암호화 방식
 # ================================================================
 check_SRV176() {
-    evd "SRV-176" "grep -E '^ENCRYPT_METHOD|^MD5_CRYPT_ENAB' /etc/login.defs 2>/dev/null; awk -F: '\$2!~/^[!*]/{print \$1,substr(\$2,1,3)}' /etc/shadow 2>/dev/null | head -10"
-    local algo=$(grep -E '^\s*ENCRYPT_METHOD' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
-    local weak=""
-    while IFS=: read -r user hash rest; do
-        [ -z "$hash" ] || echo "$hash" | grep -qE '^\$|^[!*]|^$' || continue
-        case "$hash" in
-            \$1\$*) weak="${weak} ${user}(MD5)" ;;
-            \$2*) ;;
-            \$5\$*) ;;
-            \$6\$*) ;;
-            \$y\$*) ;;
-            '!'*|'*'|'') ;;
-            *) weak="${weak} ${user}(DES/unknown)" ;;
-        esac
-    done < /etc/shadow 2>/dev/null
-    if [ -n "$weak" ]; then
-        result "SRV-176|취약|취약 해시 사용 계정:${weak} (기본 algo=${algo:-미설정})"
-    elif [ -n "$algo" ]; then
-        result "SRV-176|양호|비밀번호 암호화 방식=${algo}"
-    else
-        result "SRV-176|수동확인|ENCRYPT_METHOD 미설정 - shadow 해시 수동 확인"
-    fi
+    # 참고용(평가기준 평가항목 아님): shadow 해시 방식 — DES(13자)·MD5 는 취약, 해시가 없는 잠긴 계정은 제외
+    evd "SRV-176" "_hash_algs; grep -E '^[[:space:]]*(ENCRYPT_METHOD|MD5_CRYPT_ENAB)' /etc/login.defs 2>&1"
+    local u; u=$(_unreadable /etc/shadow) && { result "SRV-176|점검불가|/etc/shadow 읽기 권한 없음"; return; }
+    [ -f /etc/shadow ] || { result "SRV-176|점검불가|/etc/shadow 없음"; return; }
+    local algo weak
+    algo=$(grep -E '^[[:space:]]*ENCRYPT_METHOD' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
+    weak=$(awk -F: '$2!="" && $2!~/^[!*]/ { if ($2 ~ /^\$1\$/) print $1"(MD5)"; else if ($2 !~ /^\$/ && length($2)==13) print $1"(DES)"; else if ($2 !~ /^\$(2|5|6|y|gy)/ && $2 ~ /^\$/) print $1"(기타)" }' /etc/shadow 2>/dev/null)
+    case "$algo" in MD5|DES) weak="${weak:+$weak }[ENCRYPT_METHOD=${algo}]" ;; esac
+    if [ -n "$weak" ]; then result "SRV-176|취약|취약 해시 사용: ${weak} (기본 algo=${algo:-미설정})"
+    elif [ -n "$algo" ]; then result "SRV-176|양호|비밀번호 암호화 방식=${algo}, 취약 해시 계정 없음"
+    else result "SRV-176|양호|취약 해시 계정 없음 (ENCRYPT_METHOD 미설정)"; fi
 }
 
 # ================================================================
-# 추가 SRV 항목 (전자금융기반시설 전체 179항목 커버)
+# 참고용 SRV 항목 함수 — 평가기준 평가항목(_GUIDE_SRV 106개) 밖이거나 평가대상 아님(N-A)이라 SRV-RUN 에서 실행하지 않음 (필요 시 직접 호출)
 # ================================================================
 
 # SRV-002: 패스워드 복잡성
 check_SRV002() {
-    evd "SRV-002" "grep -E '^\s*(PASS_MIN_LEN|MINLEN)' /etc/login.defs 2>/dev/null; grep -v '^#' $(get_pam_files) 2>/dev/null | grep -iE 'pam_pwquality|pam_cracklib'; cat /etc/security/pwquality.conf 2>/dev/null | grep -v '^#' | grep -v '^\s*$'"
+    evd "SRV-002" "grep -E '^[[:space:]]*(PASS_MIN_LEN|MINLEN)' /etc/login.defs 2>/dev/null; grep -v '^#' $(get_pam_files) 2>/dev/null | grep -iE 'pam_pwquality|pam_cracklib'; cat /etc/security/pwquality.conf 2>/dev/null | grep -v '^#' | grep -v '^[[:space:]]*$'"
     local minlen="" dcredit="" ucredit="" lcredit="" ocredit=""
     for pf in $(get_pam_files); do
         [ -f "$pf" ] || continue
@@ -2243,13 +2659,13 @@ check_SRV002() {
         [ -n "$ml" ] && minlen=$ml
     done
     if [ -f /etc/security/pwquality.conf ]; then
-        [ -z "$minlen" ] && minlen=$(grep -E '^\s*minlen' /etc/security/pwquality.conf 2>/dev/null | grep -oE '[0-9]+' | head -1)
-        dcredit=$(grep -E '^\s*dcredit' /etc/security/pwquality.conf 2>/dev/null | grep -oE '[-0-9]+' | head -1)
-        ucredit=$(grep -E '^\s*ucredit' /etc/security/pwquality.conf 2>/dev/null | grep -oE '[-0-9]+' | head -1)
-        lcredit=$(grep -E '^\s*lcredit' /etc/security/pwquality.conf 2>/dev/null | grep -oE '[-0-9]+' | head -1)
-        ocredit=$(grep -E '^\s*ocredit' /etc/security/pwquality.conf 2>/dev/null | grep -oE '[-0-9]+' | head -1)
+        [ -z "$minlen" ] && minlen=$(grep -E '^[[:space:]]*minlen' /etc/security/pwquality.conf 2>/dev/null | grep -oE '[0-9]+' | head -1)
+        dcredit=$(grep -E '^[[:space:]]*dcredit' /etc/security/pwquality.conf 2>/dev/null | grep -oE '[-0-9]+' | head -1)
+        ucredit=$(grep -E '^[[:space:]]*ucredit' /etc/security/pwquality.conf 2>/dev/null | grep -oE '[-0-9]+' | head -1)
+        lcredit=$(grep -E '^[[:space:]]*lcredit' /etc/security/pwquality.conf 2>/dev/null | grep -oE '[-0-9]+' | head -1)
+        ocredit=$(grep -E '^[[:space:]]*ocredit' /etc/security/pwquality.conf 2>/dev/null | grep -oE '[-0-9]+' | head -1)
     fi
-    [ -z "$minlen" ] && minlen=$(grep -E '^\s*PASS_MIN_LEN' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
+    [ -z "$minlen" ] && minlen=$(grep -E '^[[:space:]]*PASS_MIN_LEN' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
     local has_complexity=0
     grep -v '^#' $(get_pam_files) 2>/dev/null | grep -qiE 'pam_pwquality|pam_cracklib' && has_complexity=1
     if [ "${minlen:-0}" -ge 8 ] 2>/dev/null && [ $has_complexity -eq 1 ]; then
@@ -2281,7 +2697,7 @@ check_SRV017() {
 check_SRV018() {
     evd "SRV-018" "cat /etc/pam.d/su 2>/dev/null | grep -v '^#'"
     if grep -v "^#" /etc/pam.d/su 2>/dev/null | grep -qi "pam_wheel"; then
-        local wg=$(grep -v "^#" /etc/pam.d/su 2>/dev/null | grep -i "pam_wheel" | grep -oE 'group=\S+' | cut -d= -f2 | head -1)
+        local wg=$(grep -v "^#" /etc/pam.d/su 2>/dev/null | grep -i "pam_wheel" | grep -oE 'group=[^[:space:]]+' | cut -d= -f2 | head -1)
         result "SRV-018|양호|su pam_wheel 제한 설정됨 (그룹=${wg:-wheel})"
     else
         result "SRV-018|취약|su pam_wheel 미설정 (root 외 su 제한 없음)"
@@ -2313,7 +2729,7 @@ check_SRV020() {
 
 # SRV-023: 서비스 접근 IP/Port 제한
 check_SRV023() {
-    evd "SRV-023" "cat /etc/hosts.allow 2>/dev/null | grep -v '^#' | grep -v '^\s*$'; echo '---'; cat /etc/hosts.deny 2>/dev/null | grep -v '^#' | grep -v '^\s*$'; echo '---'; iptables -L -n 2>/dev/null | head -20; firewall-cmd --list-all 2>/dev/null"
+    evd "SRV-023" "cat /etc/hosts.allow 2>/dev/null | grep -v '^#' | grep -v '^[[:space:]]*$'; echo '---'; cat /etc/hosts.deny 2>/dev/null | grep -v '^#' | grep -v '^[[:space:]]*$'; echo '---'; iptables -L -n 2>/dev/null | head -20; firewall-cmd --list-all 2>/dev/null"
     local ctrl=0
     [ -f /etc/hosts.deny ] && grep -qv "^#" /etc/hosts.deny 2>/dev/null && grep -qiE "ALL.*ALL|sshd" /etc/hosts.deny 2>/dev/null && ctrl=1
     iptables -L -n 2>/dev/null | grep -qiE "ACCEPT|DROP|REJECT" && ctrl=1
@@ -2324,7 +2740,7 @@ check_SRV023() {
 
 # SRV-024: 계정 잠금
 check_SRV024() {
-    evd "SRV-024" "grep -v '^#' $(get_pam_files) 2>/dev/null | grep -iE 'pam_tally2|pam_faillock|faillock'; cat /etc/security/faillock.conf 2>/dev/null | grep -v '^#' | grep -v '^\s*$'"
+    evd "SRV-024" "grep -v '^#' $(get_pam_files) 2>/dev/null | grep -iE 'pam_tally2|pam_faillock|faillock'; cat /etc/security/faillock.conf 2>/dev/null | grep -v '^#' | grep -v '^[[:space:]]*$'"
     local lock=0 deny=""
     for pf in $(get_pam_files) /etc/pam.d/system-auth /etc/pam.d/password-auth /etc/pam.d/common-auth; do
         [ -f "$pf" ] || continue
@@ -2332,7 +2748,7 @@ check_SRV024() {
         local d=$(grep -v "^#" "$pf" 2>/dev/null | grep -oE 'deny=[0-9]+' | head -1 | cut -d= -f2)
         [ -n "$d" ] && deny=$d
     done
-    [ -z "$deny" ] && [ -f /etc/security/faillock.conf ] && deny=$(grep -E '^\s*deny' /etc/security/faillock.conf 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    [ -z "$deny" ] && [ -f /etc/security/faillock.conf ] && deny=$(grep -E '^[[:space:]]*deny' /etc/security/faillock.conf 2>/dev/null | grep -oE '[0-9]+' | head -1)
     if [ $lock -eq 1 ] && [ "${deny:-0}" -gt 0 ] 2>/dev/null; then
         result "SRV-024|양호|계정 잠금 설정됨 (deny=${deny})"
     elif [ $lock -eq 1 ]; then
@@ -2443,7 +2859,7 @@ check_SRV038() {
 
 # SRV-039: 웹프로세스 권한
 check_SRV039() {
-    evd "SRV-039" "grep -iE '^\s*(User|Group)' /etc/httpd/conf/httpd.conf /etc/apache2/envvars /etc/apache2/apache2.conf 2>/dev/null | grep -v '^#'; ps aux 2>/dev/null | grep -E 'httpd|apache2|nginx' | head -5"
+    evd "SRV-039" "grep -iE '^[[:space:]]*(User|Group)' /etc/httpd/conf/httpd.conf /etc/apache2/envvars /etc/apache2/apache2.conf 2>/dev/null | grep -v '^#'; ps aux 2>/dev/null | grep -E 'httpd|apache2|nginx' | head -5"
     local web_running=0
     is_running httpd || is_running apache2 || is_running nginx && web_running=1
     if [ $web_running -eq 0 ]; then
@@ -2451,7 +2867,7 @@ check_SRV039() {
     fi
     local web_user=$(ps aux 2>/dev/null | grep -E 'httpd|apache2|nginx' | grep -v grep | grep -v root | awk '{print $1}' | sort -u | head -1)
     if [ "$web_user" = "root" ] || [ -z "$web_user" ]; then
-        local cfg_user=$(grep -iE '^\s*User\s' /etc/httpd/conf/httpd.conf /etc/apache2/apache2.conf 2>/dev/null | grep -v '^#' | awk '{print $NF}' | tail -1)
+        local cfg_user=$(grep -iE '^[[:space:]]*User[[:space:]]' /etc/httpd/conf/httpd.conf /etc/apache2/apache2.conf 2>/dev/null | grep -v '^#' | awk '{print $NF}' | tail -1)
         [ "$cfg_user" = "root" ] && result "SRV-039|취약|웹프로세스 root 권한 실행" || \
             result "SRV-039|수동확인|웹프로세스 실행 사용자 확인 필요 (${cfg_user:-미확인})"
     else
@@ -2512,11 +2928,11 @@ check_SRV043() {
 
 # SRV-044: 웹서비스 영역 분리
 check_SRV044() {
-    evd "SRV-044" "grep -iE '^\s*DocumentRoot' /etc/httpd/conf/httpd.conf /etc/apache2/sites-enabled/*.conf 2>/dev/null | grep -v '^#'; grep -iE '^\s*root\s' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null | grep -v '^#'"
+    evd "SRV-044" "grep -iE '^[[:space:]]*DocumentRoot' /etc/httpd/conf/httpd.conf /etc/apache2/sites-enabled/*.conf 2>/dev/null | grep -v '^#'; grep -iE '^[[:space:]]*root[[:space:]]' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null | grep -v '^#'"
     is_running httpd || is_running apache2 || is_running nginx || { result "SRV-044|N-A|웹서비스 미실행"; return; }
     local docroot=""
-    docroot=$(grep -iE '^\s*DocumentRoot' /etc/httpd/conf/httpd.conf /etc/apache2/sites-enabled/*.conf 2>/dev/null | grep -v '^#' | awk '{print $NF}' | tr -d '"' | tail -1)
-    [ -z "$docroot" ] && docroot=$(grep -iE '^\s*root\s' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null | grep -v '^#' | awk '{print $NF}' | tr -d ';' | tail -1)
+    docroot=$(grep -iE '^[[:space:]]*DocumentRoot' /etc/httpd/conf/httpd.conf /etc/apache2/sites-enabled/*.conf 2>/dev/null | grep -v '^#' | awk '{print $NF}' | tr -d '"' | tail -1)
+    [ -z "$docroot" ] && docroot=$(grep -iE '^[[:space:]]*root[[:space:]]' /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null | grep -v '^#' | awk '{print $NF}' | tr -d ';' | tail -1)
     if [ "$docroot" = "/" ]; then
         result "SRV-044|취약|DocumentRoot=/ (루트 디렉터리 설정)"
     elif [ -n "$docroot" ]; then
@@ -2540,7 +2956,7 @@ check_SRV046() {
 
 # SRV-047: 시스템 로깅 설정
 check_SRV047() {
-    evd "SRV-047" "grep -vE '^#|^\s*$' /etc/rsyslog.conf /etc/rsyslog.d/*.conf /etc/syslog.conf 2>/dev/null | head -20"
+    evd "SRV-047" "grep -vE '^#|^[[:space:]]*$' /etc/rsyslog.conf /etc/rsyslog.d/*.conf /etc/syslog.conf 2>/dev/null | head -20"
     local logging=0
     for f in /etc/rsyslog.conf /etc/rsyslog.d/*.conf /etc/syslog.conf; do
         [ -f "$f" ] || continue
@@ -2794,11 +3210,11 @@ check_SRV071() {
     local vuln=""
     for cf in /etc/httpd/conf/httpd.conf /etc/apache2/apache2.conf /etc/apache2/sites-enabled/*.conf; do
         [ -f "$cf" ] || continue
-        grep -v '^\s*#' "$cf" 2>/dev/null | grep -qi "Options.*Indexes" && vuln="${vuln} ${cf}"
+        grep -v '^[[:space:]]*#' "$cf" 2>/dev/null | grep -qi "Options.*Indexes" && vuln="${vuln} ${cf}"
     done
     for cf in /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
         [ -f "$cf" ] || continue
-        grep -v '^\s*#' "$cf" 2>/dev/null | grep -qi "autoindex.*on" && vuln="${vuln} ${cf}"
+        grep -v '^[[:space:]]*#' "$cf" 2>/dev/null | grep -qi "autoindex.*on" && vuln="${vuln} ${cf}"
     done
     [ -n "$vuln" ] && result "SRV-071|취약|디렉터리 인덱싱 활성화:${vuln}" || \
         result "SRV-071|양호|디렉터리 인덱싱 비활성화"
@@ -3005,7 +3421,7 @@ check_SRV106() {
 # SRV-107
 check_SRV107() {
     evd "SRV-107" "grep -E '^PASS_MIN_LEN|^MINLEN' /etc/login.defs 2>/dev/null; grep -iE 'pam_pwquality|pam_cracklib' $(get_pam_files) 2>/dev/null | grep -v '^#'"
-    local minlen=$(grep -E '^\s*PASS_MIN_LEN' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
+    local minlen=$(grep -E '^[[:space:]]*PASS_MIN_LEN' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
     local pam_ml=$(grep -v '^#' $(get_pam_files) 2>/dev/null | grep -oE 'minlen=[0-9]+' | head -1 | cut -d= -f2)
     local elen=${pam_ml:-${minlen:-0}}
     [ "${elen:-0}" -ge 8 ] 2>/dev/null && result "SRV-107|양호|패스워드 최소 길이=${elen}" || \
@@ -3024,7 +3440,7 @@ check_SRV110() {
 check_SRV111() {
     evd "SRV-111" "cat /etc/logrotate.conf 2>/dev/null | head -15; ls -la /etc/logrotate.d/ 2>/dev/null | head -10; du -sh /var/log 2>/dev/null"
     if [ -f /etc/logrotate.conf ]; then
-        local rotate=$(grep -E '^\s*rotate ' /etc/logrotate.conf 2>/dev/null | awk '{print $2}')
+        local rotate=$(grep -E '^[[:space:]]*rotate ' /etc/logrotate.conf 2>/dev/null | awk '{print $2}')
         result "SRV-111|수동확인|logrotate 설정됨 (보관=${rotate:-미확인}주기) - 정책 적합성 확인"
     else
         result "SRV-111|취약|logrotate 미설정 (로그 관리 부재)"
@@ -3080,7 +3496,7 @@ check_SRV117() {
 
 # SRV-119
 check_SRV119() {
-    evd "SRV-119" "rpm -qa aide tripwire 2>/dev/null; dpkg -l aide tripwire 2>/dev/null | grep '^ii'; which aide tripwire ossec-control 2>/dev/null; aide --check 2>/dev/null | head -5"
+    evd "SRV-119" "rpm -qa aide tripwire 2>&1; dpkg -l aide tripwire 2>&1 | grep '^ii'; command -v aide tripwire ossec-control 2>&1"   # aide --check(전체 무결성 검사)는 부하가 커서 실행하지 않음
     local tool=""
     command -v aide >/dev/null 2>&1 && tool="AIDE"
     command -v tripwire >/dev/null 2>&1 && tool="${tool} Tripwire"
@@ -3295,7 +3711,7 @@ check_SRV146() {
 
 # SRV-148
 check_SRV148() {
-    evd "SRV-148" "grep -i password /boot/grub2/grub.cfg /boot/grub/grub.cfg 2>/dev/null | head -5; grep -i SINGLE /etc/sysconfig/init /etc/default/grub 2>/dev/null; cat /etc/securetty 2>/dev/null | head -5"
+    evd "SRV-148" "grep -i password /boot/grub2/grub.cfg /boot/grub/grub.cfg 2>&1; grep -i SINGLE /etc/sysconfig/init /etc/default/grub 2>&1"
     local grub_pw=0
     for f in /boot/grub2/grub.cfg /boot/grub/grub.cfg /boot/efi/EFI/*/grub.cfg; do
         [ -f "$f" ] && grep -qi "password" "$f" 2>/dev/null && grub_pw=1
@@ -3374,14 +3790,18 @@ check_SRV154() {
 
 # SRV-155
 check_SRV155() {
-    evd "SRV-155" "systemctl is-active firewalld iptables ufw 2>/dev/null; iptables -L -n 2>/dev/null | head -15; ufw status 2>/dev/null"
+    evd "SRV-155" "systemctl is-active firewalld iptables ufw nftables 2>&1; iptables -L -n 2>&1; ufw status 2>&1; nft list ruleset 2>&1"
     local fw=""
     systemctl is-active firewalld >/dev/null 2>&1 && fw="firewalld"
     systemctl is-active iptables >/dev/null 2>&1 && fw="${fw} iptables"
-    ufw status 2>/dev/null | grep -qi "active" && fw="${fw} ufw"
-    iptables -L -n 2>/dev/null | grep -qvE '^Chain|^target|^$' && [ -z "$fw" ] && fw="iptables(규칙존재)"
-    [ -n "$fw" ] && result "SRV-155|양호|방화벽 활성:${fw}" || \
-        result "SRV-155|취약|방화벽 비활성 (firewalld/iptables/ufw 모두 비활성)"
+    ufw status 2>/dev/null | grep -qi "Status: active" && fw="${fw} ufw"
+    [ -z "$fw" ] && iptables -L -n 2>/dev/null | grep -qvE '^Chain|^target|^$' && fw="iptables(규칙존재)"
+    [ -z "$fw" ] && nft list ruleset 2>/dev/null | grep -qE '^[[:space:]]+(ip|tcp|udp|iif|oif|meta|ct)[[:space:]]' && fw="nftables(규칙존재)"
+    if [ -n "$fw" ]; then result "SRV-155|양호|방화벽 활성:${fw}"
+    elif [ "$_NONROOT" = 1 ]; then result "SRV-155|점검불가|방화벽 규칙 조회 권한 없음 (비root 실행) - root 로 재점검 필요"
+    elif [ -n "${_CLOUD:-}" ] && [ "${_CLOUD:-}" != "없음" ] && [ "${_CLOUD:-}" != "미확인" ]; then
+        result "SRV-155|수동확인|호스트 방화벽 비활성 - ${_CLOUD} 환경: 보안그룹(${_CLOUD_SG:-ID 미확인})의 인바운드 규칙으로 접근통제 시 양호 가능, 규칙 수동 확인 필요"
+    else result "SRV-155|취약|방화벽 비활성 (firewalld/iptables/ufw/nftables 모두 비활성)"; fi
 }
 
 # SRV-156
@@ -3426,9 +3846,9 @@ check_SRV159() {
 # SRV-160
 check_SRV160() {
     evd "SRV-160" "grep -E '^PASS_MAX_DAYS|^PASS_MIN_DAYS|^PASS_WARN_AGE|^PASS_MIN_LEN' /etc/login.defs 2>/dev/null"
-    local max=$(grep -E '^\s*PASS_MAX_DAYS' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
-    local min=$(grep -E '^\s*PASS_MIN_DAYS' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
-    local warn=$(grep -E '^\s*PASS_WARN_AGE' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
+    local max=$(grep -E '^[[:space:]]*PASS_MAX_DAYS' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
+    local min=$(grep -E '^[[:space:]]*PASS_MIN_DAYS' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
+    local warn=$(grep -E '^[[:space:]]*PASS_WARN_AGE' /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1)
     local vuln=""
     [ "${max:-99999}" -gt 90 ] 2>/dev/null && vuln="${vuln} MAX_DAYS=${max:-미설정}"
     [ "${min:-0}" -lt 1 ] 2>/dev/null && vuln="${vuln} MIN_DAYS=${min:-0}"
@@ -3499,9 +3919,214 @@ check_SRV172() {
         result "SRV-172|양호|배너에 시스템 정보 미노출"
 }
 
-# ── 실행 (SRV-001 ~ SRV-179 전체) ───────────────────────────────
+_show_cfg() {   # 증적용: 파일별 ls -l + 주석·빈 줄을 제외한 설정 내용 (없는 파일은 'No such file' 이 그대로 기록되어 부재도 증적이 됨)
+    local f
+    for f in "$@"; do
+        echo "# $f"
+        if [ -f "$f" ]; then ls -l "$f" 2>&1; _cfg "$f" 2>&1; else ls -ld "$f" 2>&1; fi
+    done
+}
+
+_svc_state() {   # 증적용: 서비스별 실행 상태(systemd·lssrc·svcs·프로세스명)와 최종 실행 판정 — 미실행도 상태로 기록
+    local s
+    for s in "$@"; do
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            echo "$s: systemd LoadState=$(systemctl show -p LoadState "$s" 2>/dev/null | sed 's/.*=//') ActiveState=$(systemctl is-active "$s" 2>&1)"
+        fi
+        command -v lssrc >/dev/null 2>&1 && lssrc -s "$s" 2>&1 | sed -n 2p
+        command -v svcs >/dev/null 2>&1 && svcs -H "$s" 2>&1
+        echo "$s: 프로세스 $(_comm | grep -cxF -e "$s")개, 실행 판정=$(is_running "$s" && echo 실행중 || echo 미실행)"
+    done
+}
+
+_listen_all() {   # 증적용: TCP LISTEN 목록 전체 (_listen 판정 근거)
+    if command -v ss >/dev/null 2>&1; then ss -tln 2>&1
+    elif command -v netstat >/dev/null 2>&1; then netstat -an 2>&1
+    else echo "ss/netstat 명령 없음 - 수신 포트 조회 불가 (프로세스 기준으로만 판정)"; fi
+}
+_portnote() { command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1 || echo " [ss/netstat 없음 - 수신 포트 미확인, 프로세스 기준]"; }
+_noaccess_homes() {   # 로그인 계정 홈 중 현재 계정으로 열람할 수 없는 디렉터리 (비root 실행 시 점검불가 판단용)
+    awk -F: '$7!~/(nologin|false|sync|shutdown|halt)$/ && $6!="" && $6!="/" {print $6}' /etc/passwd 2>/dev/null | sort -u | while read -r _h; do
+        [ -d "$_h" ] && { [ -x "$_h" ] && [ -r "$_h" ] || echo "$_h"; }
+    done
+}
+
+_sum() {   # 긴 목록 요약: 표준입력 줄을 쉼표로 이어 max(기본 10)개까지만, 나머지는 '외 N건(증적 참조)'
+    awk -v m="${1:-10}" 'NF {n++; if (n<=m) printf "%s%s", (n>1?",":""), $0} END {if (n>m) printf " 외 %d건(증적 참조)", n-m}'
+}
+
+_show_exist() {   # 증적용: 여러 경로 중 존재하는 파일은 내용(주석 제외)을, 없는 경로는 목록으로 기록
+    local f n=0 e=0 miss=""
+    for f in "$@"; do
+        n=$((n+1))
+        if [ -e "$f" ]; then e=$((e+1)); _show_cfg "$f"; else miss="${miss} ${f}"; fi
+    done
+    echo "# 점검 경로 ${n}개 중 존재 ${e}개"
+    [ -n "$miss" ] && echo "# 미존재:${miss}"
+    return 0
+}
+
+_ls_exist() {   # 증적용: 여러 경로 중 존재하는 파일은 ls -l 로, 없는 경로는 목록으로 기록 (파일 내용은 기록하지 않음)
+    local f n=0 e="" miss=""
+    for f in "$@"; do n=$((n+1)); if [ -e "$f" ]; then e="${e} ${f}"; else miss="${miss} ${f}"; fi; done
+    echo "# 점검 경로 ${n}개 중 존재 $(echo $e | wc -w)개"
+    [ -n "$e" ] && ls -l $e 2>&1
+    [ -n "$miss" ] && echo "# 미존재:${miss}"
+    return 0
+}
+_pw_status() {   # 증적용: 계정별 비밀번호 필드 상태 (해시 값은 출력하지 않음)
+    case "$OS_FAMILY" in
+    AIX)
+        echo "# /etc/security/passwd"
+        awk '/^[^ \t*#][^ \t]*:[ \t]*$/{sub(/:.*/,"");u=$0;next} /^[ \t]+password[ \t]*=/{v=$0;sub(/^[^=]*=[ \t]*/,"",v);sub(/[ \t]+$/,"",v); print u": " (v==""?"비밀번호 공란":"설정됨")}' /etc/security/passwd 2>&1 ;;
+    *)
+        local f=/etc/shadow; [ -e "$f" ] || f=/etc/passwd
+        echo "# $f"
+        awk -F: '{s=($2==""?"비밀번호 공란":($2=="x"?"shadow 파일로 위임":(($2 ~ /^[!*]/ || $2=="NP" || $2=="LK")?"잠김/비활성":"설정됨"))); print $1": "s}' "$f" 2>&1
+        [ "$OS_FAMILY" = "SOLARIS" ] || [ "$OS_FAMILY" = "HPUX" ] && { echo "# logins -p"; logins -p 2>&1; } ;;
+    esac
+    return 0
+}
+
+_tmout_scan() {   # 파일별 TMOUT 대입 (파일:값) — 주석 제외, export·readonly·typeset 접두 허용, $((a*b)) 계산식은 값으로 평가
+    local f line v
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        grep -E '(^|[[:space:];])TMOUT=' "$f" 2>/dev/null | grep -vE '^[[:space:]]*#' | while IFS= read -r line; do
+            v=$(printf '%s' "$line" | sed -n 's/.*TMOUT=\([^[:space:];]*\).*/\1/p' | tr -d "\"'")
+            case "$v" in
+            ''|*[!0-9*+/\(\)\$\ -]*) ;;
+            *) case "$v" in \$\(\(*\)\)) v=$(eval "echo $v" 2>/dev/null) ;; esac ;;
+            esac
+            printf '%s:%s\n' "$f" "$v"
+        done
+    done
+}
+
+_tmout_lines() {   # 증적용: TMOUT 설정 줄 (파일:줄번호:내용, 주석 제외)
+    local f
+    for f in "$@"; do [ -f "$f" ] && grep -nH -iE 'TMOUT' "$f" 2>&1 | grep -vE '^[^:]*:[0-9]+:[[:space:]]*#'; done
+    return 0
+}
+
+_strip_c_comments() {   # named.conf 주석(/* */, //, #) 제거 후 내용이 있는 줄만 출력
+    awk 'BEGIN{inc=0}
+    { line=$0; res=""
+      while (length(line)>0) {
+        if (inc) { e=index(line,"*/"); if (e==0) { line=""; break } line=substr(line,e+2); inc=0; continue }
+        a=index(line,"/*"); b=index(line,"//"); c=index(line,"#"); m=0; t=""
+        if (a>0) { m=a; t="b" }
+        if (b>0 && (m==0 || b<m)) { m=b; t="l" }
+        if (c>0 && (m==0 || c<m)) { m=c; t="l" }
+        if (m==0) { res=res line; line=""; break }
+        res=res substr(line,1,m-1)
+        if (t=="l") { line=""; break }
+        line=substr(line,m+2); inc=1
+      }
+      if (res ~ /[^ \t]/) print res }'
+}
+
+_named_load() {   # named 설정을 전역 _NC(주석 제거된 내용), _NC_SRC(출처)에 읽어 둔다. 설정을 못 찾으면 비어 있음, 읽지 못하면 _NC_ERR
+    local c i out
+    _NC=""; _NC_SRC=""; _NC_ERR=""
+    for c in /etc/named.conf /etc/bind/named.conf /var/named/chroot/etc/named.conf /etc/namedb/named.conf /usr/local/etc/namedb/named.conf; do
+        [ -f "$c" ] || continue
+        _NC_SRC="$c"
+        [ -r "$c" ] || { _NC_ERR="$c 읽기 권한 없음"; return 0; }
+        if command -v named-checkconf >/dev/null 2>&1; then
+            out=$(named-checkconf -p "$c" 2>/dev/null)
+            if [ -n "$out" ]; then _NC="$out"; _NC_SRC="named-checkconf -p $c (include 포함 유효 설정)"; return 0; fi
+        fi
+        # named-checkconf 없음/실패: named.conf 와 include 파일을 직접 읽고 주석 제거
+        _NC=$( { cat "$c"; for i in $(sed -n 's/^[[:space:]]*include[[:space:]]*"\([^"]*\)".*/\1/p' "$c" 2>/dev/null); do cat "$i" 2>/dev/null; done; cat /etc/bind/named.conf.options /etc/bind/named.conf.local 2>/dev/null; } | _strip_c_comments)
+        _NC_SRC="$c + include 파일 (주석 제거)"
+        return 0
+    done
+    return 0
+}
+
+_dns_stmt() {   # 표준입력 named 설정에서 문장 $1 의 값을 'ctx|값' 으로 출력 (ctx = 포함 블록 머리글, 목록은 항목을 공백으로 연결)
+    awk -v NAME="$1" '
+    { gsub(/\{/," { "); gsub(/\}/," } "); gsub(/;/," ; "); n=split($0,t," "); for(i=1;i<=n;i++) tok[++N]=t[i] }
+    END {
+        d=0; hdr=""
+        for (i=1;i<=N;i++) {
+            x=tok[i]
+            if (x=="{") { d++; ctx[d]=hdr; hdr=""; continue }
+            if (x=="}") { d--; hdr=""; continue }
+            if (x==";") { hdr=""; continue }
+            if (hdr=="" && x==NAME && d>=1) {
+                j=i+1; v=""
+                if (tok[j]=="{") { j++; while (j<=N && tok[j]!="}") { if (tok[j]!=";") v=v (v==""?"":" ") tok[j]; j++ } }
+                else { while (j<=N && tok[j]!=";" && tok[j]!="}") { v=v (v==""?"":" ") tok[j]; j++ } }
+                print ctx[d] "|" v; i=j; hdr=""; continue
+            }
+            hdr=hdr (hdr==""?"":" ") x
+        }
+    }'
+}
+
+_dns_pre() {   # DNS 항목 공통 선행 처리: 미실행 N-A / 설정 미발견·읽기 불가 점검불가. 계속 진행해도 되면 0
+    local id="$1" na="${2:-N-A}"
+    _named_load
+    evd "$id" "_svc_state named; echo '# 설정 출처: ${_NC_SRC:-named.conf 미발견}'; printf '%s\\n' \"\$_NC\""
+    is_running named || { result "${id}|${na}|DNS 서비스 미실행"; return 1; }
+    [ -n "$_NC_ERR" ] && { result "${id}|점검불가|named.conf 읽기 불가: ${_NC_ERR}"; return 1; }
+    [ -z "$_NC" ] && { result "${id}|점검불가|named 가 실행 중이나 named.conf(/etc/named.conf·/etc/bind/named.conf 등)를 찾지 못함 - 설정 확인 불가"; return 1; }
+    return 0
+}
+
+_hash_algs() {   # 증적용: 계정별 비밀번호 해시 알고리즘 (해시 값 자체는 출력하지 않음)
+    local f=/etc/shadow
+    echo "# $f"
+    awk -F: '{h=$2; a=(h==""?"비밀번호 공란":(h ~ /^[!*]/?"잠김/비활성":(h ~ /^\$1\$/?"MD5($1$)":(h ~ /^\$5\$/?"SHA-256($5$)":(h ~ /^\$6\$/?"SHA-512($6$)":(h ~ /^\$y\$/?"yescrypt($y$)":(h ~ /^\$2/?"bcrypt($2)":(h ~ /^\$(md5|sunmd5)\$/?"Solaris MD5":(length(h)==13?"DES(crypt 13자)":"기타")))))))));  print $1": "a}' "$f" 2>&1
+}
+
+_pstat() {   # 증적용: 파일마다 '권한 소유자 경로' 한 줄 (get_perm·get_owner 와 같은 방식)
+    local f
+    for f in "$@"; do [ -e "$f" ] || [ -L "$f" ] && echo "$(get_perm "$f") $(get_owner "$f") $f"; done
+    return 0
+}
+
+_umask_scan() {   # 파일별 umask 대입 '파일: 값' (주석 제외, umask 키워드 뒤의 8진수만 값으로 인정)
+    local f
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        awk -v f="$f" '
+            /^[[:space:]]*#/ {next}
+            tolower($1)=="umask" && $2 ~ /^[0-7]+$/ {print f": "$2; next}
+            $1 ~ /^[Uu][Mm][Aa][Ss][Kk]=[0-7]+/ {v=$1; sub(/^[^=]*=/,"",v); print f": "v}' "$f" 2>/dev/null
+    done
+    return 0
+}
+
+_smtp_gate() {   # SMTP 항목 공통: 미실행이면 N-A 결과를 내고 1 반환 (계속 진행하면 0)
+    _smtp_running && return 0
+    evd "$1" "_svc_state sendmail postfix exim exim4; _listen_all"
+    result "${1}|N-A|SMTP 서비스 미실행"
+    return 1
+}
+
+_smtp_cf_show() {   # 증적용: MTA 설정 파일 존재·권한과 지정 키워드 줄 (인자: 정규식)
+    if [ -n "$_smtp_cf" ] && [ -f "$_smtp_cf" ]; then ls -l "$_smtp_cf" 2>&1; grep -iE "$1" "$_smtp_cf" 2>&1
+    else echo "MTA(${_smtp_type:-미식별}) 설정 파일을 찾지 못함"; fi
+    return 0
+}
+
+_netrc_show() {   # 증적용: .netrc 항목 (machine/login 은 기록, password·account 값은 마스킹)
+    local f
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        echo "# $f"; ls -l "$f" 2>&1
+        [ -r "$f" ] && awk '{for(i=1;i<NF;i++) if ($i=="password" || $i=="passwd" || $i=="account") $(i+1)="***"; print}' "$f" 2>&1
+    done
+    return 0
+}
+
+# <<< SRV-COMMON-END
+# ── 실행: 평가기준 평가항목(_GUIDE_SRV 106개)만 실행 — 결과에 나오지 않는 평가기준 밖 항목은 실행하지 않음 (평가대상 아님 N-A 는 점검 없이 N-A 처리) ──
+# >>> SRV-RUN-BEGIN — 원본: server/check_server_srv.sh. 사본(webwas/check_webwas.sh)은 python tools/sync_common.py 로 갱신
 check_SRV001
-check_SRV002
 check_SRV003
 check_SRV004
 check_SRV005
@@ -3516,68 +4141,38 @@ check_SRV013
 check_SRV014
 check_SRV015
 check_SRV016
-check_SRV017
-check_SRV018
-check_SRV019
-check_SRV020
+evd "SRV-018" "uname -s"
+result "SRV-018|N-A|불필요한 하드디스크 기본 공유 비활성화 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-020" "uname -s"
+result "SRV-020|N-A|공유 기능에 대한 접근통제 설정 적절성 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV021
 check_SRV022
-check_SRV023
-check_SRV024
+evd "SRV-023" "uname -s"
+result "SRV-023|N-A|원격 터미널 서비스의 암호화 설정 적절성 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-024" "uname -s"
+result "SRV-024|N-A|취약한 Telnet 인증 방식 사용 제한 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV025
 check_SRV026
 check_SRV027
 check_SRV028
-check_SRV029
-check_SRV030
-check_SRV031
-check_SRV032
-check_SRV033
+evd "SRV-029" "uname -s"
+result "SRV-029|N-A|SMB 세션 중단 관리 설정 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-031" "uname -s"
+result "SRV-031|N-A|계정 목록 및 네트워크 공유 이름 노출 방지 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV034
 check_SRV035
-check_SRV036
 check_SRV037
-check_SRV038
-check_SRV039
-check_SRV040
-check_SRV041
-check_SRV042
-check_SRV043
-check_SRV044
-check_SRV045
-check_SRV046
-check_SRV047
-check_SRV048
-check_SRV049
-check_SRV050
-check_SRV051
-check_SRV052
-check_SRV053
-check_SRV054
-check_SRV055
-check_SRV056
-check_SRV057
-check_SRV058
-check_SRV059
-check_SRV060
-check_SRV061
 check_SRV062
 check_SRV063
 check_SRV064
-check_SRV065
 check_SRV066
-check_SRV067
-check_SRV068
 check_SRV069
 check_SRV070
-check_SRV071
 evd "SRV-072" "uname -s"
 result "SRV-072|N-A|Windows 전용 항목 (Linux/Unix 해당 없음)"
 check_SRV073
 check_SRV074
 check_SRV075
-check_SRV076
-check_SRV077
 evd "SRV-078" "uname -s"
 result "SRV-078|N-A|Windows Guest 계정 (Linux/Unix 해당 없음)"
 evd "SRV-079" "uname -s"
@@ -3588,11 +4183,7 @@ check_SRV081
 check_SRV082
 check_SRV083
 check_SRV084
-check_SRV085
-check_SRV086
 check_SRV087
-check_SRV088
-check_SRV089
 evd "SRV-090" "uname -s"
 result "SRV-090|N-A|Windows 원격 레지스트리 (Linux/Unix 해당 없음)"
 check_SRV091
@@ -3601,103 +4192,97 @@ check_SRV093
 check_SRV094
 check_SRV095
 check_SRV096
-check_SRV097
-check_SRV098
-check_SRV099
-check_SRV100
-check_SRV101
-check_SRV102
-check_SRV103
-check_SRV104
-check_SRV105
-check_SRV106
-check_SRV107
+evd "SRV-097" "uname -s"
+result "SRV-097|N-A|FTP 서비스 디렉터리 접근권한 설정 적절성 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-101" "uname -s"
+result "SRV-101|N-A|불필요한 예약 작업 제거 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-103" "uname -s"
+result "SRV-103|N-A|LAN Manager 인증 수준 적절성 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-104" "uname -s"
+result "SRV-104|N-A|보안 채널 데이터 디지털 암호화 또는 서명 기능 설정 적절성 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-105" "uname -s"
+result "SRV-105|N-A|불필요한 시작프로그램 제거 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV108
 check_SRV109
-check_SRV110
-check_SRV111
 check_SRV112
-check_SRV113
-check_SRV114
 check_SRV115
-check_SRV116
-check_SRV117
+evd "SRV-116" "uname -s"
+result "SRV-116|N-A|“보안 감사를 수행할 수 없는 경우, 즉시 시스템 종료” 기능 비활성화 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV118
-check_SRV119
-check_SRV120
+evd "SRV-119" "uname -s"
+result "SRV-119|N-A|백신 프로그램 업데이트 적용 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV121
 check_SRV122
-check_SRV123
-check_SRV124
+evd "SRV-123" "uname -s"
+result "SRV-123|N-A|최종 로그인 사용자 계정 노출 방지 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 evd "SRV-125" "uname -s"
 result "SRV-125|N-A|Windows 화면 보호기 (Linux/Unix 해당 없음)"
-check_SRV126
+evd "SRV-126" "uname -s"
+result "SRV-126|N-A|자동 로그온 방지 설정 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV127
-check_SRV128
-check_SRV129
-check_SRV130
+evd "SRV-128" "uname -s"
+result "SRV-128|N-A|NTFS 파일 시스템 사용 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-129" "uname -s"
+result "SRV-129|N-A|백신 프로그램 설치 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV131
-check_SRV132
 check_SRV133
 check_SRV134
 check_SRV135
-check_SRV136
-check_SRV137
-check_SRV138
-check_SRV139
-check_SRV140
-check_SRV141
+evd "SRV-136" "uname -s"
+result "SRV-136|N-A|로그온 단계에서 시스템 종료 기능 비활성화 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-137" "uname -s"
+result "SRV-137|N-A|네트워크 서비스 접근 권한 적절성 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-138" "uname -s"
+result "SRV-138|N-A|백업 및 복구 권한 설정 적절성 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-139" "uname -s"
+result "SRV-139|N-A|시스템 자원 소유권 변경 권한 설정 적절성 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-140" "uname -s"
+result "SRV-140|N-A|이동식 미디어 포맷 및 꺼내기 허용 정책 설정 적절성 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV142
-check_SRV143
 check_SRV144
-check_SRV145
-check_SRV146
 check_SRV147
-check_SRV148
-check_SRV149
-check_SRV150
-check_SRV151
-check_SRV152
-check_SRV153
-check_SRV154
-check_SRV155
-check_SRV156
-check_SRV157
+evd "SRV-149" "uname -s"
+result "SRV-149|N-A|디스크 볼륨 암호화 적용 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-150" "uname -s"
+result "SRV-150|N-A|로컬 로그온 허용 계정 제한 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-151" "uname -s"
+result "SRV-151|N-A|익명 SID/이름 변환 설정 제한 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
+evd "SRV-152" "uname -s"
+result "SRV-152|N-A|원격터미널 접속 가능한 사용자 그룹 제한 여부 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV158
-check_SRV159
-check_SRV160
 check_SRV161
-check_SRV162
 check_SRV163
 check_SRV164
 check_SRV165
 check_SRV166
-check_SRV167
-check_SRV168
-check_SRV169
 check_SRV170
 check_SRV171
-check_SRV172
+evd "SRV-172" "uname -s"
+result "SRV-172|N-A|불필요한 시스템 자원 공유 제거 - 평가기준 평가대상 아님 (Linux/Unix 해당 없음)"
 check_SRV173
 check_SRV174
 check_SRV175
-check_SRV176
 check_SRV177
 evd "SRV-178" "uname -s"
 result "SRV-178|N-A|Windows 개인 키 passphrase (Linux/Unix 해당 없음)"
 check_SRV179
+# <<< SRV-RUN-END
 
-_TOTAL=$((_CP + _CF + _CM + _CN))
+_TOTAL=$((_CP + _CF + _CM + _CN + _CU))
+_DEN=$((_TOTAL - _CN))   # 비율 분모는 평가대상 아님(N-A)을 제외
 echo "# ================================================================"
 echo "# 점검 요약 — 전자금융기반시설 (SRV)"
 echo "#   총 점검 항목: ${_TOTAL}"
 [ "$_TOTAL" -gt 0 ] 2>/dev/null && {
-echo "#   양호:         ${_CP}  ($((_CP * 100 / _TOTAL))%)"
-echo "#   취약:         ${_CF}  ($((_CF * 100 / _TOTAL))%)"
+echo "#   양호:         ${_CP}  ($([ "$_DEN" -gt 0 ] && echo $((_CP * 100 / _DEN)) || echo 0)%, N-A 제외 ${_DEN}건 기준)"
+echo "#   취약:         ${_CF}  ($([ "$_DEN" -gt 0 ] && echo $((_CF * 100 / _DEN)) || echo 0)%)"
 echo "#   수동확인:     ${_CM}"
+echo "#   점검불가:     ${_CU}"
 echo "#   N-A:          ${_CN}"
 }
 echo "# ================================================================"
+echo "# 점검 완료: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "# 증적 파일: ${_EVD}"
 [ -n "$_RESF" ] && echo "# 결과 파일(자동 저장): ${_RESF}  ← 증적 파일과 함께 회수"
 [ -n "$_TEEPID" ] && { exec >&- 2>/dev/null; wait "$_TEEPID" 2>/dev/null; sleep 1; }
 exit 0
