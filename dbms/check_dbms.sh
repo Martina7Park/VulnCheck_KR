@@ -38,19 +38,24 @@
 #   1) 표준출력 — 파이프 구분자 결과 (파일로 리다이렉트)
 #      형식: DBM-항목코드|결과|근거설명
 #      결과: 양호 / 취약 / 수동확인 / N-A
-#   2) 증적 파일 — /tmp/<호스트명>_dbms_evidence.txt
+#   2) 증적 파일 — /tmp/<호스트명>_<DBMS종류>_dbms_evidence.txt (권한 600, 결과 사본 /tmp/<호스트명>_<DBMS종류>_dbms.txt)
 #      점검 중 실행한 쿼리·명령어·출력·판정 근거가 타임스탬프와 함께 기록됨
 #
 # ================================================================
+
+# Solaris /usr/bin 의 awk·grep 은 -v·tolower·-E 미지원 → XPG4·GNU 도구 우선 / HP-UX ps -o 는 UNIX95 필요
+case "$(uname -s 2>/dev/null)" in SunOS) PATH="/usr/xpg4/bin:/usr/gnu/bin:/opt/csw/gnu:$PATH" ;; HP-UX) export UNIX95=1 ;; esac
 
 # ── DBMS 자동 탐지 ──────────────────────────────────────────────
 _proc_has() { { ps -e -o comm= 2>/dev/null || cat /proc/[0-9]*/comm 2>/dev/null; } | sed 's#.*/##' | grep -qE "^($1)\$"; }
 # 프로세스 이름(경로 제외)이 정확히 일치하는 첫 프로세스의 소유 계정 — 래퍼(mysqld_safe·mariadbd-safe)·'logger -t mysqld'·sudo/su 부모(root) 오인 방지
 _proc_user() { UNIX95=1 ps -e -o user= -o comm= 2>/dev/null | awk -v P="^($1)\$" '{n=$2; sub(/.*\//,"",n)} n ~ P {print $1; exit}'; }
+# 다른 계정으로 셸 명령 실행 — su -s 는 Linux 전용 (AIX·Solaris·HP-UX 는 계정의 기본 셸 사용)
+_su_sh() { case "$OS_FAMILY" in LINUX) su "$1" -s /bin/sh -c "$2" ;; *) su "$1" -c "$2" ;; esac; }
 detect_dbms() {
     [ -n "$DBMS_TYPE" ] && return
     # 실행 중인 DB 프로세스 우선 (클라이언트만 설치된 서버·환경변수 없는 root/sudo 실행 대응)
-    _proc_has 'ora_pmon_.*' && DBMS_TYPE="oracle" && return
+    { _proc_has 'ora_pmon_.*' || ps -ef 2>/dev/null | grep -q '[o]ra_pmon_'; } && DBMS_TYPE="oracle" && return
     _proc_has 'tbsvr.*' && DBMS_TYPE="tibero" && return
     _proc_has 'mariadbd|mysqld' && DBMS_TYPE="mysql" && return
     _proc_has 'postgres|postmaster' && DBMS_TYPE="pgsql" && return
@@ -90,13 +95,13 @@ detect_os
 get_perm() {
     local f="$1"
     case "$OS_FAMILY" in
-    AIX|SOLARIS|HPUX) ls -lL "$f" 2>/dev/null | awk '{k=0;for(i=2;i<=10;i++){c=substr($1,i,1);if(c!="-")k+=2^(10-i)}printf "%o\n",k}' ;;   # istat 은 Protection: rw-r--r-- 형식이라 숫자 없음
+    AIX|SOLARIS|HPUX) ls -ldL "$f" 2>/dev/null | awk 'NR==1{k=0;for(i=2;i<=10;i++){c=substr($1,i,1);if(c!="-")k+=2^(10-i)}printf "%o\n",k}' ;;   # istat 은 Protection: rw-r--r-- 형식이라 숫자 없음, -d: 디렉터리 자체
     *)       stat -L -c "%a" "$f" 2>/dev/null ;;
     esac
 }
 # _perm_bad <권한(8진)> <금지 비트(8진, 예 022)> → 금지 비트가 있으면 참 (setuid 등 특수 비트는 제외하고 뒤 3자리만)
 _perm_bad() {
-    local p="${1: -3}"
+    local p; p=$(printf '%03o' "$((8#${1:-0}))" 2>/dev/null); p="${p: -3}"
     [ -z "$p" ] && return 0
     (( (8#$p & 8#$2) != 0 ))
 }
@@ -105,7 +110,8 @@ _perm_check() {
     local mask="$1" f p; shift; _PC_FOUND=0; _PC_BAD=""
     for f in "$@"; do
         [ -e "$f" ] || continue
-        _PC_FOUND=$((_PC_FOUND+1)); p=$(get_perm "$f")
+        p=$(get_perm "$f"); [ -z "$p" ] && continue   # 권한 조회 실패(파일 소멸 등)는 위반으로 집계하지 않음
+        _PC_FOUND=$((_PC_FOUND+1))
         _perm_bad "$p" "$mask" && _PC_BAD="${_PC_BAD}${f}(${p}) "
     done
     return 0
@@ -114,7 +120,7 @@ _perm_check() {
 get_owner() {
     local f="$1"
     case "$OS_FAMILY" in
-    AIX|SOLARIS|HPUX) ls -lL "$f" 2>/dev/null | awk '{print $3}' ;;   # istat Owner: 0(root) 형식 회피
+    AIX|SOLARIS|HPUX) ls -ldL "$f" 2>/dev/null | awk 'NR==1{print $3}' ;;   # istat Owner: 0(root) 형식 회피
     *)       stat -c "%U" "$f" 2>/dev/null ;;
     esac
 }
@@ -148,8 +154,13 @@ case "$(echo "$_KMODE" | tr 'A-Z' 'a-z')" in
 3|all) _KMODE="all" ;;
 *) echo "사용법: $0 [ef|mi|all]  (ef=전자금융, mi=주요정보 2026 상세가이드, all=둘 다)" >&2; exit 1 ;;
 esac
-_RESF="/tmp/${HN}_dbms.txt"
-if [ -z "$NO_RESULT_COPY" ] && ! [ /dev/fd/1 -ef "$_RESF" ] 2>/dev/null && ( : > "$_RESF" ) 2>/dev/null; then
+# /tmp 고정 경로 파일 생성: 심볼릭 링크·다른 계정 소유 기존 파일이면 거부 (root 실행 시 링크 대상 덮어쓰기 방지), 새 파일은 O_EXCL(set -C)·600
+_safe_out() {
+    if [ -L "$1" ] || { [ -e "$1" ] && [ ! -O "$1" ]; }; then return 1; fi
+    rm -f "$1" 2>/dev/null; ( set -C; umask 077; : > "$1" ) 2>/dev/null
+}
+_RESF="/tmp/${HN}_${DBMS_TYPE}_dbms.txt"
+if [ -z "$NO_RESULT_COPY" ] && ! [ /dev/fd/1 -ef "$_RESF" ] 2>/dev/null && _safe_out "$_RESF"; then
     exec > >(tee "$_RESF"); _TEEPID=$!
 else
     _RESF=""
@@ -177,10 +188,10 @@ echo "# ================================================================"
 
 _CP=0; _CF=0; _CM=0; _CN=0
 
-_EVD="/tmp/${HN}_dbms_evidence.txt"
-# 증적 파일 쓰기 불가(다른 사용자 소유 기존 파일 — /tmp sticky·protected_regular 등) → 대체 경로
-if ! ( : >> "$_EVD" ) 2>/dev/null; then
-    _EVD=$(mktemp "${TMPDIR:-/tmp}/${HN}_dbms_evidence.XXXXXX" 2>/dev/null || echo "./${HN}_dbms_evidence_$$.txt")
+_EVD="/tmp/${HN}_${DBMS_TYPE}_dbms_evidence.txt"
+# 증적 파일 생성 불가(심볼릭 링크·다른 계정 소유 기존 파일 등) → 대체 경로
+if ! _safe_out "$_EVD"; then
+    _EVD=$(mktemp "${TMPDIR:-/tmp}/${HN}_${DBMS_TYPE}_dbms_evidence.XXXXXX" 2>/dev/null || { (umask 077; : > "./${HN}_${DBMS_TYPE}_dbms_evidence_$$.txt"); echo "./${HN}_${DBMS_TYPE}_dbms_evidence_$$.txt"; })
     echo "# [경고] 기본 증적 파일에 쓸 수 없어 대체 경로 사용: $_EVD"
 fi
 echo "# ================================================================" > "$_EVD"
@@ -255,6 +266,13 @@ _emit() {
     else _RES[$k]="${cr}|${cw} / ${w}"; fi
 }
 declare -A _FIRST=()
+_res_downgrade() {   # _res_downgrade "DBM-001 D-01 …" "사유"
+    local k v
+    for k in $1; do
+        v="${_RES[$k]:-}"
+        case "$v" in "양호|"*) _RES[$k]="수동확인|${v#양호|} (${2})"; printf '[판정] %s|수동확인|%s\n\n' "$k" "${v#양호|} (${2})" >> "$_EVD" ;; esac
+    done
+}
 _flush_results() {
     local k line _hasd=0
     case " $_ORDER" in *" D-"*) _hasd=1 ;; esac
@@ -276,8 +294,16 @@ _flush_results() {
 _DBM_CODES="001 003 004 005 006 007 008 009 011 012 013 014 015 016 017 019 020 021 022 024 025 026 028 029 030 031 032 033 034 035 036"
 _conn_ok() {
     echo "$1" | grep -q "CONN_OK" && { _DB_CONN=1; return 0; }
-    local i
-    for i in $_DBM_CODES; do mc "$i" "DB 접속 실패($2) - 접속 정보(계정/권한/호스트) 확인 후 재점검 필요"; done
+    local i _na
+    case "$DBMS_TYPE" in   # 각 DBMS 점검 함수가 N-A 처리하는 타 제품 전용 항목
+    oracle)        _na=" 021 031 035 036 " ;;
+    mysql|mariadb) _na=" 012 014 015 021 029 030 031 035 036 " ;;
+    pgsql|postgresql) _na=" 012 014 021 029 030 031 035 036 " ;;
+    *)             _na=" " ;;
+    esac
+    for i in $_DBM_CODES; do
+        case "$_na" in *" $i "*) na "$i" "평가대상 아님 (${2} 해당 없음)" ;; *) mc "$i" "DB 접속 실패($2) - 접속 정보(계정/권한/호스트) 확인 후 재점검 필요" ;; esac
+    done
     echo "# [경고] $2 접속 실패 - 전 항목 수동확인 처리" >&2
     return 1
 }
@@ -292,6 +318,20 @@ evd() {
     eval "$@" >> "$_EVD" 2>&1
     printf '\n' >> "$_EVD"
 }
+evd_ls() {   # evd_ls 항목 경로... — ls -ldL (eval 없음)
+    local item="$1"; shift
+    printf '[%s] %s $ ls -ldL %s\n' "$item" "$(date '+%H:%M:%S')" "$*" >> "$_EVD"
+    [ $# -gt 0 ] && ls -ldL -- "$@" >> "$_EVD" 2>&1
+    printf '\n' >> "$_EVD"
+}
+evd_grep() {   # evd_grep 항목 '정규식' 파일... — grep -iE (eval 없음)
+    local item="$1" re="$2"; shift 2
+    printf '[%s] %s $ grep -iE %s %s\n' "$item" "$(date '+%H:%M:%S')" "'$re'" "$*" >> "$_EVD"
+    [ $# -gt 0 ] && grep -iE -- "$re" "$@" >> "$_EVD" 2>&1
+    printf '\n' >> "$_EVD"
+}
+# _rx1 '정규식' — 표준입력에서 첫 일치 문자열 (grep -o 없는 AIX·HP-UX 대응)
+_rx1() { _RX="$1" awk 'match($0, ENVIRON["_RX"]) { print substr($0, RSTART, RLENGTH); exit }'; }   # -v 는 '\.' 등 역슬래시를 해석하므로 환경변수로 전달
 evd_file() {
     local item="$1" f="$2"
     if [ -f "$f" ] || [ -d "$f" ]; then
@@ -310,17 +350,20 @@ _csv() { tr '\n' ',' | sed 's/,$//'; }
 _get_umask() {
     # $1=구동 계정, $2..=프로세스 이름 후보 — 실행 중 데몬의 실제 umask 우선, 모두 없을 때만 계정 로그인 umask
     local _user="$1" _umask="" _pid="" _n _c; shift
-    for _n in "$@"; do
+    for _n in "$@"; do   # 이름 정확 일치(ora_pmon_<SID> 등 접미사 포함)
         _pid=$(pgrep -x "$_n" 2>/dev/null | head -1)
         if [ -z "$_pid" ]; then
             for _c in /proc/[0-9]*/comm; do case "$(cat "$_c" 2>/dev/null)" in "$_n"|"$_n"_*) _pid=${_c#/proc/}; _pid=${_pid%/comm}; break ;; esac; done
         fi
-        [ -z "$_pid" ] && _pid=$(pgrep -f "$_n" 2>/dev/null | head -1)   # ora_pmon_<SID> 등 접미사 붙는 프로세스
-        [ -n "$_pid" ] && [ -f "/proc/$_pid/status" ] && _umask=$(awk '/^Umask:/{print $2}' "/proc/$_pid/status" 2>/dev/null)
-        [ -n "$_umask" ] && break
+        [ -n "$_pid" ] && break
     done
-    [ -z "$_umask" ] && [ -n "$_user" ] && _umask=$(su -c "umask" "$_user" 2>/dev/null)
-    echo "$_umask"
+    if [ -z "$_pid" ]; then   # 명령행 부분 일치는 마지막 수단 ('logger -t mysqld' 같은 root 프로세스 오인 방지)
+        for _n in "$@"; do _pid=$(pgrep -f "$_n" 2>/dev/null | head -1); [ -n "$_pid" ] && break; done
+    fi
+    [ -n "$_pid" ] && [ -f "/proc/$_pid/status" ] && _umask=$(awk '/^Umask:/{print $2}' "/proc/$_pid/status" 2>/dev/null)
+    # /proc Umask 없음(커널 4.7 미만 등) → 구동 계정 로그인 셸의 umask (비로그인 su 는 스크립트의 root umask 를 물려받음)
+    [ -z "$_umask" ] && [ -n "$_user" ] && _umask=$(su - "$_user" -c umask 2>/dev/null | tail -1 | tr -d ' ')
+    case "$_umask" in [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) echo "$_umask" ;; *) echo "" ;; esac
 }
 
 _judge_umask() {
@@ -342,15 +385,15 @@ _judge_umask() {
 # ================================================================
 _ora_env() {   # root/sudo 실행 등 환경변수 없음 → ora_pmon 프로세스·oratab 으로 ORACLE_HOME·SID·구동 계정 복원
     local c pm="" pid="" sid h s2
-    for c in /proc/[0-9]*/comm; do case "$(cat "$c" 2>/dev/null)" in ora_pmon_*) pm=$(cat "$c"); pid=${c#/proc/}; pid=${pid%/comm}; break ;; esac; done
-    [ -z "$pid" ] && read -r pid pm <<< "$(ps -e -o pid=,comm= 2>/dev/null | awk '$2 ~ /ora_pmon_/{print $1, $2; exit}')"
+    for c in /proc/[0-9]*/comm; do case "$(cat "$c" 2>/dev/null)" in ora_pmon_*) pid=${c#/proc/}; pid=${pid%/comm}; pm=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | awk '{print $1}'); break ;; esac; done   # comm 은 15자에서 잘림 → cmdline
+    [ -z "$pid" ] && read -r pid pm <<< "$(ps -e -o pid= -o args= 2>/dev/null | awk '{for (i = 2; i <= NF; i++) if ($i ~ /^ora_pmon_/) {print $1, $i; exit}}')"
     pm=${pm##*/}
     [ -n "$pid" ] && _ORA_OS_USER=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
     [ -n "$ORACLE_HOME" ] && [ -x "$ORACLE_HOME/bin/sqlplus" ] && [ -n "$ORACLE_SID$ORACLE_SERVICE" ] && return 0
     sid=${ORACLE_SID:-${pm#ora_pmon_}}
     [ -z "$sid" ] && return 1
-    s2=$(awk -F: -v s="$sid" 'tolower($1)==tolower(s) && $2!="" {print $1; exit}' /etc/oratab /var/opt/oracle/oratab 2>/dev/null)
-    h=${ORACLE_HOME:-$(awk -F: -v s="$sid" 'tolower($1)==tolower(s) && $2!="" {print $2; exit}' /etc/oratab /var/opt/oracle/oratab 2>/dev/null)}
+    s2=$(cat /etc/oratab /var/opt/oracle/oratab 2>/dev/null | awk -F: -v s="$sid" 'tolower($1)==tolower(s) && $2!="" {print $1; exit}')   # 없는 파일에서 awk 가 중단되지 않도록 cat 으로 합침
+    h=${ORACLE_HOME:-$(cat /etc/oratab /var/opt/oracle/oratab 2>/dev/null | awk -F: -v s="$sid" 'tolower($1)==tolower(s) && $2!="" {print $2; exit}')}
     [ -z "$h" ] && [ -n "$pid" ] && h=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^ORACLE_HOME=//p')
     [ -z "$ORACLE_SID" ] && [ -n "$pid" ] && ORACLE_SID=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^ORACLE_SID=//p')
     [ -n "$h" ] || return 1
@@ -386,20 +429,26 @@ check_oracle() {
         CONN="/ as sysdba"
         [ "$(id -u)" = 0 ] && [ -n "$_ORA_OS_USER" ] && [ "$_ORA_OS_USER" != "root" ] && _ORA_SU="$_ORA_OS_USER"
     elif [ -n "$ORACLE_SERVICE" ]; then
-        CONN="${ORACLE_USER}/${ORACLE_PASS}@${ORACLE_HOST}:${ORACLE_PORT}/${ORACLE_SERVICE}"
-    elif [ -n "$ORACLE_SID" ]; then
-        CONN="${ORACLE_USER}/${ORACLE_PASS}@${ORACLE_SID}"
-    else
-        CONN="${ORACLE_USER}/${ORACLE_PASS}"
+        CONN="${ORACLE_USER}/\"${ORACLE_PASS}\"@${ORACLE_HOST}:${ORACLE_PORT}/${ORACLE_SERVICE}"
+    else   # 로컬 인스턴스: ORACLE_SID 환경변수로 bequeath 접속 (실패 시 아래에서 '@SID' TNS 별칭 재시도)
+        CONN="${ORACLE_USER}/\"${ORACLE_PASS}\""
     fi
+    export ORACLE_SID
 
     _ora_exec() {   # 접속 문자열은 표준입력으로만 전달 (프로세스 인자 노출 없음)
-        if [ -n "$_ORA_SU" ]; then su "$_ORA_SU" -s /bin/sh -c "ORACLE_HOME='$ORACLE_HOME' ORACLE_SID='$ORACLE_SID' TNS_ADMIN='$TNS_ADMIN' '$SQLPLUS' -s /nolog"
+        if [ -n "$_ORA_SU" ]; then _su_sh "$_ORA_SU" "ORACLE_HOME='$ORACLE_HOME' ORACLE_SID='$ORACLE_SID' TNS_ADMIN='$TNS_ADMIN' '$SQLPLUS' -s /nolog"
         else "$SQLPLUS" -s /nolog; fi
+    }
+    # Oracle 소유 실행 파일(orabasehome·lsnrctl 등)은 root 가 아닌 구동 계정으로 실행
+    _ora_run() {   # 인자는 셸 해석 없이 전달 (경로가 셸 코드로 실행되지 않도록 %q 인용)
+        if [ "$(id -u)" = 0 ] && [ -n "$_ORA_OS_USER" ] && [ "$_ORA_OS_USER" != root ]; then
+            _su_sh "$_ORA_OS_USER" "ORACLE_HOME=$(printf %q "$ORACLE_HOME") TNS_ADMIN=$(printf %q "$TNS_ADMIN") $(printf '%q ' "$@")"
+        else "$@"; fi
     }
     run_q() {   # SQL 오류 시 원문(SQL 에코·'*'·ERROR at line) 대신 첫 ORA-/SP2- 줄만 반환, 전체 오류는 증적에 기록
         local _o
-        _o=$(printf 'CONNECT %s\nSET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 200 TRIMSPOOL ON\n%s\nEXIT\n' "$CONN" "$1" | _ora_exec 2>&1)
+        _o=$(printf 'CONNECT %s\nSET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 200 TRIMSPOOL ON\nPROMPT __Q_BEGIN__\n%s\nEXIT\n' "$CONN" "$1" | _ora_exec 2>&1)
+        printf '%s\n' "$_o" | grep -q '^__Q_BEGIN__$' && _o=$(printf '%s\n' "$_o" | awk 'f {print} /^__Q_BEGIN__$/ {f = 1}')   # 표지가 첫 줄이어도 동작 (sed '1,/re/' 는 2행부터 찾음)
         if printf '%s\n' "$_o" | grep -qE '^(ORA|SP2)-[0-9]+'; then
             printf '[SQL오류] %s\n%s\n\n' "$(printf '%s' "$1" | head -c 200)" "$(printf '%s\n' "$_o" | grep -E '^(ORA|SP2)-')" >> "$_EVD"
             printf '%s\n' "$_o" | grep -E '^(ORA|SP2)-' | head -1
@@ -407,19 +456,29 @@ check_oracle() {
     }
     if [ -z "$ORACLE_PASS" ] && ! run_q "SELECT 'CONN_'||'OK' FROM DUAL;" | grep -q CONN_OK && [ -t 0 ]; then
         read -rs -p "Oracle OS 인증 실패 - SYS 비밀번호: " ORACLE_PASS </dev/tty; echo >&2
-        _ORA_SU=""; CONN="sys/${ORACLE_PASS}${ORACLE_SID:+@${ORACLE_SID}} as sysdba"
+        _ORA_SU=""; CONN="sys/\"${ORACLE_PASS}\" as sysdba"
+    fi
+    # bequeath 실패(다른 ORACLE_HOME 등) → tnsnames 의 SID 별칭으로 재시도
+    if [ -n "$ORACLE_PASS" ] && [ -z "$ORACLE_SERVICE" ] && [ -n "$ORACLE_SID" ] && ! run_q "SELECT 'CONN_'||'OK' FROM DUAL;" | grep -q CONN_OK; then
+        case "$CONN" in *" as sysdba") CONN="${CONN% as sysdba}@${ORACLE_SID} as sysdba" ;; *) CONN="${CONN}@${ORACLE_SID}" ;; esac
     fi
     echo "# Oracle 접속: $( [ "$CONN" = "/ as sysdba" ] && echo "OS 인증(/ as sysdba)${_ORA_SU:+ - ${_ORA_SU} 계정}" || echo "${CONN%%/*}@${ORACLE_SERVICE:-${ORACLE_SID:-local}}")"
 
     _conn_ok "$(run_q "SELECT 'CONN_'||'OK' FROM DUAL;")" "Oracle" || return
-    DB_VER=$(run_q "SELECT VERSION FROM V\$INSTANCE;" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    DB_VER=$(run_q "SELECT VERSION FROM V\$INSTANCE;" | _rx1 '[0-9]+\.[0-9]+')
     DB_MAJ=$(echo "$DB_VER" | cut -d. -f1)
     echo "# Oracle 버전: ${DB_VER}"
     # 12c+ 멀티테넌트: CDB$ROOT 접속 시 열린 PDB 전체를 순회 (DBA_* 뷰는 현재 컨테이너만 조회)
-    _ORA_CONS=""
+    _ORA_CONS=""; _ORA_CONS_FAIL=""
     if [ "$(run_q "SELECT SYS_CONTEXT('USERENV','CON_NAME') FROM DUAL;" | tr -d ' \n')" = 'CDB$ROOT' ]; then
         _ORA_CONS=$(run_q "SELECT NAME FROM V\$PDBS WHERE OPEN_MODE LIKE 'READ%' AND NAME<>'PDB\$SEED' ORDER BY CON_ID;" | grep -v "ORA-" | tr -d ' ' | grep -v '^$' | tr '\n' ' ')
-        echo "# Oracle 컨테이너: CDB\$ROOT ${_ORA_CONS}"
+        local _c _ok=""; _ORA_CONS_FAIL=""
+        for _c in $_ORA_CONS; do
+            if run_q "ALTER SESSION SET CONTAINER=\"$_c\";
+SELECT 'CONN_'||'OK' FROM DUAL;" | grep -q CONN_OK; then _ok="$_ok $_c"; else _ORA_CONS_FAIL="$_ORA_CONS_FAIL $_c"; fi
+        done
+        _ORA_CONS="${_ok# }"; _ORA_CONS_FAIL="${_ORA_CONS_FAIL# }"
+        echo "# Oracle 컨테이너: CDB\$ROOT ${_ORA_CONS}${_ORA_CONS_FAIL:+ (접속 불가 PDB: $_ORA_CONS_FAIL - 계정·권한 항목 양호는 수동확인 처리)}"
         evd_q "DBM-003" "V\$PDBS 열린 PDB (계정·권한 항목은 CDB\$ROOT + PDB 별 [PDB명] 접두로 합산)" "${_ORA_CONS:-없음}"
     fi
     run_qa() {   # CDB$ROOT(또는 비CDB) + 열린 PDB 전체
@@ -510,7 +569,8 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
     _p9=$(_prof IDLE_TIME)
     evd_q "DBM-009" "resource_limit=${_res_lim}, OPEN 계정별 IDLE_TIME" "$(echo "$_p9" | _csv)"
     _b9=$(echo "$_p9" | awk -F= '$2=="UNLIMITED" || $2+0>15 {print}' | head -8)
-    if [ "${_res_lim^^}" != "TRUE" ]; then ng "009" "resource_limit=${_res_lim:-FALSE} (프로파일 자원 제한 비활성 - IDLE_TIME 미적용)"
+    if [ "${_res_lim^^}" != "TRUE" ] && [ "${_res_lim^^}" != "FALSE" ]; then mc "009" "resource_limit 조회 실패(${_res_lim:-빈 값}) - IDLE_TIME·RESOURCE_LIMIT 수동 확인"
+    elif [ "${_res_lim^^}" != "TRUE" ]; then ng "009" "resource_limit=${_res_lim} (프로파일 자원 제한 비활성 - IDLE_TIME 미적용)"
     elif [ -z "$_p9" ]; then mc "009" "IDLE_TIME 조회 실패 - 수동 확인"
     elif [ -n "$_b9" ]; then ng "009" "IDLE_TIME UNLIMITED/15분 초과 계정: $(echo "$_b9" | _csv) - 내부 규정 미명시 시 15분, 서비스 계정 평가 제외 가능"
     else ok "009" "resource_limit=TRUE, OPEN 계정 IDLE_TIME 15분 이하"; fi
@@ -520,26 +580,29 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
         ua=$(run_q "SELECT VALUE FROM V\$OPTION WHERE PARAMETER='Unified Auditing';" | tr -d ' \n')
         if [ "$ua" = "TRUE" ]; then
             cnt=$(run_q "SELECT COUNT(DISTINCT POLICY_NAME) FROM AUDIT_UNIFIED_ENABLED_POLICIES;" 2>/dev/null | tr -d ' \n')
-            [ -z "$cnt" ] && cnt=$(run_q "SELECT COUNT(*) FROM DBA_AUDIT_POLICY_COLUMNS;" 2>/dev/null | tr -d ' \n')
             evd_q "DBM-011" "Unified Auditing=TRUE, 활성 정책 수" "${cnt:-조회 불가}"
-            [ "${cnt:-0}" -gt 0 ] 2>/dev/null && mc "011" "통합 감사 수집 중 (정책 ${cnt}개) - 주기적 백업 여부 인터뷰/증적 확인" || ng "011" "통합 감사 활성화됐으나 정책 없음"
+            case "$cnt" in
+            ''|*[!0-9]*) mc "011" "통합 감사 활성 정책 조회 실패(${cnt:-빈 값}) - AUDIT_UNIFIED_ENABLED_POLICIES 수동 확인" ;;
+            0) ng "011" "통합 감사 활성화됐으나 활성 정책 없음" ;;
+            *) mc "011" "통합 감사 수집 중 (정책 ${cnt}개) - 주기적 백업 여부 인터뷰/증적 확인" ;;
+            esac
         else
             at=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='audit_trail';" | tr -d ' \n')
             evd_q "DBM-011" "audit_trail" "$at"
-            [ "$at" = "NONE" ] || [ -z "$at" ] && ng "011" "audit_trail=NONE" || mc "011" "audit_trail=${at} 수집 중 - 주기적 백업 여부 인터뷰/증적 확인"
+            case "$at" in *ORA-*|*SP2-*|'') mc "011" "audit_trail 조회 실패(${at:-빈 값}) - 감사 설정 수동 확인" ;; NONE) ng "011" "audit_trail=NONE" ;; *) mc "011" "audit_trail=${at} 수집 중 - 주기적 백업 여부 인터뷰/증적 확인" ;; esac
         fi
     else
         at=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='audit_trail';" | tr -d ' \n')
         evd_q "DBM-011" "audit_trail" "$at"
-        [ "$at" = "NONE" ] || [ -z "$at" ] && ng "011" "audit_trail=NONE" || mc "011" "audit_trail=${at} 수집 중 - 주기적 백업 여부 인터뷰/증적 확인"
+        case "$at" in *ORA-*|*SP2-*|'') mc "011" "audit_trail 조회 실패(${at:-빈 값}) - 감사 설정 수동 확인" ;; NONE) ng "011" "audit_trail=NONE" ;; *) mc "011" "audit_trail=${at} 수집 중 - 주기적 백업 여부 인터뷰/증적 확인" ;; esac
     fi
 
-    _ora_net() { local d; for d in "$TNS_ADMIN" "$("$ORACLE_HOME/bin/orabasehome" 2>/dev/null)/network/admin" "$ORACLE_HOME/network/admin"; do [ -n "$d" ] && [ -d "$d" ] && echo "$d"; done | awk '!s[$0]++'; }
-    _ora_dbs() { local d; for d in "$("$ORACLE_HOME/bin/orabaseconfig" 2>/dev/null)/dbs" "$ORACLE_HOME/dbs"; do [ -d "$d" ] && echo "$d"; done | awk '!s[$0]++'; }
+    _ora_net() { local d; for d in "$TNS_ADMIN" "$(_ora_run "$ORACLE_HOME/bin/orabasehome" 2>/dev/null)/network/admin" "$ORACLE_HOME/network/admin"; do [ -n "$d" ] && [ -d "$d" ] && echo "$d"; done | awk '!s[$0]++'; }
+    _ora_dbs() { local d; for d in "$(_ora_run "$ORACLE_HOME/bin/orabaseconfig" 2>/dev/null)/dbs" "$ORACLE_HOME/dbs"; do [ -d "$d" ] && echo "$d"; done | awk '!s[$0]++'; }
     # DBM-012: Listener Control Utility 접근 제한
     # 평가기준: Oracle 11.2 이상 양호 / 11.1 이하는 ADMIN_RESTRICTIONS_<리스너>=ON + lsnrctl 비밀번호(PASSWORDS_<리스너>) 설정
     evd_file "DBM-012" "$ORACLE_HOME/network/admin/listener.ora"
-    evd "DBM-012" "lsnrctl status 2>/dev/null | grep -iE 'Version|Security'"
+    { printf '[DBM-012] %s $ lsnrctl status | grep -iE "Version|Security"\n' "$(date '+%H:%M:%S')"; _ora_run "$ORACLE_HOME/bin/lsnrctl" status 2>&1 | grep -iE 'Version|Security'; printf '\n'; } >> "$_EVD"
     _v1=$(echo "$DB_VER" | cut -d. -f1); _v2=$(echo "$DB_VER" | cut -d. -f2)
     if [ -z "$_v1" ]; then
         mc "012" "Oracle 버전 확인 실패 - Listener 보안 설정 수동 확인"
@@ -547,8 +610,8 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
         ok "012" "Oracle ${DB_VER} (11.2 이상 - 리스너 로컬 OS 인증 기본 적용)"
     else
         _lora=""; for lora in $(for n in $(_ora_net); do echo "$n/listener.ora"; done) "/etc/oracle/listener.ora"; do [ -f "$lora" ] && _lora="$lora" && break; done
-        _ar=$(grep -iE '^\s*ADMIN_RESTRICTIONS_\S+\s*=\s*ON' "${_lora:-/nonexistent}" 2>/dev/null | head -1)
-        _pw=$(grep -iE '^\s*PASSWORDS_\S+\s*=' "${_lora:-/nonexistent}" 2>/dev/null | head -1)
+        _ar=$(grep -iE '^[[:space:]]*ADMIN_RESTRICTIONS_[^[:space:]=]+[[:space:]]*=[[:space:]]*ON' "${_lora:-/nonexistent}" 2>/dev/null | head -1)
+        _pw=$(grep -iE '^[[:space:]]*PASSWORDS_[^[:space:]=]+[[:space:]]*=' "${_lora:-/nonexistent}" 2>/dev/null | head -1)
         if [ -z "$_lora" ]; then mc "012" "Oracle ${DB_VER} - listener.ora 미발견, 수동 확인"
         elif [ -n "$_ar" ] && [ -n "$_pw" ]; then ok "012" "Oracle ${DB_VER} - ADMIN_RESTRICTIONS=ON, lsnrctl 비밀번호 설정"
         else ng "012" "Oracle ${DB_VER} (11.1 이하) - ADMIN_RESTRICTIONS=${_ar:+ON}${_ar:-미설정/OFF}, lsnrctl 비밀번호 ${_pw:+설정}${_pw:-미설정}"; fi
@@ -560,9 +623,9 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
     for _sn in $(for n in $(_ora_net); do echo "$n/sqlnet.ora"; done) /etc/oracle/sqlnet.ora; do
         [ -n "$_sn" ] && [ -f "$_sn" ] && _sqlnet="$_sn" && break
     done
-    evd "DBM-013" "grep -iE '^\s*TCP\.(VALIDNODE_CHECKING|INVITED_NODES|EXCLUDED_NODES)' ${_sqlnet:-/nonexistent} 2>/dev/null"
-    _vnc=$(grep -iE '^\s*TCP\.VALIDNODE_CHECKING' "${_sqlnet:-/nonexistent}" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
-    _inv=$(grep -iE '^\s*TCP\.(INVITED|EXCLUDED)_NODES' "${_sqlnet:-/nonexistent}" 2>/dev/null | head -2 | tr '\n' ' ')
+    evd_grep "DBM-013" '^[[:space:]]*TCP\.(VALIDNODE_CHECKING|INVITED_NODES|EXCLUDED_NODES)' ${_sqlnet:+"$_sqlnet"}
+    _vnc=$(grep -iE '^[[:space:]]*TCP\.VALIDNODE_CHECKING' "${_sqlnet:-/nonexistent}" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
+    _inv=$(grep -iE '^[[:space:]]*TCP\.(INVITED|EXCLUDED)_NODES' "${_sqlnet:-/nonexistent}" 2>/dev/null | head -2 | tr '\n' ' ')
     if [ "${_vnc,,}" = "yes" ] && [ -n "$_inv" ]; then ok "013" "TCP.VALIDNODE_CHECKING=yes, ${_inv}"
     elif [ -z "$_sqlnet" ]; then mc "013" "sqlnet.ora 미발견 - 원격 접근제어(TCP.VALIDNODE_CHECKING/방화벽/솔루션) 수동 확인"
     else ng "013" "TCP.VALIDNODE_CHECKING=${_vnc:-미설정} (${_sqlnet}) - 네트워크 장비·솔루션 접근제어 적용 시 수동 확인"; fi
@@ -616,13 +679,13 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
     na "021" "Windows MSSQL 전용 항목 (Oracle 해당 없음)"
 
     # DBM-022: 설정 파일 접근 권한 (바이너리 + 설정파일 종합)
-    evd "DBM-022" "ls -la $ORACLE_HOME/network/admin/*.ora $ORACLE_HOME/bin/sqlplus $ORACLE_HOME/bin/lsnrctl $ORACLE_HOME/bin/oracle $ORACLE_HOME/dbs/init*.ora $ORACLE_HOME/dbs/spfile*.ora 2>/dev/null"
+    evd_ls "DBM-022" "$ORACLE_HOME"/network/admin/*.ora "$ORACLE_HOME/bin/sqlplus" "$ORACLE_HOME/bin/lsnrctl" "$ORACLE_HOME/bin/oracle" "$ORACLE_HOME"/dbs/init*.ora "$ORACLE_HOME"/dbs/spfile*.ora
     # 평가기준: [755] bin 주요 파일 group·others 쓰기 금지 / [644] network/admin *.ora group·others 쓰기·실행 금지 / [640] spfile·init group 쓰기·실행 및 others 권한 금지
     _B=$ORACLE_HOME/bin; local _nf="" _df="" _n _spf _g644 _g640
     for _n in $(_ora_net); do _nf="$_nf $_n/listener.ora $_n/sqlnet.ora $_n/tnsnames.ora $_n/protocol.ora"; done
     for _n in $(_ora_dbs); do _df="$_df $_n/spfile*.ora $_n/init*.ora"; done
     _spf=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='spfile';" | grep '^/' | head -1)   # ASM(+DG) 경로 제외
-    evd "DBM-022" "ls -laL $_nf $_df $_spf \$ORACLE_HOME/dbs/orapw* 2>/dev/null"
+    evd_ls "DBM-022" $_nf $_df $_spf "$ORACLE_HOME"/dbs/orapw*
     _perm_check 022 $_B/oracle $_B/sqlplus $_B/sqlldr $_B/sqlload $_B/proc $_B/oraenv $_B/oerr $_B/exp $_B/imp $_B/tkprof $_B/tnsping $_B/wrap; _o22=$_PC_BAD; _f22=$_PC_FOUND
     _perm_check 033 $_nf; _o33=$_PC_BAD; _g644=$_PC_FOUND; _f22=$((_f22+_PC_FOUND))
     _perm_check 037 $(printf '%s\n' $_df $_spf | sort -u); _o37=$_PC_BAD; _g640=$_PC_FOUND; _f22=$((_f22+_PC_FOUND))
@@ -672,20 +735,22 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
     # 평가기준: AUD$ 소유자가 관리자 계정이 아니거나 일반 계정에 삽입/수정/삭제 권한이 있으면 취약 (SELECT·관리 롤은 제외)
     _aud_own=$(run_q "SELECT OWNER FROM DBA_TABLES WHERE TABLE_NAME='AUD\$';" | grep -v "^$" | grep -v "ORA-" | _csv)
     _aud_grants=$(run_qa "SELECT GRANTEE||' → '||TABLE_NAME||' ('||PRIVILEGE||')' FROM DBA_TAB_PRIVS WHERE TABLE_NAME IN ('AUD\$','FGA_LOG\$') AND PRIVILEGE IN ('INSERT','UPDATE','DELETE') AND GRANTEE NOT IN ('SYS','SYSTEM','DBA','DELETE_CATALOG_ROLE','AUDIT_ADMIN','AUDSYS') ORDER BY 1;" 2>/dev/null | grep -v "^$" | head -10)
+    local _aud_err=""; echo "$_aud_grants" | grep -q 'ORA-' && { _aud_err=$(echo "$_aud_grants" | grep 'ORA-' | head -1); _aud_grants=$(echo "$_aud_grants" | grep -v 'ORA-'); }
     evd_q "DBM-030" "AUD\$ 소유자 / 비관리 계정 INSERT·UPDATE·DELETE 권한" "owner=${_aud_own:-미확인} / ${_aud_grants:-없음}"
     if [ -n "$_aud_own" ] && ! echo "$_aud_own" | grep -qE '^(SYS|SYSTEM|AUDSYS)(,|$)'; then ng "030" "AUD\$ 소유자가 관리자 계정 아님: ${_aud_own}"
     elif [ -n "$_aud_grants" ]; then ng "030" "AUD\$ 수정/삭제 권한 보유 일반 계정: $(echo "$_aud_grants" | _csv)"
+    elif [ -n "$_aud_err" ] || [ -z "$_aud_own" ]; then mc "030" "AUD\$ 소유자·권한 조회 실패(${_aud_err:-소유자 미확인}) - 수동 확인"
     else ok "030" "AUD\$ 소유자 ${_aud_own:-SYS}, 일반 계정 수정/삭제 권한 없음"; fi
 
     evd_q "DBM-031" "해당 없음 (Oracle)" "MSSQL 전용 항목"
     na "031" "MSSQL 전용 항목"
 
     # DBM-032: 통신구간 암호화 (SQLNET.ENCRYPTION)
-    evd "DBM-032" "grep -i 'SQLNET.ENCRYPTION_SERVER\|SQLNET.CRYPTO_CHECKSUM_SERVER' $ORACLE_HOME/network/admin/sqlnet.ora 2>/dev/null || echo '(sqlnet.ora 미설정)'"
     _ora_enc=""
     for _sf in $(for n in $(_ora_net); do echo "$n/sqlnet.ora"; done) "/etc/oracle/sqlnet.ora"; do
         [ -f "$_sf" ] || continue
-        _ora_enc=$(grep -i "SQLNET.ENCRYPTION_SERVER" "$_sf" 2>/dev/null | grep -oiE "(REQUIRED|REQUESTED|ACCEPTED|REJECTED)" | head -1)
+        evd_grep "DBM-032" '^[[:space:]]*SQLNET\.(ENCRYPTION_SERVER|CRYPTO_CHECKSUM_SERVER)[[:space:]]*=' "$_sf"
+        _ora_enc=$(grep -iE '^[[:space:]]*SQLNET\.ENCRYPTION_SERVER[[:space:]]*=' "$_sf" 2>/dev/null | tail -1 | tr 'a-z' 'A-Z' | _rx1 'REQUIRED|REQUESTED|ACCEPTED|REJECTED')   # '#' 주석 줄 제외
         [ -n "$_ora_enc" ] && break
     done
     if [ -n "$_ora_enc" ]; then
@@ -709,11 +774,12 @@ $1" | grep -v '^$' | sed "s/^/[$c]/"
     fi
 
     # DBM-034: DBMS 서비스 구동 권한
-    evd "DBM-034" "ps -ef 2>/dev/null | grep ora_pmon | grep -v grep"
-    oracle_proc=$(ps -ef 2>/dev/null | grep ora_pmon | grep -v grep | awk '{print $1}' | head -1)
-    [ -n "$oracle_proc" ] && {
-        [ "$oracle_proc" = "root" ] && ng "034" "Oracle 프로세스 root 계정으로 실행" || ok "034" "Oracle 구동 계정: ${oracle_proc}"
-    } || mc "034" "Oracle 구동 계정 수동 확인"
+    evd "DBM-034" "ps -ef 2>/dev/null | grep -E 'ora_pmon|tnslsnr' | grep -v grep"
+    oracle_proc=$(ps -e -o user= -o args= 2>/dev/null | awk '{for (i = 2; i <= NF; i++) if ($i ~ /^ora_pmon_/ || $i ~ /tnslsnr$/) {print $1; break}}' | sort -u | tr '\n' ' ')
+    if [ -z "$oracle_proc" ]; then mc "034" "Oracle 구동 계정 수동 확인"
+    elif echo " $oracle_proc " | grep -qw root; then ng "034" "Oracle 프로세스(pmon·리스너) root 계정으로 실행: ${oracle_proc% }"
+    else ok "034" "Oracle 구동 계정(pmon·리스너): ${oracle_proc% }"; fi
+    [ -n "$_ORA_CONS_FAIL" ] && _res_downgrade "DBM-001 DBM-003 DBM-004 DBM-005 DBM-006 DBM-007 DBM-008 DBM-015 DBM-017 DBM-019 DBM-020 DBM-024 DBM-028 DBM-030" "접속 불가 PDB(${_ORA_CONS_FAIL}) 미점검"
 
     evd_q "DBM-035" "해당 없음 (Oracle)" "MSSQL 전용 항목 (xp_cmdshell)"
     na "035" "MSSQL 전용 항목"
@@ -1116,7 +1182,7 @@ check_pgsql() {
             [ "$_PG_OS" = "root" ] && _PG_OS=""
         fi
     fi
-    _pg_exec() { if [ -n "$_PG_OS" ] && [ "$_PGH" = "@sock" ]; then su "$_PG_OS" -s /bin/sh -c "\"$PSQL\" $OPTS -f -"; else "$PSQL" $OPTS -f -; fi; }
+    _pg_exec() { if [ -n "$_PG_OS" ] && [ "$_PGH" = "@sock" ]; then _su_sh "$_PG_OS" "\"$PSQL\" $OPTS -f -"; else "$PSQL" $OPTS -f -; fi; }
     run_q() { printf '%s\n' "$1" | _pg_exec 2>/dev/null | grep -v "^$"; }
     get_conf() { run_q "SHOW $1;"; }
     _pg_each() {   # 접속 가능한 전 DB 에서 SQL 실행 → '<DB>:<행>' / 실패 DB → '#FAIL:<DB>' (오류 시 중단 후 끝 표지 미출력으로 판별)
@@ -1984,14 +2050,14 @@ _kput() {   # 가이드 항목 판정 1회 기록 (코드 전체: D-xx)
 _KNA() { local c; for c in "$@"; do _kput "$c" "N-A" "가이드 점검 대상 제품 아님 (${_KDB})"; done; }
 _kisa_perm_w() {   # 파일 목록 중 그룹·일반 사용자 수정(쓰기) 권한 보유 파일
     local f p o=""
-    for f in "$@"; do [ -e "$f" ] || continue; p=$(get_perm "$f"); [ -n "$p" ] && (( (8#${p: -3} & 8#022) != 0 )) && o="${o} ${f}(${p})"; done
+    for f in "$@"; do [ -e "$f" ] || continue; p=$(get_perm "$f"); [ -n "$p" ] && _perm_bad "$p" 022 && o="${o} ${f}(${p})"; done
     echo "${o# }"
 }
 _kisa_d25() {   # D-25: EoS(보안 패치 미제공) = 취약, 그 외 최신 패치 여부 확인
     local e="${_RES[DBM-025]:-}"
     evd_q "D-25" "DBMS 버전 / EoS 판정(DBM-025)" "${DB_VER:-미확인} / ${e:-없음}"
     case "$e" in 취약*) _kput "D-25" "취약" "보안 패치가 제공되지 않는 버전(EoS): ${e#*|}" ;;
-    *) _kput "D-25" "수동확인" "${_KDB} $(echo "${DB_VER:-}" | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 | grep . || echo '버전 미확인') - 벤더 최신 보안 패치 적용 여부 확인 (지원 종료(EoS) 여부는 컨버터가 자동 판정)" ;; esac
+    *) _kput "D-25" "수동확인" "${_KDB} $(echo "${DB_VER:-}" | _rx1 '[0-9]+(\.[0-9]+)+' | grep . || echo '버전 미확인') - 벤더 최신 보안 패치 적용 여부 확인 (지원 종료(EoS) 여부는 컨버터가 자동 판정)" ;; esac
 }
 _kisa_fail() { local c; for c in $2; do _kput "$c" "수동확인" "$1"; done; }
 _D_ALL="D-01 D-02 D-03 D-04 D-05 D-06 D-07 D-08 D-09 D-10 D-11 D-12 D-13 D-14 D-15 D-16 D-17 D-18 D-19 D-20 D-21 D-22 D-23 D-24 D-25 D-26"
@@ -2037,7 +2103,7 @@ kisa_mysql() {
     _vp=$(run_q "SHOW VARIABLES WHERE Variable_name REGEXP '^(validate_password|simple_password_check|cracklib_password_check)';" | tr '\t' '=' | tr '\n' ' ')
     _lt=$(get_var "default_password_lifetime")
     evd_q "D-03" "validate_password*/simple_password_check* / default_password_lifetime" "${_vp:-미설치} / ${_lt:-없음}"
-    _ln=$(echo "$_vp" | grep -oE '(validate_password[._]length|simple_password_check_minimal_length)=[0-9]+' | head -1 | cut -d= -f2)
+    _ln=$(echo "$_vp" | _rx1 '(validate_password[._]length|simple_password_check_minimal_length)=[0-9]+' | cut -d= -f2)
     if echo "$_vp" | grep -qE 'validate_password[._]policy=(MEDIUM|STRONG|1|2)'; then _cx="validate_password MEDIUM 이상"
     elif echo "$_vp" | grep -qE 'simple_password_check_digits=[1-9]' && echo "$_vp" | grep -qE 'simple_password_check_other_characters=[1-9]'; then _cx="simple_password_check"
     elif echo "$_vp" | grep -q 'cracklib_password_check'; then _cx="cracklib_password_check"; fi
@@ -2261,11 +2327,11 @@ kisa_oracle() {
         _omu="(SELECT USERNAME FROM DBA_USERS WHERE ORACLE_MAINTAINED='Y')"
         _omr="(SELECT ROLE FROM DBA_ROLES WHERE ORACLE_MAINTAINED='Y')"
     else
-        _omu="('SYS','SYSTEM','OUTLN','DBSNMP','MDSYS','CTXSYS','ORDSYS','ORDPLUGINS','ORDDATA','XDB','WMSYS','OLAPSYS','EXFSYS','LBACSYS','SYSMAN','MGMT_VIEW','APPQOSSYS','ORACLE_OCM','DIP','XS\$NULL','ANONYMOUS','SI_INFORMTN_SCHEMA','SPATIAL_CSW_ADMIN_USR','SPATIAL_WFS_ADMIN_USR','FLOWS_FILES','APEX_PUBLIC_USER','OWBSYS','OWBSYS_AUDIT','TSMSYS','MDDATA')"
+        _omu="('SYS','SYSTEM','OUTLN','DBSNMP','MDSYS','CTXSYS','ORDSYS','ORDPLUGINS','ORDDATA','XDB','WMSYS','OLAPSYS','EXFSYS','LBACSYS','SYSMAN','MGMT_VIEW','APPQOSSYS','ORACLE_OCM','DIP','XS\$NULL','ANONYMOUS','SI_INFORMTN_SCHEMA','SPATIAL_CSW_ADMIN_USR','SPATIAL_WFS_ADMIN_USR','FLOWS_FILES','APEX_PUBLIC_USER','OWBSYS','OWBSYS_AUDIT','TSMSYS','MDDATA','DMSYS','APEX_030200','APEX_040000','APEX_040100','APEX_040200','FLOWS_030000','FLOWS_030100','OLAPSYS','WKPROXY','WK_TEST','SCOTT_SAMPLE_NONE')"
         _omr="('DBA','CONNECT','RESOURCE','SELECT_CATALOG_ROLE','EXECUTE_CATALOG_ROLE','DELETE_CATALOG_ROLE','EXP_FULL_DATABASE','IMP_FULL_DATABASE','AQ_ADMINISTRATOR_ROLE','AQ_USER_ROLE','SCHEDULER_ADMIN','GATHER_SYSTEM_STATISTICS','LOGSTDBY_ADMINISTRATOR','RECOVERY_CATALOG_OWNER','HS_ADMIN_ROLE','OEM_MONITOR','OEM_ADVISOR','WM_ADMIN_ROLE','XDBADMIN','XDB_SET_INVOKER','XDB_WEBSERVICES','XDB_WEBSERVICES_OVER_HTTP','XDB_WEBSERVICES_WITH_PUBLIC','DATAPUMP_EXP_FULL_DATABASE','DATAPUMP_IMP_FULL_DATABASE','JAVA_ADMIN','JAVA_DEPLOY','JAVASYSPRIV','JAVAUSERPRIV','JAVADEBUGPRIV','JAVAIDPRIV','EJBCLIENT','CTXAPP','OLAP_DBA','OLAP_USER','OLAP_XS_ADMIN','MGMT_USER','ADM_PARALLEL_EXECUTE_TASK','DBFS_ROLE','HS_ADMIN_SELECT_ROLE','HS_ADMIN_EXECUTE_ROLE','AUTHENTICATEDUSER','CSW_USR_ROLE','SPATIAL_CSW_ADMIN','SPATIAL_WFS_ADMIN','WFS_USR_ROLE','JMXSERVER','ORDADMIN','PLUSTRACE')"
     fi
     _ql() { run_qa "$1" | grep -v '^[[:space:]]*$'; }   # 결과 줄 (ORA- 오류 줄 포함 → 호출부에서 판별)
-    _qerr() { echo "$1" | grep -m1 -oE '(ORA|SP2)-[0-9]+[^,]*'; }
+    _qerr() { echo "$1" | _rx1 '(ORA|SP2)-[0-9]+[^,]*'; }   # grep -o/-m 없는 AIX·HP-UX 대응
 
     # D-01 기본 계정 초기 비밀번호 변경 또는 잠금
     local _dp _dpo
@@ -2351,7 +2417,7 @@ kisa_oracle() {
     for _n in $(_ora_net); do [ -f "$_n/sqlnet.ora" ] && _sn="$_n/sqlnet.ora" && break; done
     _vc=$(grep -iE '^[[:space:]]*TCP\.VALIDNODE_CHECKING' "${_sn:-/nonexistent}" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ')
     _iv=$(grep -iE '^[[:space:]]*TCP\.(INVITED|EXCLUDED)_NODES' "${_sn:-/nonexistent}" 2>/dev/null | head -2 | tr '\n' ' ')
-    evd "D-10" "grep -iE '^[[:space:]]*TCP\.(VALIDNODE_CHECKING|INVITED_NODES|EXCLUDED_NODES)' ${_sn:-/nonexistent} 2>/dev/null"
+    evd_grep "D-10" '^[[:space:]]*TCP\.(VALIDNODE_CHECKING|INVITED_NODES|EXCLUDED_NODES)' ${_sn:+"$_sn"}
     if [ "${_vc,,}" = "yes" ] && [ -n "$_iv" ]; then _kput "D-10" "양호" "지정 IP 만 접속 허용: TCP.VALIDNODE_CHECKING=yes, ${_iv% }"
     elif [ -z "$_sn" ]; then _kput "D-10" "수동확인" "sqlnet.ora 미발견 - 원격 접속 IP 제한(sqlnet.ora·방화벽·접근제어 솔루션) 확인"
     else _kput "D-10" "취약" "sqlnet.ora 접속 IP 제한 미설정 (TCP.VALIDNODE_CHECKING=${_vc:-미설정}, ${_sn}) - 방화벽·DB 접근제어 솔루션으로 제한 시 증빙 확인 후 양호"; fi
@@ -2370,7 +2436,8 @@ kisa_oracle() {
     for _n in $(_ora_net); do [ -f "$_n/listener.ora" ] && _lo="$_n/listener.ora" && break; done
     _pw=$(grep -iE '^[[:space:]]*PASSWORDS_[A-Za-z0-9_]+[[:space:]]*=' "${_lo:-/nonexistent}" 2>/dev/null | head -1)
     _ar=$(grep -iE '^[[:space:]]*ADMIN_RESTRICTIONS_[A-Za-z0-9_]+[[:space:]]*=[[:space:]]*ON' "${_lo:-/nonexistent}" 2>/dev/null | head -1)
-    evd "D-12" "grep -iE '^[[:space:]]*(PASSWORDS|ADMIN_RESTRICTIONS)_' ${_lo:-/nonexistent} 2>/dev/null | sed -E 's/^([[:space:]]*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][Ss]_[^=]*=).*/\\1 (마스킹)/'"
+    { printf '[D-12] %s $ grep -iE "^(PASSWORDS|ADMIN_RESTRICTIONS)_" %s (비밀번호 마스킹)\n' "$(date '+%H:%M:%S')" "${_lo:-listener.ora 미발견}"
+      [ -n "$_lo" ] && grep -iE '^[[:space:]]*(PASSWORDS|ADMIN_RESTRICTIONS)_' "$_lo" 2>/dev/null | sed 's/^\([[:space:]]*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][Ss]_[^=]*=\).*/\1 (마스킹)/'; printf '\n'; } >> "$_EVD"
     if [ -z "$_v1" ]; then _kput "D-12" "수동확인" "Oracle 버전 확인 실패 - Listener 비밀번호 설정 확인"
     elif [ "$_v1" -gt 12 ] 2>/dev/null || { [ "$_v1" -eq 12 ] && [ "${_v2:-0}" -ge 2 ]; } 2>/dev/null; then _kput "D-12" "N-A" "Oracle ${DB_VER} - 12c R2 이후 버전은 Listener 비밀번호 미지원 (가이드: 해당사항 없음)"
     elif [ -z "$_lo" ]; then _kput "D-12" "수동확인" "Oracle ${DB_VER} - listener.ora 미발견, Listener 비밀번호 설정 확인"
@@ -2383,7 +2450,7 @@ kisa_oracle() {
     for _n in $(_ora_net); do _fl14="$_fl14 $_n $_n/listener.ora $_n/sqlnet.ora $_n/tnsnames.ora"; done
     for _n in $(_ora_dbs); do _fl14="$_fl14 $(ls -d "$_n"/init*.ora "$_n"/spfile*.ora "$_n"/orapw* 2>/dev/null | tr '\n' ' ')"; done
     _dbf=$(run_q "SELECT NAME FROM V\$CONTROLFILE UNION ALL SELECT MEMBER FROM V\$LOGFILE UNION ALL SELECT NAME FROM V\$DATAFILE;" | grep '^/' | head -100 | tr '\n' ' ')
-    evd "D-14" "ls -ldL $_fl14 2>/dev/null; ls -lL $(echo "$_dbf" | tr ' ' '\n' | head -20 | tr '\n' ' ') 2>/dev/null"
+    evd_ls "D-14" $_fl14 $(echo "$_dbf" | tr ' ' '\n' | head -20)
     _w14=$(_kisa_perm_w $_fl14 $_dbf)
     if [ -z "${_fl14// /}" ]; then _kput "D-14" "수동확인" "Oracle 설정 파일 미발견 (ORACLE_HOME·TNS_ADMIN 확인)"
     elif [ -n "$_w14" ]; then _kput "D-14" "취약" "주요 파일·디렉터리에 그룹·일반 사용자 수정 권한: ${_w14}"
@@ -2458,10 +2525,13 @@ kisa_oracle() {
     _at=$(run_q "SELECT VALUE FROM V\$PARAMETER WHERE NAME='audit_trail';" | tr -d ' \n')
     [ "${DB_MAJ:-0}" -ge 12 ] 2>/dev/null && _pc=$(run_q "SELECT COUNT(DISTINCT POLICY_NAME) FROM AUDIT_UNIFIED_ENABLED_POLICIES;" | tr -d ' \n' | grep -E '^[0-9]+$')
     evd_q "D-26" "audit_trail / Unified Auditing / 활성 통합 감사 정책 수" "${_at:-?} / ${_ua:-?} / ${_pc:-해당 없음}"
-    if { [ -n "$_at" ] && [ "${_at^^}" != "NONE" ]; } || [ "${_pc:-0}" -gt 0 ] 2>/dev/null; then
-        _kput "D-26" "양호" "감사 기록 적용: audit_trail=${_at:-?}${_pc:+, 통합 감사 정책 ${_pc}개} - 기관 감사 기록 정책 수립 여부는 인터뷰 확인"
-    elif [ -z "$_at$_pc" ]; then _kput "D-26" "수동확인" "감사 설정 조회 실패"
-    else _kput "D-26" "취약" "감사 기록 미설정 (audit_trail=${_at:-NONE}, 통합 감사 정책 없음)"; fi
+    local _atx=""; case "$_at" in *ORA-*|*SP2-*) _atx="audit_trail 조회 실패"; _at="" ;; esac   # 조회 실패 문자열은 값이 아님
+    [ "${_ua^^}" = "TRUE" ] && _at=""                                  # 순수 통합 감사 모드: audit_trail 은 무시됨 → 통합 감사 정책만 판정
+    if [ "${_pc:-0}" -gt 0 ] 2>/dev/null || { [ -n "$_at" ] && [ "${_at^^}" != "NONE" ]; }; then
+        _kput "D-26" "양호" "감사 기록 적용: $( [ "${_ua^^}" = "TRUE" ] && echo "순수 통합 감사" || echo "${_atx:-audit_trail=${_at:-NONE}}")${_pc:+, 통합 감사 정책 ${_pc}개} - 기관 감사 기록 정책 수립 여부는 인터뷰 확인"
+    elif [ -z "$_at" ] && [ -z "$_pc" ]; then _kput "D-26" "수동확인" "감사 설정 조회 실패 (audit_trail·AUDIT_UNIFIED_ENABLED_POLICIES)"
+    else _kput "D-26" "취약" "감사 기록 미설정 ($( [ "${_ua^^}" = "TRUE" ] && echo "순수 통합 감사 모드" || echo "audit_trail=${_at:-NONE}"), 활성 통합 감사 정책 ${_pc:-0}개)"; fi
+    [ -n "$_ORA_CONS_FAIL" ] && _res_downgrade "D-01 D-02 D-03 D-04 D-05 D-06 D-08 D-09 D-11 D-17 D-18 D-20 D-21" "접속 불가 PDB(${_ORA_CONS_FAIL}) 미점검"
 }
 
 # ── 실행 분기 ────────────────────────────────────────────────────
