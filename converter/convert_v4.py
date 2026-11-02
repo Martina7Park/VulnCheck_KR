@@ -2670,7 +2670,7 @@ def _net_os_label(vendor, text, ver=None):
             return "Cisco NX-OS"
         major = (ver or "").split(".")[0]
         return "Cisco IOS-XE" if ("IOS XE" in text or "IOS-XE" in text or major in ("16", "17", "26")) else "Cisco IOS"
-    return {"ASA": "Cisco ASA", "FRR": "FRRouting", "JUNIPER": "Juniper Junos", "HUAWEI": "Huawei VRP", "DELL": "Dell OS9", "ALTEON": "Radware Alteon",
+    return {"ASA": "Cisco ASA", "FRR": "FRRouting", "DLINK": "D-Link", "JUNIPER": "Juniper Junos", "HUAWEI": "Huawei VRP", "DELL": "Dell OS9", "ALTEON": "Radware Alteon",
             "A10": "A10 ACOS", "BIGIP": "F5 BIG-IP", "CITRIX": "Citrix ADC", "BROCADE": "Brocade", "PIOLINK": "Piolink"}.get(vendor, vendor)
 
 
@@ -5646,6 +5646,18 @@ def _kisa_cmd_block(code, env):
     return "\n".join(blocks)
 
 
+def _fit_print_layout(wb):
+    """인쇄 설정이 없는 시트(보안가이드·장비 상세·취약점 목록·검토·수정 등): A4 가로, 너비 1페이지 맞춤 — 열이 여러 장으로 갈라지지 않게"""
+    for ws in wb.worksheets:
+        if ws.sheet_state != "visible" or (ws.sheet_properties.pageSetUpPr and ws.sheet_properties.pageSetUpPr.fitToPage):
+            continue
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
+
+
 SECURITY_GUIDE_SHEET = "보안가이드"
 
 
@@ -8322,7 +8334,8 @@ def run_convert(mode, category, base_dir, criteria_excel):
                     res[code] = (RESULT_NA, f"장비 유형({', '.join(net_subs) or vendor})에 해당 없음")
                 else:
                     res[code] = (RESULT_MANUAL, "config에서 자동 판단 불가 (수동 확인)")
-            print(f"[INFO] {fname} → {_net_os_label(vendor, text, _net_identity(text)[1])} / 장비 유형 {detect_net_dtype(lines)}"
+            _b, _m, _ = _net_brand(text)
+            print(f"[INFO] {fname} → {(f'D-Link {_m}'.strip() if _b == 'D-LINK' else _net_os_label(vendor, text, _net_identity(text)[1]))} / 장비 유형 {detect_net_dtype(lines)}"
                   + (" / 외부망 연결 단서(공인 IP·BGP) 있음" if _net_external(text) else ""))
 
         res = run_eos_check(category, res, text, base_dir)
@@ -8398,6 +8411,7 @@ def _write_report(mode, category, cat_dir, base_dir, all_results, hosts_info, cr
     _create_vuln_list_sheet(wb, all_results, criteria_items)
     _create_review_sheet(wb, all_results, criteria_items)
     _create_security_guide_sheet(wb, all_results, hosts_info, criteria_items)
+    _fit_print_layout(wb)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_str  = "전자금융" if mode == "EF" else "주요정보"
