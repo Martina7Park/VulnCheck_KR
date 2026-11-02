@@ -42,6 +42,7 @@ if (-not $script:KMODE) {
 $script:KMODE = switch ($script:KMODE) { '1' {'ef'} 'srv' {'ef'} '2' {'mi'} 'kisa' {'mi'} '3' {'all'} default { $script:KMODE } }
 if (@('ef','mi','all') -notcontains $script:KMODE) { Write-Host "사용법: check_webwas.ps1 -Mode ef|mi|all"; exit 1 }
 $ErrorActionPreference = "SilentlyContinue"
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}   # 영문 OS(437)에서 결과 파일 한글 깨짐 방지 (컨버터는 UTF-8 판독)
 $ProgressPreference    = "SilentlyContinue"
 
 $script:cntPass=0; $script:cntFail=0; $script:cntMC=0; $script:cntNA=0
@@ -370,7 +371,7 @@ if (Get-Service W3SVC -EA SilentlyContinue) {
 
 # Apache on Windows 탐지
 $APACHE_CONF = ""
-if (-not $WEB_SRV) {
+if (-not $WEB_SRV -or $WEB_SRV -eq "apache") {
     $apachePaths = @(
         "C:\Apache24\conf\httpd.conf",
         "C:\Apache2\conf\httpd.conf",
@@ -378,16 +379,16 @@ if (-not $WEB_SRV) {
         "C:\Program Files (x86)\Apache Group\Apache2\conf\httpd.conf"
     )
     foreach ($p in $apachePaths) {
-        if (Test-Path $p) { $APACHE_CONF = $p; $WEB_SRV = "apache"; break }
+        if (Test-Path $p) { $APACHE_CONF = $p; if (-not $WEB_SRV) { $WEB_SRV = "apache" }; break }
     }
 }
 
 # Nginx on Windows 탐지
 $NGINX_CONF = ""
-if (-not $WEB_SRV) {
+if (-not $WEB_SRV -or $WEB_SRV -eq "nginx") {
     $nginxPaths = @("C:\nginx\conf\nginx.conf","C:\Program Files\nginx\conf\nginx.conf")
     foreach ($p in $nginxPaths) {
-        if (Test-Path $p) { $NGINX_CONF = $p; $WEB_SRV = "nginx"; break }
+        if (Test-Path $p) { $NGINX_CONF = $p; if (-not $WEB_SRV) { $WEB_SRV = "nginx" }; break }
     }
 }
 
@@ -1669,14 +1670,15 @@ if ($IIS_INSTALLED) {
             Fail "031" "IIS 디렉토리 브라우징 전역 활성화됨 - 비활성화 필요"
         } else {
             # 사이트별 확인
-            $sites = Get-ChildItem "IIS:\Sites" -EA SilentlyContinue
+            $sites = @(Get-ChildItem "IIS:\Sites" -EA SilentlyContinue)
             $vuln031 = @()
             foreach ($site in $sites) {
                 $db = Get-WebConfigurationProperty "system.webServer/directoryBrowse" -PSPath "IIS:\Sites\$($site.Name)" -Name "enabled" -EA SilentlyContinue
                 if ($db -and $db.Value -eq $true) { $vuln031 += $site.Name }
             }
             if ($vuln031) { Fail "031" "디렉토리 브라우징 활성 사이트: $($vuln031 -join ', ')" }
-            else { Pass "031" "IIS 디렉토리 브라우징 비활성화됨 (전체 사이트)" }
+            elseif ($sites.Count -eq 0) { MC "031" "IIS 사이트 목록 조회 실패 - 사이트별 디렉토리 브라우징 수동 확인 (전역 설정은 비활성)" }
+            else { Pass "031" "IIS 디렉토리 브라우징 비활성화됨 (전체 사이트 $($sites.Count)개)" }
         }
     } elseif (Test-Path $APPCMD) {
         $dbOut = & $APPCMD list config /section:directoryBrowse 2>$null
@@ -1754,8 +1756,14 @@ if ($IIS_INSTALLED) {
 
     # WST-121: IIS 역방향 프록시(ARR) 설정
     Evd "WST-121" "Get-WebGlobalModule -Name 'ApplicationRequestRouting' -EA SilentlyContinue"
-    $arrMod = Get-WebGlobalModule -Name "ApplicationRequestRouting" -EA SilentlyContinue
-    if ($arrMod) {
+    if ($HAS_WEB_ADMIN) { $arrMod = Get-WebGlobalModule -Name "ApplicationRequestRouting" -EA SilentlyContinue }
+    else {
+        $ahcArr = "$env:windir\System32\inetsrv\config\applicationHost.config"
+        $arrMod = (Test-Path $ahcArr) -and ((Get-Content $ahcArr -Raw -EA SilentlyContinue) -match 'name="ApplicationRequestRouting"')
+    }
+    if (-not $HAS_WEB_ADMIN -and -not (Test-Path "$env:windir\System32\inetsrv\config\applicationHost.config")) {
+        MC "121" "IIS ARR 모듈 설치 여부 확인 불가 (WebAdministration 모듈·applicationHost.config 없음)"
+    } elseif ($arrMod) {
         MC "121" "IIS ARR(역방향 프록시) 모듈 설치됨 - 프록시 허용 범위 수동 확인"
     } else {
         Pass "121" "IIS ARR 역방향 프록시 모듈 미설치"
@@ -1774,8 +1782,16 @@ if ($IIS_INSTALLED) {
     if ($HAS_WEB_ADMIN) {
         $errMode = Get-WebConfigurationProperty "system.webServer/httpErrors" -PSPath "IIS:\" -Name "errorMode" -EA SilentlyContinue
         $existMode = Get-WebConfigurationProperty "system.webServer/httpErrors" -PSPath "IIS:\" -Name "existingResponse" -EA SilentlyContinue
-        $errModeVal = if ($errMode) { $errMode.Value } else { "" }
-        if ($errModeVal -eq "Custom") {
+        $errModeVal = if ($errMode -is [string]) { $errMode } elseif ($errMode) { "$($errMode.Value)" } else { "" }
+        $det123 = @()
+        foreach ($st in @(Get-ChildItem "IIS:\Sites" -EA SilentlyContinue)) {
+            $em = Get-WebConfigurationProperty "system.webServer/httpErrors" -PSPath "IIS:\Sites\$($st.Name)" -Name "errorMode" -EA SilentlyContinue
+            $emv = if ($em -is [string]) { $em } elseif ($em) { "$($em.Value)" } else { "" }
+            if ($emv -eq "Detailed") { $det123 += $st.Name }
+        }
+        if ($det123) {
+            Fail "123" "사이트별 상세 에러 노출(errorMode=Detailed): $($det123 -join ', ')"
+        } elseif ($errModeVal -eq "Custom") {
             Pass "123" "IIS 커스텀 에러 페이지 설정됨 (errorMode=Custom)"
         } elseif ($errModeVal -eq "DetailedLocalOnly") {
             Pass "123" "IIS 에러 상세정보 로컬만 노출 (DetailedLocalOnly)"
@@ -1818,16 +1834,21 @@ if ($WEB_SRV -eq "apache" -and $APACHE_CONF) {
     $confDir = Split-Path $APACHE_CONF
 
     # WST-031: 디렉토리 리스팅
-    $dirIdx = Select-String -Path (Get-ChildItem $confDir -Filter "*.conf" -Recurse -EA SilentlyContinue).FullName -Pattern "Options.*Indexes" -EA SilentlyContinue | Where-Object { $_ -notmatch "#" }
-    if ($dirIdx) { Fail "031" "Apache 디렉토리 리스팅 활성: $($dirIdx | Select-Object -First 1)" }
-    else { Pass "031" "Apache 디렉토리 리스팅 비활성 (Options -Indexes)" }
+    $apConfs = @((Get-ChildItem $confDir -Filter "*.conf" -Recurse -EA SilentlyContinue).FullName | Where-Object { $_ })
+    # 'Options -Indexes' 는 비활성 설정이므로 제외, 'Options Indexes' / '+Indexes' 만 활성
+    $dirIdx = if ($apConfs) { Select-String -Path $apConfs -Pattern '^\s*Options\s+([^#]*\s)?\+?Indexes(\s|$)' -EA SilentlyContinue } else { $null }
+    if (-not $apConfs) { MC "031" "Apache 설정 파일(*.conf) 조회 실패 - 디렉토리 리스팅 수동 확인" }
+    elseif ($dirIdx) { Fail "031" "Apache 디렉토리 리스팅 활성: $(($dirIdx | Select-Object -First 1).Line.Trim())" }
+    else { Pass "031" "Apache 디렉토리 리스팅 비활성 (Options Indexes 미사용)" }
 
     # WST-036: Apache 실행 계정
     $apacheProc = Get-Process httpd -EA SilentlyContinue | Select-Object -First 1
     if ($apacheProc) {
         $cimProc = Get-CimInstance Win32_Process -Filter "ProcessId=$($apacheProc.Id)" -EA SilentlyContinue
         $procUser = if ($cimProc) { (Invoke-CimMethod -InputObject $cimProc -MethodName GetOwner -EA SilentlyContinue).User } else { $null }
-        if ($procUser -eq "SYSTEM" -or $procUser -eq "Administrator") {
+        if (-not $procUser) {
+            MC "036" "Apache 실행 계정 조회 실패 - 서비스 로그온 계정 수동 확인"
+        } elseif ($procUser -eq "SYSTEM" -or $procUser -eq "Administrator") {
             Fail "036" "Apache SYSTEM/Administrator 권한으로 실행 중"
         } else {
             Pass "036" "Apache 실행 계정: $procUser (비관리자)"
@@ -1835,14 +1856,17 @@ if ($WEB_SRV -eq "apache" -and $APACHE_CONF) {
     } else { MC "036" "Apache 실행 계정 수동 확인" }
 
     # WST-102: ServerTokens
-    $srvTokens = Select-String -Path $APACHE_CONF -Pattern "^ServerTokens" -EA SilentlyContinue | Select-Object -First 1
-    if ($srvTokens -match "Prod|Min") { Pass "102" "Apache ServerTokens=$($srvTokens.Line.Split()[-1]) (버전 최소 노출)" }
-    elseif ($srvTokens -match "Full|OS|All|Major|Minor") { Fail "102" "Apache ServerTokens=$($srvTokens.Line.Split()[-1]) (버전 노출)" }
+    $srvTokens = if ($apConfs) { Select-String -Path $apConfs -Pattern '^\s*ServerTokens\s+(\S+)' -EA SilentlyContinue | Select-Object -Last 1 } else { $null }
+    $stVal = if ($srvTokens) { $srvTokens.Matches[0].Groups[1].Value } else { "" }
+    if ($stVal -match '^(Prod|ProductOnly)$') { Pass "102" "Apache ServerTokens=$stVal (제품명만 노출)" }
+    elseif ($stVal) { Fail "102" "Apache ServerTokens=$stVal (버전 노출 - Prod 로 설정)" }
+    elseif ($apConfs) { Fail "102" "Apache ServerTokens 미설정 (기본값 Full - 버전·OS 노출)" }
     else { MC "102" "Apache ServerTokens 설정 수동 확인" }
 
     # WST-123: ErrorDocument
-    $errDoc = Select-String -Path (Get-ChildItem $confDir -Filter "*.conf" -Recurse -EA SilentlyContinue).FullName -Pattern "ErrorDocument" -EA SilentlyContinue | Where-Object { $_ -notmatch "#" }
-    if ($errDoc) { Pass "123" "Apache ErrorDocument 설정됨" }
+    $errDoc = if ($apConfs) { Select-String -Path $apConfs -Pattern '^\s*ErrorDocument\s+[45]\d\d\s' -EA SilentlyContinue } else { $null }
+    if (-not $apConfs) { MC "123" "Apache 설정 파일 조회 실패 - ErrorDocument 수동 확인" }
+    elseif ($errDoc) { Pass "123" "Apache ErrorDocument 설정됨" }
     else { Fail "123" "Apache ErrorDocument 미설정 (기본 에러 페이지 노출)" }
 
     foreach ($code in @("033","039","044","048","121","122","124","125","126")) {
@@ -1852,14 +1876,30 @@ if ($WEB_SRV -eq "apache" -and $APACHE_CONF) {
 
 # Nginx on Windows 점검
 if ($WEB_SRV -eq "nginx" -and $NGINX_CONF) {
-    $ngContent = Get-Content $NGINX_CONF -EA SilentlyContinue
+    # nginx.conf + include 파일(상대 경로는 conf 폴더 기준, 3단계) - 주석 제거
+    $ngDir = Split-Path $NGINX_CONF
+    $ngFiles = @($NGINX_CONF); $ngQueue = @($NGINX_CONF)
+    for ($ngI = 0; $ngI -lt 3 -and $ngQueue; $ngI++) {
+        $ngNext = @()
+        foreach ($ngF in $ngQueue) {
+            $ngIncs = @(Get-Content $ngF -EA SilentlyContinue | ForEach-Object { $ln = $_ -replace '#.*', ''; if ($ln -match '^\s*include\s+([^;]+);') { $Matches[1].Trim().Trim('"', "'") } })
+            foreach ($inc in $ngIncs) {
+                $pat = if ([IO.Path]::IsPathRooted($inc)) { $inc } else { Join-Path $ngDir $inc }
+                foreach ($ngM in @(Get-ChildItem $pat -EA SilentlyContinue | Where-Object { -not $_.PSIsContainer } | ForEach-Object { $_.FullName })) {
+                    if ($ngFiles -notcontains $ngM) { $ngFiles += $ngM; $ngNext += $ngM }
+                }
+            }
+        }
+        $ngQueue = $ngNext
+    }
+    $ngContent = @($ngFiles | ForEach-Object { Get-Content $_ -EA SilentlyContinue } | ForEach-Object { $_ -replace '#.*', '' })
 
     # WST-031: autoindex
-    if ($ngContent -match "autoindex\s+on") { Fail "031" "Nginx autoindex on 설정됨" }
-    else { Pass "031" "Nginx autoindex off (기본 또는 명시)" }
+    if ($ngContent -match '^\s*autoindex\s+on\s*;') { Fail "031" "Nginx autoindex on 설정됨" }
+    else { Pass "031" "Nginx autoindex off (기본 또는 명시, 설정 파일 $($ngFiles.Count)개)" }
 
     # WST-102: server_tokens
-    if ($ngContent -match "server_tokens\s+off") { Pass "102" "Nginx server_tokens off 설정됨" }
+    if ($ngContent -match '^\s*server_tokens\s+off\s*;') { Pass "102" "Nginx server_tokens off 설정됨" }
     else { Fail "102" "Nginx server_tokens off 미설정 (버전 노출)" }
 
     foreach ($code in @("033","036","039","044","048","121","122","123","124","125","126")) {
@@ -2308,6 +2348,9 @@ $webRoots = @()
 if ($HAS_WEB_ADMIN) { $webRoots = @(Get-ChildItem 'IIS:\Sites' -EA SilentlyContinue | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_.physicalPath) } | Where-Object { $_ }) }
 if (-not $webRoots -and (Test-Path "C:\inetpub\wwwroot")) { $webRoots = @("C:\inetpub\wwwroot") }
 if ($TOMCAT_HOME) { $webRoots += "$TOMCAT_HOME\webapps" }
+if ($APACHE_CONF) { $webRoots += @(Select-String -Path $APACHE_CONF -Pattern '^\s*DocumentRoot\s+"?([^"]+)"?' -EA SilentlyContinue | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() -replace '/', '\' } | Where-Object { Test-Path $_ }) }
+if ($NGINX_CONF) { $webRoots += @(Select-String -Path $NGINX_CONF -Pattern '^\s*root\s+([^;]+);' -EA SilentlyContinue | ForEach-Object { $r0 = $_.Matches[0].Groups[1].Value.Trim().Trim('"') -replace '/', '\'; if (-not [IO.Path]::IsPathRooted($r0)) { $r0 = Join-Path (Split-Path (Split-Path $NGINX_CONF)) $r0 }; $r0 } | Where-Object { Test-Path $_ }) }
+$webRoots = @($webRoots | Where-Object { $_ } | Select-Object -Unique)
 function Worse([string]$a,[string]$b) {
     $rk = @{ "취약"=4; "수동확인"=3; "양호"=2; "N-A"=1 }
     if (-not $a) { return $b }; if (-not $b) { return $a }
@@ -2340,12 +2383,13 @@ if (-not $IIS_INSTALLED -and -not $WEB_SRV -and -not $WAS_SRV) {
     foreach ($r in $webRoots) { $f34 += @(Get-ChildItem $r -Recurse -Depth 2 -Include *.bak,*.old,*.tmp,*.orig,*~ -EA SilentlyContinue | Select-Object -First 3 | ForEach-Object FullName) }
     if ($ahcTxt -match 'IISSamples|IISHelp') { $f34 += "IISSamples/IISHelp 가상 디렉터리" }
     if ($TOMCAT_HOME -and (Test-Path "$TOMCAT_HOME\webapps\examples")) { $f34 += "Tomcat webapps\examples" }
-    if ($f34.Count -gt 0) { Fail "034" "불필요 파일/샘플 존재: $($f34 -join ', ')" } else { Pass "034" "샘플 디렉터리·임시/백업 파일 미발견" }
+    if ($f34.Count -gt 0) { Fail "034" "불필요 파일/샘플 존재: $($f34 -join ', ')" } elseif (-not $webRoots) { MC "034" "웹 서비스 경로 확인 불가 - 샘플·임시/백업 파일 수동 확인" } else { Pass "034" "샘플 디렉터리·임시/백업 파일 미발견" }
 
     # WST-035: 업로드/다운로드 용량 제한 (maxAllowedContentLength, bufferingLimit, maxRequestEntityAllowed)
     Evd "WST-035" "Select-String -Path '$ahc' -Pattern 'maxAllowedContentLength|bufferingLimit|maxRequestEntityAllowed' -EA SilentlyContinue"
     if ($IIS_INSTALLED) {
-        if ($ahcTxt -match 'maxAllowedContentLength=|maxRequestEntityAllowed=|bufferingLimit=') { Pass "035" "IIS 업로드/다운로드 용량 제한 설정됨 (requestLimits/ASP limits)" }
+        if ($ahcTxt -match 'maxAllowedContentLength="4294967295"') { Fail "035" "IIS 요청 크기 제한 해제 (maxAllowedContentLength=4294967295, 최대값)" }
+        elseif ($ahcTxt -match 'maxAllowedContentLength=|maxRequestEntityAllowed=|bufferingLimit=') { Pass "035" "IIS 업로드/다운로드 용량 제한 설정됨 (requestLimits/ASP limits)" }
         else { MC "035" "IIS 명시적 용량 제한 설정 없음 (기본 maxAllowedContentLength 30MB 적용) - 업무 기준 대비 적정성 확인" }
     } else { MC "035" "$WEB_SRV$WAS_SRV 용량 제한(LimitRequestBody/maxPostSize) 수동 확인" }
 
@@ -2355,12 +2399,12 @@ if (-not $IIS_INSTALLED -and -not $WEB_SRV -and -not $WAS_SRV) {
     Evd "WST-037" "Get-ChildItem 'IIS:\Sites' -EA SilentlyContinue | Select-Object Name,physicalPath; Select-String -Path '$ahc' -Pattern 'IISAdmin|IISAdmpwd' -EA SilentlyContinue"
     $bad37 = @($webRoots | Where-Object { $_ -match '^[A-Za-z]:\\?$' -or $_ -match '^[A-Za-z]:\\(Windows|Program Files|Users)\\?$' })
     if ($ahcTxt -match 'IISAdmin|IISAdmpwd') { $bad37 += "IISAdmin/IISAdmpwd 경로" }
-    if ($bad37.Count -gt 0) { Fail "037" "업무 영역과 분리되지 않은/불필요 경로: $($bad37 -join ', ')" } else { Pass "037" "웹 서비스 경로 분리됨: $($webRoots -join ', ')" }
+    if ($bad37.Count -gt 0) { Fail "037" "업무 영역과 분리되지 않은/불필요 경로: $($bad37 -join ', ')" } elseif (-not $webRoots) { MC "037" "웹 서비스 경로 확인 불가 - 업무 영역 분리 수동 확인" } else { Pass "037" "웹 서비스 경로 분리됨: $($webRoots -join ', ')" }
 
     # WST-038: 웹 경로 내 바로가기(.lnk) 파일
     Evd "WST-038" "foreach (`$r in @('$($webRoots -join "','")')) { Get-ChildItem `$r -Recurse -Filter *.lnk -EA SilentlyContinue | Select-Object -First 10 FullName }"
     $lnk = @(); foreach ($r in $webRoots) { $lnk += @(Get-ChildItem $r -Recurse -Filter *.lnk -EA SilentlyContinue | Select-Object -First 3 | ForEach-Object FullName) }
-    if ($lnk.Count -gt 0) { Fail "038" "웹 서비스 경로 내 바로가기 파일: $($lnk -join ', ')" } else { Pass "038" "웹 서비스 경로 내 바로가기(.lnk) 파일 없음" }
+    if ($lnk.Count -gt 0) { Fail "038" "웹 서비스 경로 내 바로가기 파일: $($lnk -join ', ')" } elseif (-not $webRoots) { MC "038" "웹 서비스 경로 확인 불가 - 바로가기(.lnk) 파일 수동 확인" } else { Pass "038" "웹 서비스 경로 내 바로가기(.lnk) 파일 없음" }
 
     # WST-040: 설정 파일 노출 방지 (.asa 매핑 / requestFiltering)
     Evd "WST-040" "Select-String -Path '$ahc' -Pattern '\.asa|hiddenSegments' -EA SilentlyContinue | Select-Object -First 10"
@@ -2372,7 +2416,7 @@ if (-not $IIS_INSTALLED -and -not $WEB_SRV -and -not $WAS_SRV) {
     Evd "WST-041" "foreach (`$r in @('$($webRoots -join "','")')) { icacls `$r }"
     $bad41 = @()
     foreach ($r in $webRoots) { $a = Get-Acl $r -EA SilentlyContinue; if ($a) { $a.Access | Where-Object { $_.IdentityReference -match 'Everyone' -and $_.FileSystemRights -match 'Write|Modify|FullControl' } | ForEach-Object { $bad41 += "$r(Everyone:$($_.FileSystemRights))" } } }
-    if ($bad41.Count -gt 0) { Fail "041" "웹 디렉터리 Everyone 과도 권한: $($bad41 -join ', ')" } else { Pass "041" "웹 디렉터리 Everyone 쓰기/수정 권한 없음" }
+    if ($bad41.Count -gt 0) { Fail "041" "웹 디렉터리 Everyone 과도 권한: $($bad41 -join ', ')" } elseif (-not $webRoots) { MC "041" "웹 서비스 경로 확인 불가 - 웹 디렉터리 권한 수동 확인" } else { Pass "041" "웹 디렉터리 Everyone 쓰기/수정 권한 없음" }
 
     # WST-042: 불필요한 스크립트 매핑 (.htr .idc .stm .shtm .shtml .printer .htw .ida .idq)
     Evd "WST-042" "Select-String -Path '$ahc' -Pattern 'path=`"\*\.(htr|idc|stm|shtm|shtml|printer|htw|ida|idq)`"' -EA SilentlyContinue"
@@ -2590,7 +2634,7 @@ KRes 'WEB-19' $r
 $lbn = ' (로드밸런서·프록시에서 TLS 종료 시 해당 구간 증빙으로 판단)'
 $r20 = $null; $r21 = $null
 if ($iisK -and $cfgOK) {
-    $noS = @($ksites | Where-Object { -not @($_.Bind | Where-Object { $_ -like 'https://*' }).Count } | ForEach-Object { $_.Name })
+    $noS = @($ksites | Where-Object { @($_.Bind | Where-Object { $_ -like 'http://*' -or $_ -like 'https://*' }).Count -and -not @($_.Bind | Where-Object { $_ -like 'https://*' }).Count } | ForEach-Object { $_.Name })   # FTP·net.tcp 전용 사이트 제외
     $r20 = if ($noS.Count) { "취약|HTTPS 바인딩 없는 사이트: $($noS -join ', ')$lbn" } else { '양호|전 사이트 HTTPS 바인딩' }
     $noR = @($ksites | Where-Object { $site = $_; $http = @($_.Bind | Where-Object { $_ -like 'http://*' }).Count
         $redir = ((WsVal $site { param($n) if ($n.httpRedirect.enabled -eq 'true') { $n.httpRedirect.destination } }) -match '^https://') -or

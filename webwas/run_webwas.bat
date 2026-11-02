@@ -1,7 +1,7 @@
 @echo off
 title WebWAS Security Check
 
-net session >nul 2>&1
+fltmc >nul 2>&1
 if %errorlevel% neq 0 (
     echo [ERROR] Run as Administrator.
     echo         Right-click this file ^> Run as administrator
