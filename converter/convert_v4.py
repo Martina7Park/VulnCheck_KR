@@ -7544,6 +7544,23 @@ def parse_version_info(text):
                 m = re.search(r'(\d+)', val)
                 if m: found.append(("tibero", m.group(1)))
 
+        # check_dbms.sh / check_dbms_mssql.ps1: 'DBMS 종류' 줄에는 버전이 없고 '# <제품> 버전: <값>' 줄에 따로 출력
+        elif key == "oracle 버전":       # 19.0 → 19 (18c 이후 연도형) / 12.2 → 12.2
+            m = re.search(r'(\d+)(?:\.(\d+))?', val)
+            if m: found.append(("oracle", m.group(1) if int(m.group(1)) >= 18 else f"{m.group(1)}.{m.group(2) or 0}"))
+        elif key == "mysql/mariadb 버전":   # 8.0.36 / 10.11.14-MariaDB-... → 주 버전(x.y)
+            m = re.search(r'(\d+\.\d+)', val)
+            if m: found.append(("mariadb" if "mariadb" in val.lower() else "mysql", m.group(1)))
+        elif key == "postgresql 버전":   # 'PostgreSQL 16.15 (…) on …' → 16 / 9.6.24 → 9.6
+            m = re.search(r'(\d+)(?:\.(\d+))?', val)
+            if m: found.append(("postgresql", m.group(1) if int(m.group(1)) >= 10 else f"{m.group(1)}.{m.group(2) or 0}"))
+        elif key == "tibero 버전":
+            m = re.search(r'(\d+)', val)
+            if m: found.append(("tibero", m.group(1)))
+        elif key == "sql server 버전":   # '2019 (15.0.4153.1)'
+            m = re.search(r'(20\d{2})', val)
+            if m: found.append(("mssql", m.group(1)))
+
         elif key in ("os version", "os 버전", "os버전", "kernel"):
             m = re.search(r'(\d+\.?\d*\.?\d*)', val)
             if m and not found:
@@ -7605,6 +7622,11 @@ def run_eos_check(category, res, text, base_dir):
             res[eos_code] = (worst, combined)
     else:
         res[eos_code] = (worst, combined)
+    # DBMS 주요정보 D-25(보안 패치 적용 버전): EoS = 보안 패치 미제공 → 취약, 지원 중이면 패치 적용 여부는 여전히 확인 필요(수동확인 유지)
+    if category == "dbms" and res.get("D-25", ("",))[0] == RESULT_MANUAL:
+        _why = res["D-25"][1]
+        res["D-25"] = ((RESULT_BAD, f"{combined} - 보안 패치가 제공되지 않는 버전") if worst == RESULT_BAD
+                       else (RESULT_MANUAL, f"{_why} / {combined}"))
 
     return res
 
