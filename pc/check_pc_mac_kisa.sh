@@ -10,6 +10,8 @@
 #   Windows 는 check_pc_kisa.ps1 사용. (전자금융용 check_pc_mac.sh 와 항목코드 의미가 다르므로 혼용 금지)
 #
 # [대상 OS]  macOS 12 이상 (bash 3.2 호환)
+#   PC-10/PC-11 은 Apple 보안 릴리스 목록(support.apple.com/100100)을 조회해 미적용 보안 릴리스·지원 종료 판정
+#   (인터넷 불가 시 연도 기반 추정, MAC_EOS_OFFLINE=1 로 조회 생략, PATCH_GRACE_DAYS=30 패치 유예일)
 # [실행 방법]
 #   sudo bash check_pc_mac_kisa.sh > ~/Desktop/PC_KISA_$(scutil --get ComputerName | tr ' /' '__').txt
 #   - sudo(root) 실행 권장: 시스템 데몬(launchctl)·원격 로그인(systemsetup)·암호 정책(pwpolicy)·공유 목록(sharing)은 root 만 조회 가능.
@@ -57,15 +59,161 @@ urd() {
 port_open() { nc -z -w 1 127.0.0.1 "$1" >/dev/null 2>&1; }
 # have <명령>: 명령이 있는지 (없으면 그 사실을 '점검불가' 사유로 쓰고, 빈 출력을 양호/취약으로 오판하지 않는다)
 have() { command -v "$1" >/dev/null 2>&1; }
-# svc_state <launchd 라벨> <포트>: on / off / unk  (root: launchctl 적재 여부, 비root: 포트가 열려 있으면 on, 아니면 unk; launchctl 이 없으면 unk)
+# 로컬 포트 수신(LISTEN) 여부: netstat -an -p tcp 의 LISTEN 행 '로컬 주소' 끝 포트만 인정 (외부로 나가는 연결의 원격 포트 5900 등은 서비스 활성 근거가 아님). netstat 에서 못 찾으면 로컬 연결 시도(nc)
+listening() {
+    if have netstat && netstat -an -p tcp 2>/dev/null | awk -v p="$1" '$NF=="LISTEN"{n=split($4,a,/[.:]/); if(a[n]==p) f=1} END{exit f?0:1}'; then return 0; fi
+    port_open "$1"
+}
+# svc_state <launchd 라벨> <포트>: on / off / unk
+#  ※ 'launchctl list' 에 보이는 com.apple.screensharing.agent / com.apple.RemoteDesktop.agent 는 모든 사용자 세션에 항상 로드되는 보조 에이전트라 서비스 활성 근거가 아님
+#    → 서비스 데몬이 system 도메인에 로드됐는지(launchctl print system/<라벨>) 또는 포트가 LISTEN 중인지로만 판정
+#  on: 포트 LISTEN 또는 system 도메인 로드 / off: root 이고 launchctl 로 조회했는데 미로드·포트 닫힘 / unk: 비root 에서 system 도메인을 못 보거나 launchctl 없음 (단정 불가)
 svc_state() {
-    if [ "$IS_ROOT" -eq 1 ] && ! have launchctl; then
-        echo unk
-    elif [ "$IS_ROOT" -eq 1 ]; then
-        if launchctl list 2>/dev/null | awk -v l="$1" '$3==l{f=1} END{exit f?0:1}'; then echo on; else echo off; fi
-    else
-        if [ -n "$2" ] && port_open "$2"; then echo on; else echo unk; fi
+    if [ -n "$2" ] && listening "$2"; then echo on; return; fi
+    if have launchctl; then
+        if launchctl print "system/$1" >/dev/null 2>&1; then echo on; return; fi
+        [ "$IS_ROOT" -eq 1 ] && { echo off; return; }
     fi
+    echo unk
+}
+# ard_state: 원격 관리(ARD) on / off / unk — ARDAgent 프로세스(ps 는 모든 사용자 프로세스가 보임) 또는 3283 포트 LISTEN 이면 on
+ard_state() {
+    if have ps && ps -axo comm 2>/dev/null | awk -F/ '$NF=="ARDAgent"{f=1} END{exit f?0:1}'; then echo on; return; fi
+    if listening 3283; then echo on; return; fi
+    if have ps; then echo off; else echo unk; fi
+}
+
+# ── 백신 판별: 앱 이름·실행 파일 이름(경로 제외)으로만 판별 ──
+#  /Applications/AhnLab/ASTx(안랩 세이프 트랜잭션, 금융 보안 모듈)처럼 폴더·경로에 제조사명이 있어도 백신이 아닌 것을 백신으로 오탐하지 않도록
+#  ※ 'AhnLab' 단독 일치는 쓰지 않음 (V3 제품은 'V3'/'AhnLab V3' 로 시작하는 앱 이름으로 판별)
+AV_APP_RE='^(ahnlab ?)?v3( |lite|365|$)|kaspersky|alyac|sophos|symantec|norton|mcafee|^eset|bitdefender|crowdstrike|^falcon|^sentinel|defender|malwarebytes|avast|avira|trend ?micro'
+AV_PROC_RE='^(v3|ahnlab ?v3)|^kav|kaspersky|sophos|symantec|norton|mcafee|^eset|bitdefender|^bdldaemon|^falcon|com\.crowdstrike|^sentinel|^wdav|malwarebytes|^rtprotection|avast|avira|alyac|trend ?micro|^icoreservice'
+# av_scan: AV_DIRS(검색한 폴더) / AV_APPS(백신 앱 이름) / AV_PROCS(백신 프로세스 이름) 설정
+av_scan() {
+    AV_DIRS="/Applications"
+    if [ "$IS_ROOT" -eq 1 ]; then
+        case "$TUSER" in ''|*[!A-Za-z0-9._-]*) ;; *) AV_DIRS="$AV_DIRS /Users/$TUSER/Applications" ;; esac
+    else
+        case "$HOME" in ''|*[!A-Za-z0-9._/-]*) ;; *) AV_DIRS="$AV_DIRS $HOME/Applications" ;; esac
+    fi
+    AV_APPS=$(find $AV_DIRS -maxdepth 2 -name '*.app' 2>/dev/null | sed 's#.*/##;s/\.app$//' | grep -iE "$AV_APP_RE" | sort -u | tr '\n' ',' | sed 's/,$//')
+    AV_PROCS=$(ps -axo comm 2>/dev/null | awk -F/ '{print $NF}' | grep -iE "$AV_PROC_RE" | sort -u | tr '\n' ',' | sed 's/,$//')
+}
+
+# ── macOS 지원 종료(EoS) 판정: Apple 보안 릴리스 페이지(support.apple.com/100100) 조회 ──
+# Apple 은 macOS 지원 종료일을 공지하지 않으므로 '실제 보안 업데이트 배포 여부'로 판정:
+#   최신 주요 버전(N) 최초 출시 이후에도 CVE 가 포함된 보안 업데이트를 받은 주요 버전 = 지원 중, 그 외 = 지원 종료
+#   (N-3 은 N 출시 당일 마지막 업데이트를 받고 끝나므로 '출시일 당일 릴리스'만 있는 경우는 PATCH_GRACE_DAYS 동안만 전환기(수동확인), 이후 지원 종료)
+# 결과 변수: EOS_RES(양호/취약/수동확인/점검불가) EOS_DESC(근거 한 줄) EOS_EVD(증적용 원자료) /
+#           PATCH_LATEST(같은 주요 버전의 더 새 보안 릴리스 중 최신), PATCH_DATE·PATCH_AGE(미적용 보안 릴리스 중 가장 오래된 것의 배포일·경과일)
+# MAC_EOS_OFFLINE=1 이면 온라인 조회를 생략하고, 조회·해석에 실패하면 연도 기반 '추정'으로 판정한다. PATCH_GRACE_DAYS(기본 30)
+# 조회한 페이지 내용은 awk 로 숫자·날짜만 뽑아 검증한 값만 사용 (eval 사용 안 함)
+mac_eos_check() {
+    local major=${OS_VER%%.*} url="https://support.apple.com/en-us/100100" grace why="" page="" crc=0 raw="" parsed="" rows="" out="" nrows=0
+    local e_ok e_n e_n0 e_sup e_lv e_ld e_r e_pl e_pd e_age e_nr e_nm fd ld bad=0 x today
+    EOS_RES=""; EOS_DESC=""; EOS_EVD=""; PATCH_LATEST=""; PATCH_DATE=""; PATCH_AGE=""
+    grace=${PATCH_GRACE_DAYS:-30}; case "$grace" in ''|*[!0-9]*) grace=30 ;; esac
+    case "$major" in
+        ''|*[!0-9]*) EOS_RES="점검불가"; EOS_DESC="macOS 버전(sw_vers) 조회 실패 (${OS_VER}) - 지원 종료 여부 판정 불가"; EOS_EVD="OS_VER=${OS_VER}"; return 0 ;;
+    esac
+    today=$(date +%Y%m%d)
+    if [ -n "$MAC_EOS_OFFLINE" ]; then why="MAC_EOS_OFFLINE 설정으로 온라인 조회 생략"
+    elif ! have curl; then why="curl 명령 없음"
+    else
+        page=$(curl -sfL -m 20 --connect-timeout 8 -A "Mozilla/5.0" "$url" 2>/dev/null); crc=$?
+        if [ "$crc" -ne 0 ] || [ -z "$page" ]; then why="Apple 보안 릴리스 페이지 조회 실패 (curl 종료코드 ${crc})"
+        else
+            # 1) macOS 행만 뽑아 태그 제거 (칸은 | 로 구분) — 증적 원자료
+            raw=$(printf '%s\n' "$page" | tr '\r\n' '  ' | sed 's#</[Tt][Rr]>#&\
+#g' | sed -e 's/<[^>]*>/|/g' -e 's/&nbsp;/ /g' -e 's/&amp;/\&/g' | awk -F'|' '
+                { n=0; for(i=1;i<=NF;i++){ f=$i; gsub(/^[ \t]+/,"",f); gsub(/[ \t]+$/,"",f); gsub(/[ \t]+/," ",f); if(f!=""){ n++; c[n]=f } }
+                  if (n>0 && c[1] ~ /^macOS [A-Z][A-Za-z ]* [0-9]+(\.[0-9]+)*$/) { s=c[1]; for(i=2;i<=n;i++) s=s "|" c[i]; print s } }')
+            # 2) 버전·날짜(YYYYMMDD)·CVE 없음 여부(1) 로 정규화하고 형식이 맞는 줄만 사용
+            parsed=$(printf '%s\n' "$raw" | awk -F'|' '
+                BEGIN{split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec",M," "); for(i=1;i<=12;i++) m[M[i]]=sprintf("%02d",i)}
+                NF>0 { v=$1; sub(/.* /,"",v); nc=($0 ~ /no published CVE/)?1:0; d=""
+                  for(i=2;i<=NF;i++){ if (split($i,a," ")==3 && a[1] ~ /^[0-9][0-9]?$/ && (a[2] in m) && a[3] ~ /^20[0-9][0-9]$/) { d=a[3] m[a[2]] sprintf("%02d",a[1]+0); break } }
+                  if (d!="") print v, d, nc }')
+            rows=$(printf '%s\n' "$parsed" | grep -E '^[0-9]+(\.[0-9]+)* 20[0-9]{6} [01]$')
+            if [ -n "$rows" ]; then nrows=$(printf '%s\n' "$rows" | wc -l | tr -d ' '); fi
+            EOS_EVD="[원문: macOS 행 (HTML 태그 제거, 칸 구분 |) - 조회 ${url}, 수신 ${#page}자]
+${raw:-(macOS 행 없음)}
+[정규화: 버전 날짜(YYYYMMDD) CVE없음여부(1=This update has no published CVE entries)]
+${rows:-(해석된 행 없음)}"
+            if [ "$nrows" -lt 10 ]; then why="목록 해석 실패 (해석된 macOS 릴리스 ${nrows}개 - 페이지 형식 변경 가능)"
+            else
+                out=$(printf '%s\n' "$rows" | awk -v cur="$OS_VER" -v mj="$major" -v today="$today" -v grace="$grace" '
+                    function vcmp(a,b,  x,y,i,n,m,p,q){n=split(a,x,".");m=split(b,y,".");if(m>n)n=m;for(i=1;i<=n;i++){p=x[i]+0;q=y[i]+0;if(p<q)return -1;if(p>q)return 1}return 0}
+                    function jd(s,  y,mo,d){y=int(s/10000);mo=int((s%10000)/100);d=s%100;if(mo<3){y--;mo+=12};return int(365.25*(y+4716))+int(30.6001*(mo+1))+d}
+                    { split($1,p,"."); M=p[1]+0; d=$2+0; nrows++
+                      if(!(M in seen)){seen[M]=1; nmaj++}
+                      if(M>N) N=M
+                      if(!(M in first) || d<first[M]) first[M]=d
+                      if(vcmp($1,M".0")==0 && (!(M in n0) || d<n0[M])) n0[M]=d
+                      if($3==0){ if(!(M in last) || d>last[M]) last[M]=d
+                                 if(!(M in lv) || vcmp($1,lv[M])>0) lv[M]=$1 }
+                      if(d>newest) newest=d
+                      if($3==0 && M==mj+0 && vcmp($1,cur)>0){ if(pl==""||vcmp($1,pl)>0) pl=$1; if(pd==""||d<pd) pd=d } }
+                    END{ ok=1
+                      if(nrows<10 || nmaj<3 || N<10) ok=0
+                      if(jd(today)-jd(newest)>400 || jd(newest)-jd(today)>7) ok=0
+                      n0d=(N in n0)?n0[N]:first[N]; age0=jd(today)-jd(n0d)
+                      sup=""; for(k=N;k>=10;k--) if(k==N || ((k in last) && (last[k]>n0d || (last[k]==n0d && age0<=grace+0)))) sup=sup (sup==""?"":",") k
+                      mn=mj+0
+                      if(mn>N) r="N"
+                      else if(mn==N) r="G"
+                      else if((mn in last) && last[mn]>n0d) r="G"
+                      else if((mn in last) && last[mn]==n0d && age0<=grace+0) r="M"
+                      else r="B"
+                      printf "%d|%d|%d|%s|%s|%s|%s|%s|%s|%s|%d|%d\n", ok, N, n0d, sup, lv[mn], last[mn], r, pl, pd, (pd==""?"":jd(today)-jd(pd)), nrows, nmaj }')
+                IFS='|' read -r e_ok e_n e_n0 e_sup e_lv e_ld e_r e_pl e_pd e_age e_nr e_nm <<EOF
+$out
+EOF
+                # awk 출력 검증: 숫자·버전·날짜 형식이 아니면 사용하지 않음
+                for x in "$e_ok" "$e_n" "$e_n0" "$e_nr" "$e_nm"; do case "$x" in ''|*[!0-9]*) bad=1 ;; esac; done
+                for x in "$e_lv" "$e_pl"; do case "$x" in *[!0-9.]*) bad=1 ;; esac; done
+                for x in "$e_ld" "$e_pd" "$e_age"; do case "$x" in *[!0-9]*) bad=1 ;; esac; done
+                case "$e_sup" in ''|*[!0-9,]*) bad=1 ;; esac
+                case "$e_r" in G|B|M|N) ;; *) bad=1 ;; esac
+                if [ "$bad" -ne 0 ]; then why="목록 해석 결과 검증 실패"
+                elif [ "$e_ok" != 1 ]; then why="목록 내용 이상 (macOS 릴리스 ${e_nr}개, 주요 버전 ${e_nm}종, 최신 ${e_n} - 오래된 페이지이거나 형식 변경)"
+                else
+                    fd="${e_n0:0:4}-${e_n0:4:2}-${e_n0:6:2}"; ld=""; [ -n "$e_ld" ] && ld=" ${e_ld:0:4}-${e_ld:4:2}-${e_ld:6:2}"
+                    case "$e_r" in
+                        G) EOS_RES="양호"; EOS_DESC="macOS ${OS_VER} - Apple 보안 업데이트 지원 중 (지원 주요 버전: ${e_sup}, 해당 버전 최근 보안 릴리스 ${e_lv:-미확인}${ld}) [Apple 보안 릴리스 목록 support.apple.com/100100 조회]" ;;
+                        N) EOS_RES="양호"; EOS_DESC="macOS ${OS_VER} - 보안 릴리스 목록의 최신 주요 버전(${e_n})보다 높은 버전(베타·목록 지연 가능)으로 지원 중으로 간주 [Apple 보안 릴리스 목록 support.apple.com/100100 조회]" ;;
+                        M) EOS_RES="수동확인"; EOS_DESC="macOS ${OS_VER} - macOS ${e_n} 출시(${fd}) 직후 전환기: 최종 보안 릴리스(${e_lv}${ld})가 출시일과 같아 지원 종료 여부 미확정 (${grace}일 후 재확인) - Apple 보안 릴리스 확인 [support.apple.com/100100 조회]" ;;
+                        *) EOS_RES="취약"; EOS_DESC="macOS ${OS_VER} - Apple 보안 업데이트 지원 종료 (최종 보안 릴리스 ${e_lv:-최근 3년 목록에 없음}${ld}, macOS ${e_n} 최초 출시(${fd}) 이후 추가 보안 업데이트 없음) - 지원 버전(${e_sup})으로 업그레이드 필요 [Apple 보안 릴리스 목록 support.apple.com/100100 조회]" ;;
+                    esac
+                    if [ -n "$e_pl" ]; then PATCH_LATEST="$e_pl"; PATCH_DATE="${e_pd:0:4}-${e_pd:4:2}-${e_pd:6:2}"; PATCH_AGE="$e_age"; fi
+                    EOS_EVD="${EOS_EVD}
+[판정 입력] 주요 버전=${major} 현재=${OS_VER} 최신 주요 버전=${e_n}(최초 출시 ${fd}) 지원 주요 버전=${e_sup} 유예일=${grace} 같은 주요 버전의 미적용 보안 릴리스=${e_pl:-없음}${e_pd:+ (가장 오래된 배포일 ${PATCH_DATE}, ${e_age}일 경과)}"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    # ── 오프라인 추정: Apple 은 매년 9월 새 주요 버전 출시(26=2025, 27=2026 …) 후 최신 3개 주요 버전만 보안 업데이트 ──
+    local y m n list sup oldest k
+    y=$(date +%Y); m=$(date +%m); m=${m#0}
+    EOS_EVD="${EOS_EVD:+${EOS_EVD}
+}[오프라인 추정] 사유: ${why}. 시스템 날짜 ${y}-${m}, 주요 버전=${major} (연도 기반 추정 - Apple 서버 조회 불가)"
+    if [ "$y" -lt 2025 ] 2>/dev/null; then
+        EOS_RES="수동확인"; EOS_DESC="macOS ${OS_VER} - 지원 여부 추정 불가 (${why}; 시스템 날짜 ${y} 가 비정상) - support.apple.com/100100 에서 직접 확인"; return 0
+    fi
+    n=$((y - 2000)); [ "$m" -ge 9 ] && n=$((n + 1))
+    list="11 12 13 14 15"; k=26; while [ $k -le $n ]; do list="$list $k"; k=$((k+1)); done
+    sup=$(echo $list | awk '{print $(NF-2), $(NF-1), $NF}'); oldest=${sup%% *}
+    if [ "$major" -gt "$n" ] 2>/dev/null || echo " $sup " | grep -q " $major "; then
+        if [ "$major" = "$oldest" ] && [ "$m" -ge 9 ] && [ "$m" -le 10 ]; then
+            EOS_RES="수동확인"; EOS_DESC="macOS ${OS_VER} - 신규 주요 버전 출시 전환기(지원 종료 가능) - Apple 보안 릴리스 확인 필요 (${why} → 연도 기반 추정, 추정 지원 버전: ${sup// /·})"
+        else
+            EOS_RES="양호"; EOS_DESC="macOS ${OS_VER} - 보안 업데이트 지원 버전으로 추정 (${why} → 연도 기반 추정, 추정 지원 버전: ${sup// /·}; support.apple.com/100100 확인 권장)"
+        fi
+    else
+        EOS_RES="취약"; EOS_DESC="macOS ${OS_VER} - 보안 업데이트 지원 종료 버전으로 추정 (${why} → 연도 기반 추정, 추정 지원 버전: ${sup// /·}; support.apple.com/100100 확인 권장)"
+    fi
+    return 0
 }
 
 # ── 헤더 메타데이터: IP / 실행 계정 / 클라우드 ──
@@ -251,23 +399,30 @@ result "PC-03|N-A|가이드 점검 대상(Windows 10, Windows 11) 아님 - macOS
 
 # ── PC-04 공유 폴더 ──
 evd "PC-04" "sharing -l"
-evd "PC-04" "launchctl list"
+evd "PC-04" "launchctl print system/com.apple.smbd"
+evd "PC-04" "launchctl print system/com.apple.AppleFileServer"
+evd "PC-04" "netstat -an -p tcp"
 evd "PC-04" "defaults read /Library/Preferences/SystemConfiguration/com.apple.smb.server"
-evd "PC-04" "nc -z -w 1 127.0.0.1 445 && echo 'port 445 open' || echo 'port 445 closed'"
+evd "PC-04" "nc -z -w 1 127.0.0.1 445 && echo 'port 445 open' || echo 'port 445 closed'; nc -z -w 1 127.0.0.1 548 && echo 'port 548 open' || echo 'port 548 closed'"
 SHARING=$(sharing -l 2>/dev/null)
 shares=$(echo "$SHARING" | awk -F':[ \t]*' '/^name:/{print $2}' | tr '\n' ',' | sed 's/,$//')
 # 공유별 게스트 접근: 'List of Share Points' 블록의 smb/afp 'guest access: 1'
 gshare=$(echo "$SHARING" | awk -F':[ \t]*' '/^name:/{n=$2} /guest access/{gsub(/[ \t]/,"",$2); if($2=="1") print n}' | sort -u | tr '\n' ',' | sed 's/,$//')
 smb=$(svc_state com.apple.smbd 445)
+afp=$(svc_state com.apple.AppleFileServer 548)
 guest=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.smb.server AllowGuestAccess 2>/dev/null)
-if [ "$guest" = "1" ]; then result "PC-04|취약|파일 공유 게스트 접근 허용 (AllowGuestAccess=1), 공유: ${shares:-목록 조회 불가}"
-elif [ "$IS_ROOT" -eq 1 ]; then
-    if [ -n "$gshare" ]; then result "PC-04|취약|공유 폴더 게스트 접근 허용 (비밀번호 없이 접근): ${gshare}"
-    elif [ -z "$shares" ] && [ "$smb" = "unk" ]; then result "PC-04|점검불가|SMB 서비스 상태(launchctl)·공유 목록(sharing -l)을 조회하지 못함 (launchctl/sharing 명령 없음 또는 오류)"
-    elif [ -z "$shares" ] && [ "$smb" = "off" ]; then result "PC-04|양호|파일 공유 비활성 (공유 폴더 없음)"
-    else result "PC-04|수동확인|파일 공유 사용: ${shares:-공유 목록 없음(SMB 서비스 적재: $smb)} - 불필요 공유 여부·접근 권한 확인"; fi
+fson=""; [ "$smb" = on ] && fson="${fson} SMB"; [ "$afp" = on ] && fson="${fson} AFP"
+if [ -n "$fson" ]; then
+    if [ -n "$gshare" ]; then result "PC-04|취약|파일 공유(${fson# }) 활성 + 공유 폴더 게스트 접근 허용 (비밀번호 없이 접근): ${gshare}"
+    elif [ "$guest" = "1" ]; then result "PC-04|취약|파일 공유(${fson# }) 활성 + 게스트 접근 허용 (AllowGuestAccess=1), 공유: ${shares:-목록 조회 불가}"
+    elif [ "$IS_ROOT" -eq 1 ]; then result "PC-04|수동확인|파일 공유 사용(${fson# }): ${shares:-공유 목록 없음} - 불필요 공유 여부·접근 권한 확인"
+    else result "PC-04|점검불가|파일 공유(${fson# }) 활성이나 공유 폴더 목록(sharing -l)·공유별 게스트 설정 조회 불가: ${NEED_ROOT} (AllowGuestAccess=${guest:-미설정})"; fi
+elif [ "$IS_ROOT" -eq 1 ] && [ "$smb" = "off" ] && [ "$afp" = "off" ]; then
+    # 공유 폴더가 정의돼 있어도 파일 공유 서비스(SMB/AFP)가 꺼져 있으면 외부 접근 불가 → 양호
+    result "PC-04|양호|파일 공유 서비스(SMB/AFP) 비활성 (system 도메인 미적재, 포트 445/548 닫힘)$([ -n "$shares" ] && echo " - 정의된 공유 ${shares} 는 서비스가 꺼져 있어 접근 불가")$({ [ -n "$gshare" ] || [ "$guest" = "1" ]; } && echo ", 게스트 허용 설정 존재(${gshare:-AllowGuestAccess=1}) - 재활성 시 취약")"
+elif [ "$IS_ROOT" -eq 1 ]; then result "PC-04|점검불가|SMB/AFP 서비스 상태(launchctl)를 조회하지 못함 (launchctl 명령 없음 또는 오류, 포트 445/548 닫힘)"
 else
-    result "PC-04|점검불가|공유 폴더 목록(sharing -l)·SMB 서비스 상태 조회 불가: ${NEED_ROOT} (SMB 포트 445 $([ "$smb" = on ] && echo 열림 || echo 닫힘), AllowGuestAccess=${guest:-미설정})"
+    result "PC-04|점검불가|공유 폴더 목록(sharing -l)·SMB 서비스 상태 조회 불가: ${NEED_ROOT} (포트 445/548 닫힘, AllowGuestAccess=${guest:-미설정})"
 fi
 
 # ── PC-05 불필요한 서비스 (원격 로그인·원격 Apple 이벤트·인터넷 공유·원격 관리 등) ──
@@ -336,11 +491,14 @@ ed=$(defaults read "/Library/Managed Preferences/com.microsoft.Edge" ClearBrowsi
 if [ "${ch:-0}" -gt 0 ] || [ "$ed" = "1" ]; then result "PC-09|양호|브라우저 종료 시 캐시 삭제 정책 적용 (Chrome=${ch}, Edge=${ed:-미설정})"
 else result "PC-09|수동확인|브라우저 종료 시 임시 파일(캐시) 삭제 정책 미확인 - 사용 브라우저별 설정 확인 (Safari 는 해당 설정 없음)"; fi
 
-# ── PC-10 주기적 보안 패치 (자동 업데이트 + 마지막 설치일 90일 이내) ──
+# ── PC-10 주기적 보안 패치 (자동 업데이트 + 마지막 설치일 90일 이내 + 미적용 보안 릴리스) ──
 evd "PC-10" "defaults read /Library/Preferences/com.apple.SoftwareUpdate"
+evd "PC-10" "softwareupdate --schedule"
 evd "PC-10" "softwareupdate --history"
 ac=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null)
 cr=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall 2>/dev/null)
+# 키 미설정 = macOS 기본값(자동 확인 켜짐) — softwareupdate --schedule 로 대조
+if [ -z "$ac" ] && softwareupdate --schedule 2>&1 | grep -qiE 'turned off|check is off'; then ac=0; ac_src=" (키 없음, softwareupdate --schedule 이 꺼짐으로 응답)"; else ac_src=""; fi
 last=$(softwareupdate --history 2>/dev/null | awk 'NR>2{
     if (match($0, /[0-9][0-9][0-9][0-9][.\/-] ?[0-9][0-9]?[.\/-] ?[0-9][0-9]?/)) { d=substr($0,RSTART,RLENGTH); gsub(/ /,"",d); split(d,a,/[.\/-]/); printf "%04d-%02d-%02d\n", a[1],a[2],a[3] }
     else if (match($0, /[0-9][0-9]?\/[0-9][0-9]?\/[0-9][0-9][0-9][0-9]/)) { split(substr($0,RSTART,RLENGTH),a,"/"); printf "%04d-%02d-%02d\n", a[3],a[1],a[2] }
@@ -350,21 +508,22 @@ if [ -n "$last" ]; then
     le=$(date -j -f '%Y-%m-%d' "$last" '+%s' 2>/dev/null)
     [ -n "$le" ] && age=$(( ($(date '+%s') - le) / 86400 ))
 fi
-evq "PC-10" "자동 업데이트 설정 / 마지막 설치일(softwareupdate --history) / 경과일" "AutomaticCheckEnabled=${ac:-미설정(기본 1)} CriticalUpdateInstall=${cr:-미설정(기본 1)} last=${last:-확인 불가} age_days=${age:-확인 불가}"
-if ! have defaults; then result "PC-10|점검불가|defaults 명령이 없어 자동 업데이트 설정을 읽을 수 없음"
-elif [ "$ac" = "0" ] || [ "$cr" = "0" ]; then result "PC-10|취약|자동 업데이트 비활성 (AutomaticCheckEnabled=${ac:-기본}, CriticalUpdateInstall=${cr:-기본}) - 최근 설치 ${last:-확인 불가}"
+evq "PC-10" "자동 업데이트 설정 / 마지막 설치일(softwareupdate --history) / 경과일" "AutomaticCheckEnabled=${ac:-미설정(기본 1)}${ac_src} CriticalUpdateInstall=${cr:-미설정(기본 1)} last=${last:-확인 불가} age_days=${age:-확인 불가}"
+mac_eos_check   # PC-10(보안 릴리스 적용)·PC-11(지원 종료) 공용 — Apple 보안 릴리스 목록 조회
+evq "PC-10" "Apple 보안 릴리스 목록 조회·해석 원자료 (PC-10 미적용 보안 릴리스 / PC-11 지원 종료 공용)" "$EOS_EVD"
+GRACE=${PATCH_GRACE_DAYS:-30}; case "$GRACE" in ''|*[!0-9]*) GRACE=30 ;; esac
+pmiss=""; [ -n "$PATCH_LATEST" ] && pmiss="미적용 보안 릴리스: ${OS_VER} → ${PATCH_LATEST} (가장 오래된 미적용 배포 ${PATCH_DATE}, ${PATCH_AGE}일 경과)"
+if [ -n "$PATCH_LATEST" ] && [ "${PATCH_AGE:-0}" -gt "$GRACE" ] 2>/dev/null; then result "PC-10|취약|${pmiss} - ${GRACE}일 이상 보안 패치 미적용 (AutomaticCheck=${ac:-기본 1}, Critical=${cr:-기본 1}, 최근 설치 ${last:-확인 불가})"
+elif ! have defaults; then result "PC-10|점검불가|defaults 명령이 없어 자동 업데이트 설정을 읽을 수 없음"
+elif [ "$ac" = "0" ] || [ "$cr" = "0" ]; then result "PC-10|취약|자동 업데이트 비활성 (AutomaticCheckEnabled=${ac:-기본}${ac_src}, CriticalUpdateInstall=${cr:-기본}) - 최근 설치 ${last:-확인 불가}"
 elif [ -n "$age" ] && [ "$age" -gt 90 ]; then result "PC-10|취약|최근 업데이트 설치일 ${last} 로부터 ${age}일 경과 (90일 초과; 자동 업데이트 설정은 활성)"
-else result "PC-10|양호|자동 업데이트·보안 응답 설치 활성 (AutomaticCheck=${ac:-기본 1}, Critical=${cr:-기본 1}), 최근 설치 ${last:-확인 불가}${age:+ (${age}일 전)} - 내부 관리 절차는 인터뷰 확인"; fi
+else result "PC-10|양호|자동 업데이트·보안 응답 설치 활성 (AutomaticCheck=${ac:-기본 1}, Critical=${cr:-기본 1}), 최근 설치 ${last:-확인 불가}${age:+ (${age}일 전)}$([ -n "$pmiss" ] && echo ", ${pmiss}(유예 ${GRACE}일 이내)") - 내부 관리 절차는 인터뷰 확인"; fi
 
 # ── PC-11 지원이 종료되지 않은 OS (Windows Build → macOS 버전) ──
 evd "PC-11" "sw_vers"
-# Apple 은 최신 3개 주요 버전에 보안 업데이트 제공. 지원 최소 주 버전은 MAC_MIN_SUPPORTED 환경변수로 조정 (기본 15: 2026-09 기준 macOS 27·26·15)
-MIN_SUP="${MAC_MIN_SUPPORTED:-15}"
-evq "PC-11" "판정에 쓴 값 (OS 주 버전 / 지원 최소 주 버전 기준)" "OS_MAJOR=${OS_MAJOR} MIN_SUPPORTED=${MIN_SUP}"
-if ! [ "${OS_MAJOR:-0}" -ge 1 ] 2>/dev/null; then result "PC-11|점검불가|macOS 버전(sw_vers) 조회 실패"
-elif [ "$OS_MAJOR" -ge "$MIN_SUP" ]; then result "PC-11|양호|macOS ${OS_VER} - 보안 업데이트 지원 버전 (기준: 주 버전 ${MIN_SUP} 이상)"
-elif [ "$OS_MAJOR" -eq $((MIN_SUP-1)) ]; then result "PC-11|수동확인|macOS ${OS_VER} - 최신 3개 버전에서 제외(보안 업데이트 종료 전환) - Apple 보안 릴리스 확인, macOS ${MIN_SUP} 이상 업그레이드 권고"
-else result "PC-11|취약|macOS ${OS_VER} - 보안 업데이트 지원 종료 버전 (macOS ${MIN_SUP} 이상 필요)"; fi
+# Apple 은 macOS 지원 종료일을 공지하지 않음 → 보안 릴리스 페이지에서 '최신 주요 버전 출시 이후에도 보안 업데이트를 받는지'로 판정 (mac_eos_check, PC-10 에서 조회)
+evq "PC-11" "Apple 보안 릴리스 목록 조회·해석 원자료 (결과: ${EOS_RES})" "$EOS_EVD"
+result "PC-11|${EOS_RES}|${EOS_DESC}"
 
 # ── PC-12 자동 로그인 ──
 evd "PC-12" "defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser"
@@ -375,17 +534,20 @@ elif [ -n "$al" ] || [ -f /etc/kcpassword ]; then result "PC-12|취약|자동 �
 else result "PC-12|양호|자동 로그인 비활성"; fi
 
 # ── PC-13 / PC-14 백신 설치·업데이트 / 실시간 감시 ──
-AVRE='kaspersky|ahnlab|^v3( |lite|365|$)|alyac|sophos|symantec|norton|mcafee|trend ?micro|eset|bitdefender|crowdstrike|falcon|sentinel|defender|malwarebytes|avast|avira'
-evd "PC-13" "ls /Applications"
+av_scan
+evd "PC-13" "find $AV_DIRS -maxdepth 2 -name '*.app'"
 evd "PC-13" "ps -axo comm"
 evd "PC-13" "system_profiler SPInstallHistoryDataType"
 evd "PC-14" "ps -axo comm"
-evd "PC-14" "ls /Applications"
-av=$(ls /Applications 2>/dev/null | sed 's/\.app$//' | grep -iE "$AVRE" | tr '\n' ',' | sed 's/,$//')
-# 실행 중 프로세스: 실행 파일 이름 앞부분 일치 (부분 문자열 오탐 방지)
-avp=$(ps -axo comm 2>/dev/null | awk -F/ '{print $NF}' | grep -iE '^(wdav|falcond|falcon-sensor|sentinelagent|sentineld|sophos|savd|symantec|norton|mcafee|eset|esets|bdagent|bdservicehost|kav|kaspersky|ahnlab|v3|avast|avgd|malwarebytes|mbam|avira)' | sort -u | tr '\n' ',' | sed 's/,$//')
+evd "PC-14" "find $AV_DIRS -maxdepth 2 -name '*.app'"
+evq "PC-13" "백신 판별 결과 (앱 이름·실행 파일 이름만으로 판별, 경로 제외 - /Applications/AhnLab/ASTx 는 안랩 세이프 트랜잭션(금융 보안 모듈)으로 백신 아님)" "앱=${AV_APPS:-없음}" "앱 패턴=${AV_APP_RE}"
+evq "PC-14" "백신 실행 프로세스 판별 결과 (실행 파일 이름만 사용)" "프로세스=${AV_PROCS:-없음}" "프로세스 패턴=${AV_PROC_RE}"
+av="$AV_APPS"; avp="$AV_PROCS"
 xp=$(system_profiler SPInstallHistoryDataType 2>/dev/null | grep -A4 'XProtectPlistConfigData' | grep -i 'Install Date' | tail -1 | sed 's/.*: //')
-if [ -n "$av" ]; then
+if ! have find; then
+    result "PC-13|점검불가|find 명령이 없어 설치된 백신 앱을 조사할 수 없음"
+    result "PC-14|점검불가|find 명령이 없어 설치된 백신 앱을 조사할 수 없음 - 백신 실시간 감시 수동 확인"
+elif [ -n "$av" ]; then
     result "PC-13|수동확인|백신 설치: ${av} - 엔진·패턴 최신 업데이트 여부 백신 콘솔에서 확인 (XProtect 최근 갱신: ${xp:-미확인})"
     if [ -n "$avp" ]; then result "PC-14|양호|백신 실시간 감시 프로세스 실행: ${avp}"; else result "PC-14|수동확인|백신(${av}) 실시간 감시 프로세스 미확인 - 백신 설정에서 실시간 보호 확인"; fi
 else
@@ -423,9 +585,11 @@ else
         { [ -z "$dsl" ] || [ "$v" -gt "$dsl" ]; } 2>/dev/null && dsl=$v
     done
     t=${idle:-0}; [ "$t" -eq 0 ] 2>/dev/null && [ -n "$dsl" ] && [ "$dsl" -gt 0 ] && t=$((dsl*60))
+    # sysadminctl -screenLock 을 우선(macOS 13+ 는 askForPassword 키가 비었거나 이전 값이 남을 수 있음), 해석 불가일 때만 키 사용
     pwok=0
-    [ "$askpw" = "1" ] && pwok=1
-    echo "$lkst" | grep -qiE 'immediate|[0-9]+ (seconds|minutes)' && pwok=1
+    if echo "$lkst" | grep -qiE 'immediate|delay is [0-9]+|[0-9]+ (seconds|minutes)'; then pwok=1
+    elif echo "$lkst" | grep -qiwE 'off|disabled'; then pwok=0
+    elif [ "$askpw" = "1" ]; then pwok=1; fi
     evq "PC-16" "판정에 쓴 값 (사용자 ${TUSER}) idleTime(초) / askForPassword / askForPasswordDelay / sysadminctl -screenLock / displaysleep(분, 배터리·AC 최악)" "idleTime=${idle:-미설정} askForPassword=${askpw:-미설정} askForPasswordDelay=${askdl:-미설정} screenLock=[${lkst}] displaysleep=${dsl:-미확인} → 유효 대기=${t}초 암호요구=${pwok}"
     if [ "$t" -gt 0 ] 2>/dev/null && [ "$t" -le 600 ] && [ "$pwok" -eq 1 ]; then result "PC-16|양호|화면보호기/디스플레이 끄기 $((t/60))분, 해제 시 암호 요구 (사용자 ${TUSER}, askForPassword=${askpw:-미설정}, delay=${askdl:-미설정}초)"
     else result "PC-16|취약|화면보호기 설정 미흡 (대기=${idle:-미설정}초, 디스플레이 끄기=${dsl:-미확인}분, 암호 요구=${askpw:-미설정}/${lkst:-미확인}; 기준: 10분 이하 + 암호)"; fi
@@ -444,12 +608,13 @@ else
 fi
 
 # ── PC-18 원격 지원(화면 공유·원격 관리) 금지 ──
-evd "PC-18" "launchctl list"
+evd "PC-18" "launchctl print system/com.apple.screensharing"
+evd "PC-18" "netstat -an -p tcp"
 evd "PC-18" "ps -axo comm"
-evd "PC-18" "nc -z -w 1 127.0.0.1 5900 && echo 'port 5900 open' || echo 'port 5900 closed'"
+evd "PC-18" "nc -z -w 1 127.0.0.1 5900 && echo 'port 5900 open' || echo 'port 5900 closed'; nc -z -w 1 127.0.0.1 3283 && echo 'port 3283 open' || echo 'port 3283 closed'"
 rs=""; unk18=0
 case "$(svc_state com.apple.screensharing 5900)" in on) rs="${rs} 화면 공유" ;; unk) unk18=1 ;; esac
-ps -axo comm 2>/dev/null | awk -F/ '$NF=="ARDAgent"{f=1} END{exit f?0:1}' && rs="${rs} 원격 관리(ARD)"
+case "$(ard_state)" in on) rs="${rs} 원격 관리(ARD)" ;; unk) unk18=1 ;; esac
 tp=$(ps -axo comm 2>/dev/null | awk -F/ '{print $NF}' | grep -iE '^(TeamViewer|AnyDesk|RemoteView|Chrome Remote|remoting_host)' | sort -u | tr '\n' ',' | sed 's/,$//')
 [ -n "$tp" ] && rs="${rs} 원격 지원 프로그램(${tp})"
 if [ -n "$rs" ]; then result "PC-18|취약|원격 지원 기능 사용:${rs}"

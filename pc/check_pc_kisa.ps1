@@ -119,17 +119,57 @@ function Get-UserHive {
     } catch {}
     return @{ Root = "HKCU:"; Desc = "현재 프로세스 사용자 $($script:runAs) (HKCU, 콘솔 로그온 사용자 확인 실패)" }
 }
-# 로컬 계정 목록: Name, Enabled, PasswordRequired, SID  (Get-LocalUser → 실패 시 WMI Win32_UserAccount). 조회 실패는 $script:acctOk=$false.
+# net user <이름> 의 '마지막 암호 설정일' (PS 2.0/Get-LocalUser 없는 경로용, 로캘 무관): 라벨 대신 줄 위치로 읽는다
+#   net user 출력의 비어 있지 않은 줄 순서 = User name, Full Name, Comment, User's comment, Country/region code, Account active, Account expires, Password last set ...
+#   8번째 줄에서 날짜 패턴(yyyy-MM-dd / yyyy.MM.dd / M/d/yyyy)을 찾아 반환. 날짜를 못 읽으면 "?" (알 수 없음)
+function Get-NetUserPwdSet([string]$name) {
+    try {
+        $vals = @(); foreach ($l in @(net user "$name" 2>$null)) { if ("$l".Trim() -ne '') { $vals += "$l" } }
+        if ($vals.Count -lt 8) { return "?" }
+        $ln = $vals[7]
+        if ($ln -match '(\d{4})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})') { return ('{0}-{1:00}-{2:00}' -f $Matches[1], [int]$Matches[2], [int]$Matches[3]) }
+        if ($ln -match '(\d{1,2}/\d{1,2}/\d{4})') { return $Matches[1] }
+    } catch {}
+    return "?"
+}
+# 로컬 계정 목록: Name, Enabled, PasswordRequired, SID, PasswordLastSet, PrincipalSource  (Get-LocalUser → 실패 시 WMI Win32_UserAccount + net user). 조회 실패는 $script:acctOk=$false.
+#   PasswordLastSet: yyyy-MM-dd(설정 이력 있음) / ""(Get-LocalUser 가 설정 이력 없음으로 보고) / "?"(알 수 없음) / "-"(조회 불필요)
 function Get-LocalAccts {
     $script:acctOk = $true
     if (Get-Command Get-LocalUser -EA SilentlyContinue) {
         $got = $false; $tmp = @()
-        try { foreach ($u in @(Get-LocalUser -EA Stop)) { $got = $true; $tmp += New-Object PSObject -Property @{ Name = "$($u.Name)"; Enabled = [bool]$u.Enabled; PasswordRequired = [bool]$u.PasswordRequired; SID = "$($u.SID)" } } } catch { $got = $false }
+        try {
+            foreach ($u in @(Get-LocalUser -EA Stop)) {
+                $got = $true
+                $pls = ""; if ($u.PasswordLastSet) { try { $pls = ([datetime]$u.PasswordLastSet).ToString("yyyy-MM-dd") } catch { $pls = "$($u.PasswordLastSet)" } }
+                $tmp += New-Object PSObject -Property @{ Name = "$($u.Name)"; Enabled = [bool]$u.Enabled; PasswordRequired = [bool]$u.PasswordRequired; SID = "$($u.SID)"; PasswordLastSet = $pls; PrincipalSource = "$($u.PrincipalSource)" }
+            }
+        } catch { $got = $false }
         if ($got) { $tmp; return }
     }
     $w = Get-Wmi "Win32_UserAccount" "LocalAccount=True"
     if (-not $script:wmiOk) { $script:acctOk = $false; return }
-    foreach ($u in @($w)) { if ($u) { New-Object PSObject -Property @{ Name = "$($u.Name)"; Enabled = (-not [bool]$u.Disabled); PasswordRequired = [bool]$u.PasswordRequired; SID = "$($u.SID)" } } }
+    foreach ($u in @($w)) { if ($u) {
+        $pls = "-"; if (-not [bool]$u.PasswordRequired -and -not [bool]$u.Disabled) { $pls = Get-NetUserPwdSet "$($u.Name)" }
+        New-Object PSObject -Property @{ Name = "$($u.Name)"; Enabled = (-not [bool]$u.Disabled); PasswordRequired = [bool]$u.PasswordRequired; SID = "$($u.SID)"; PasswordLastSet = $pls; PrincipalSource = "" }
+    } }
+}
+# PasswordRequired=False 는 '빈 비밀번호 허용 플래그'일 뿐 실제로 비밀번호가 없다는 뜻이 아님 (Microsoft 계정 연결·설정 앱으로 만든 계정에서 흔함) → 실제 상태로 구분
+#   msa: Microsoft 계정(비밀번호는 Microsoft 계정에서 관리) / empty: 비밀번호 설정 이력 없음(취약) / flag: 설정 이력 있고 플래그만 해제(수동확인) / unk: 설정일 확인 불가(수동확인)
+function Get-PwdFlagState($a) {
+    if ("$($a.PrincipalSource)" -eq "MicrosoftAccount") { return "msa" }
+    $p = "$($a.PasswordLastSet)"
+    if ($p -eq "?" -or $p -eq "-") { return "unk" }
+    if ($p -eq "") { return "empty" }
+    return "flag"
+}
+function Get-PwdFlagText($a) {
+    switch (Get-PwdFlagState $a) {
+        "msa"   { return "$($a.Name)(Microsoft 계정 - 비밀번호는 Microsoft 계정에서 관리)" }
+        "empty" { return "$($a.Name)(PasswordRequired=False + 비밀번호 설정 이력 없음)" }
+        "flag"  { return "$($a.Name)(PasswordRequired=False 이나 비밀번호는 설정됨 $($a.PasswordLastSet) - 빈 비밀번호 허용 플래그만 해제, 실제 빈 비밀번호 여부는 로그인 화면/net user 로 확인)" }
+        default { return "$($a.Name)(PasswordRequired=False, 마지막 암호 설정일 확인 불가)" }
+    }
 }
 # net accounts 값(로캘 무관): 영문/한글 라벨 → 실패 시 출력 순서(강제 로그오프, 최소기간, 최대기간, 최소길이, 기록, 잠금임계값, ...)
 function Get-NetAcctMap {
@@ -286,16 +326,21 @@ else { Fail "PC-01" "최대 암호 사용 기간 $(if ([int]$maxAge -le 0) { '�
 $cpx = Get-SecPol "PasswordComplexity"; $mnl = Get-SecPol "MinimumPasswordLength"
 if ($null -eq $mnl) { $mnl = ConvertTo-IntOrUnlimited (Get-NetAcctMap).MinLen 0 }
 $accts02 = Get-LocalAccts; $acctOk02 = $script:acctOk
-$noPw = @($accts02 | Where-Object { $_.Enabled -and -not $_.PasswordRequired -and $_.Name -notmatch '^(DefaultAccount|WDAGUtilityAccount)$' } | ForEach-Object { $_.Name })
-Evd "PC-02" "Get-LocalAccts | Format-Table Name,Enabled,PasswordRequired,SID -AutoSize"
+$noPwA = @($accts02 | Where-Object { $_.Enabled -and -not $_.PasswordRequired -and $_.Name -notmatch '^(DefaultAccount|WDAGUtilityAccount)$' })
+$noPw = @($noPwA | Where-Object { (Get-PwdFlagState $_) -eq "empty" } | ForEach-Object { Get-PwdFlagText $_ })
+$chk02 = @($noPwA | Where-Object { $s = Get-PwdFlagState $_; $s -eq "flag" -or $s -eq "unk" } | ForEach-Object { Get-PwdFlagText $_ })
+$msa02 = @($noPwA | Where-Object { (Get-PwdFlagState $_) -eq "msa" } | ForEach-Object { Get-PwdFlagText $_ })
+$info02 = ""; if ($msa02.Count) { $info02 = " / " + ($msa02 -join ', ') }
+Evd "PC-02" "Get-LocalAccts | Format-Table Name,Enabled,PasswordRequired,PasswordLastSet,PrincipalSource,SID -AutoSize"
 EvdQ "PC-02" "PasswordComplexity / MinimumPasswordLength (secedit 사용 가능=$hasSecEdit; 복잡성은 secedit 에서만 조회)" "$cpx / $mnl"
 $bad02 = @(); $unk02 = @()
 if ($null -eq $cpx) { $unk02 += "암호 복잡성 정책(관리자 권한 secedit 필요)" } elseif ("$cpx" -ne "1") { $bad02 += "암호 복잡성 정책 사용 안 함" }
 if ($null -eq $mnl) { $unk02 += "최소 암호 길이" } elseif ([int]$mnl -lt 8) { $bad02 += "최소 암호 길이 ${mnl}자 (8자 이상 필요)" }
-if (-not $acctOk02) { $unk02 += "비밀번호 미요구 계정(계정 조회 실패)" } elseif ($noPw.Count) { $bad02 += "비밀번호 미요구 계정: $($noPw -join ', ')" }
+if (-not $acctOk02) { $unk02 += "비밀번호 미요구 계정(계정 조회 실패)" } elseif ($noPw.Count) { $bad02 += "비밀번호 미설정 계정: $($noPw -join ', ')" }
 if ($bad02.Count) { Fail "PC-02" (($bad02 -join ' / ') + $(if ($unk02.Count) { " (확인 불가: $($unk02 -join ', '))" } else { "" })) }
 elseif ($unk02.Count) { NC "PC-02" "확인 불가 항목: $($unk02 -join ', ')$(if (-not $script:isAdmin) { ' - ' + $script:NEED_ADMIN })" }
-else { Pass "PC-02" "암호 복잡성 사용, 최소 길이 ${mnl}자, 비밀번호 미요구 계정 없음" }
+elseif ($chk02.Count) { MC "PC-02" "암호 복잡성 사용, 최소 길이 ${mnl}자 / 비밀번호 필수 플래그가 꺼진 계정 - 실제 비밀번호 설정 여부 확인 필요: $($chk02 -join ', ')$info02" }
+else { Pass "PC-02" "암호 복잡성 사용, 최소 길이 ${mnl}자, 비밀번호 미설정 계정 없음$info02" }
 
 # ── PC-03 복구 콘솔 자동 로그온 금지 ──
 $rc = Get-Reg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Setup\RecoveryConsole' 'SecurityLevel'
@@ -375,13 +420,54 @@ EvdQ "PC-06" "Windows Messenger PreventRun / 설치된 메신저(레지스트리
 if ($msgs.Count -or $msgRun.Count) { MC "PC-06" "상용 메신저 설치/실행: $((@($msgs) + @($msgRun | ForEach-Object { "$_(실행 중)" })) -join ', ') - 기관 인가 메신저 여부 확인 (비인가 시 취약)" }
 else { Pass "PC-06" "상용 메신저 미설치 (Windows Messenger 정책 PreventRun=$(if ($null -eq $prev) { '미설정(Windows 10/11 미포함)' } else { $prev }))" }
 
+# WQL 질의 (ASSOCIATORS OF 등): Get-CimInstance -Query (PS 3.0+) → 없으면 Get-WmiObject -Query (PS 2.0). 오류 시 $script:wmiOk=$false
+function Get-WmiQ([string]$Query) {
+    $script:wmiOk = $true
+    try {
+        $cimCmd = Get-Command Get-CimInstance -EA SilentlyContinue
+        if ($cimCmd) { & $cimCmd -Query $Query -EA Stop } else { Get-WmiObject -Query $Query -EA Stop }
+    } catch { $script:wmiOk = $false }
+}
+# 볼륨이 내장인지 USB·외장 디스크인지: Win32_LogicalDisk → (Win32_LogicalDiskToPartition) → Win32_DiskPartition → (Win32_DiskDriveToDiskPartition) → Win32_DiskDrive 의 InterfaceType/MediaType/PNPDeviceID
+#   (외장 USB 디스크는 Win32_LogicalDisk.DriveType=3(고정)으로 보고되므로 DriveType 만으로 구분할 수 없음)
+function Get-VolBus([string]$dev) {
+    $r = @{ Known = $false; External = $false; Desc = "" }
+    $parts = @(Get-WmiQ "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='$dev'} WHERE AssocClass=Win32_LogicalDiskToPartition")
+    if (-not $script:wmiOk -or -not $parts.Count) { $r.Desc = "WMI 연관 조회 실패"; return $r }
+    $descs = @()
+    foreach ($p in $parts) {
+        $partId = "$($p.DeviceID)"
+        $drv = @(Get-WmiQ "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$partId'} WHERE AssocClass=Win32_DiskDriveToDiskPartition")
+        if (-not $script:wmiOk -or -not $drv.Count) { continue }
+        foreach ($d in $drv) {
+            $r.Known = $true
+            if (("$($d.InterfaceType)" -eq "USB") -or ("$($d.MediaType)" -match "External|Removable") -or ("$($d.PNPDeviceID)" -match "^USBSTOR")) { $r.External = $true }
+            $descs += "$($d.Model) [InterfaceType=$($d.InterfaceType), MediaType=$($d.MediaType), PNPDeviceID=$($d.PNPDeviceID)]"
+        }
+    }
+    if (-not $r.Known) { $descs += "디스크 드라이브 연관 조회 결과 없음" }
+    $r.Desc = $descs -join "; "
+    return $r
+}
 # ── PC-07 파일 시스템 NTFS ──
 Evd "PC-07" "Get-Wmi Win32_LogicalDisk 'DriveType=3' | Format-Table DeviceID,FileSystem,Size -AutoSize"
 $vol = @(Get-Wmi "Win32_LogicalDisk" "DriveType=3"); $volOk = $script:wmiOk
-$fat = @($vol | Where-Object { "$($_.FileSystem)" -match '^(FAT|FAT32|exFAT)$' } | ForEach-Object { "$($_.DeviceID)($($_.FileSystem))" })
+# FAT 계열 볼륨은 내장 디스크인지 USB·외장 디스크인지 구분 (외장 USB 디스크도 DriveType=3 으로 보고됨). 시스템 드라이브는 외장 판정에서 제외
+$fat = @(); $extv = @(); $unkv = @(); $busEvd = @()
+foreach ($v in @($vol | Where-Object { "$($_.FileSystem)" -match '^(FAT|FAT32|exFAT)$' })) {
+    $lbl = "$($v.DeviceID)($($v.FileSystem))"
+    if ("$($v.DeviceID)" -eq "$env:SystemDrive") { $fat += $lbl; $busEvd += "$lbl : 시스템 드라이브 - 내장으로 간주"; continue }
+    $b = Get-VolBus "$($v.DeviceID)"
+    $kind = if ($b.External) { "USB·외장 디스크" } elseif ($b.Known) { "내장 디스크" } else { "구분 불가" }
+    $busEvd += "$lbl : $kind - $($b.Desc)"
+    if ($b.External) { $extv += $lbl } elseif ($b.Known) { $fat += $lbl } else { $unkv += $lbl }
+}
+if ($busEvd.Count) { EvdQ "PC-07" "FAT 계열 볼륨의 내장/외장 구분 (Win32_LogicalDiskToPartition → Win32_DiskDriveToDiskPartition → Win32_DiskDrive InterfaceType/MediaType/PNPDeviceID)" ($busEvd -join "`n") }
+$extNote = ""; if ($extv.Count) { $extNote = " (이동식(USB) 외장 디스크 $($extv -join ', ') - 시스템·데이터 볼륨 아님, 판정 제외)" }
 if (-not $volOk -or -not $vol.Count) { NC "PC-07" "로컬 디스크 조회 실패 (Win32_LogicalDisk) - 파일 시스템 수동 확인" }
-elseif ($fat.Count) { Fail "PC-07" "NTFS 가 아닌 로컬 볼륨: $($fat -join ', ')" }
-else { Pass "PC-07" "로컬 디스크 파일 시스템: $(($vol | ForEach-Object { "$($_.DeviceID)$($_.FileSystem)" }) -join ', ')" }
+elseif ($fat.Count) { Fail "PC-07" "NTFS 가 아닌 내장 로컬 볼륨: $($fat -join ', ')$extNote" }
+elseif ($unkv.Count) { MC "PC-07" "NTFS 가 아닌 로컬 볼륨 $($unkv -join ', ') 의 내장/외장 구분 불가(WMI 연관 조회 실패) - 수동 확인$extNote" }
+else { Pass "PC-07" "내장 로컬 디스크 파일 시스템: $(($vol | ForEach-Object { "$($_.DeviceID)$($_.FileSystem)" }) -join ', ')$extNote" }
 
 # ── PC-08 멀티 부팅 (BCD 의 복구 항목 제외 OS 로더 수 + UEFI 펌웨어 부팅 항목의 타 OS) ──
 Evd "PC-08" "bcdedit /enum osloader"

@@ -124,17 +124,57 @@ function Get-UserHive {
     } catch {}
     return @{ Root = "HKCU:"; Desc = "현재 프로세스 사용자 $($script:runAs) (HKCU, 콘솔 로그온 사용자 확인 실패)" }
 }
-# 로컬 계정 목록: Name, Enabled, PasswordRequired, SID  (Get-LocalUser → 실패 시 WMI Win32_UserAccount). 조회 실패는 $script:acctOk=$false.
+# net user <이름> 의 '마지막 암호 설정일' (PS 2.0/Get-LocalUser 없는 경로용, 로캘 무관): 라벨 대신 줄 위치로 읽는다
+#   net user 출력의 비어 있지 않은 줄 순서 = User name, Full Name, Comment, User's comment, Country/region code, Account active, Account expires, Password last set ...
+#   8번째 줄에서 날짜 패턴(yyyy-MM-dd / yyyy.MM.dd / M/d/yyyy)을 찾아 반환. 날짜를 못 읽으면 "?" (알 수 없음)
+function Get-NetUserPwdSet([string]$name) {
+    try {
+        $vals = @(); foreach ($l in @(net user "$name" 2>$null)) { if ("$l".Trim() -ne '') { $vals += "$l" } }
+        if ($vals.Count -lt 8) { return "?" }
+        $ln = $vals[7]
+        if ($ln -match '(\d{4})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})') { return ('{0}-{1:00}-{2:00}' -f $Matches[1], [int]$Matches[2], [int]$Matches[3]) }
+        if ($ln -match '(\d{1,2}/\d{1,2}/\d{4})') { return $Matches[1] }
+    } catch {}
+    return "?"
+}
+# 로컬 계정 목록: Name, Enabled, PasswordRequired, SID, PasswordLastSet, PrincipalSource  (Get-LocalUser → 실패 시 WMI Win32_UserAccount + net user). 조회 실패는 $script:acctOk=$false.
+#   PasswordLastSet: yyyy-MM-dd(설정 이력 있음) / ""(Get-LocalUser 가 설정 이력 없음으로 보고) / "?"(알 수 없음) / "-"(조회 불필요)
 function Get-LocalAccts {
     $script:acctOk = $true
     if (Get-Command Get-LocalUser -EA SilentlyContinue) {
         $got = $false; $tmp = @()
-        try { foreach ($u in @(Get-LocalUser -EA Stop)) { $got = $true; $tmp += New-Object PSObject -Property @{ Name = "$($u.Name)"; Enabled = [bool]$u.Enabled; PasswordRequired = [bool]$u.PasswordRequired; SID = "$($u.SID)" } } } catch { $got = $false }
+        try {
+            foreach ($u in @(Get-LocalUser -EA Stop)) {
+                $got = $true
+                $pls = ""; if ($u.PasswordLastSet) { try { $pls = ([datetime]$u.PasswordLastSet).ToString("yyyy-MM-dd") } catch { $pls = "$($u.PasswordLastSet)" } }
+                $tmp += New-Object PSObject -Property @{ Name = "$($u.Name)"; Enabled = [bool]$u.Enabled; PasswordRequired = [bool]$u.PasswordRequired; SID = "$($u.SID)"; PasswordLastSet = $pls; PrincipalSource = "$($u.PrincipalSource)" }
+            }
+        } catch { $got = $false }
         if ($got) { $tmp; return }
     }
     $w = Get-Wmi "Win32_UserAccount" "LocalAccount=True"
     if (-not $script:wmiOk) { $script:acctOk = $false; return }
-    foreach ($u in @($w)) { if ($u) { New-Object PSObject -Property @{ Name = "$($u.Name)"; Enabled = (-not [bool]$u.Disabled); PasswordRequired = [bool]$u.PasswordRequired; SID = "$($u.SID)" } } }
+    foreach ($u in @($w)) { if ($u) {
+        $pls = "-"; if (-not [bool]$u.PasswordRequired -and -not [bool]$u.Disabled) { $pls = Get-NetUserPwdSet "$($u.Name)" }
+        New-Object PSObject -Property @{ Name = "$($u.Name)"; Enabled = (-not [bool]$u.Disabled); PasswordRequired = [bool]$u.PasswordRequired; SID = "$($u.SID)"; PasswordLastSet = $pls; PrincipalSource = "" }
+    } }
+}
+# PasswordRequired=False 는 '빈 비밀번호 허용 플래그'일 뿐 실제로 비밀번호가 없다는 뜻이 아님 (Microsoft 계정 연결·설정 앱으로 만든 계정에서 흔함) → 실제 상태로 구분
+#   msa: Microsoft 계정(비밀번호는 Microsoft 계정에서 관리) / empty: 비밀번호 설정 이력 없음(취약) / flag: 설정 이력 있고 플래그만 해제(수동확인) / unk: 설정일 확인 불가(수동확인)
+function Get-PwdFlagState($a) {
+    if ("$($a.PrincipalSource)" -eq "MicrosoftAccount") { return "msa" }
+    $p = "$($a.PasswordLastSet)"
+    if ($p -eq "?" -or $p -eq "-") { return "unk" }
+    if ($p -eq "") { return "empty" }
+    return "flag"
+}
+function Get-PwdFlagText($a) {
+    switch (Get-PwdFlagState $a) {
+        "msa"   { return "$($a.Name)(Microsoft 계정 - 비밀번호는 Microsoft 계정에서 관리)" }
+        "empty" { return "$($a.Name)(PasswordRequired=False + 비밀번호 설정 이력 없음)" }
+        "flag"  { return "$($a.Name)(PasswordRequired=False 이나 비밀번호는 설정됨 $($a.PasswordLastSet) - 빈 비밀번호 허용 플래그만 해제, 실제 빈 비밀번호 여부는 로그인 화면/net user 로 확인)" }
+        default { return "$($a.Name)(PasswordRequired=False, 마지막 암호 설정일 확인 불가)" }
+    }
 }
 # net accounts 값(로캘 무관): 영문/한글 라벨 → 실패 시 출력 순서(강제 로그오프, 최소기간, 최대기간, 최소길이, 기록, 잠금임계값, ...)
 function Get-NetAcctMap {
@@ -283,17 +323,23 @@ $uh = Get-UserHive   # 사용자 설정(HKCU 계열)을 읽을 hive — 콘솔 �
 # ══════════════════════════════════════════════════════════════════
 # PC-01: 패스워드 설정
 # ══════════════════════════════════════════════════════════════════
-Evd "PC-01" "Get-LocalAccts | Format-Table Name,Enabled,PasswordRequired,SID -AutoSize"
+Evd "PC-01" "Get-LocalAccts | Format-Table Name,Enabled,PasswordRequired,PasswordLastSet,PrincipalSource,SID -AutoSize"
 $accts = Get-LocalAccts
 if (-not $script:acctOk) {
     NC "01" "로컬 계정 조회 실패 (Get-LocalUser·Win32_UserAccount 모두 실패)"
 } else {
     $act = @($accts | Where-Object { $_.Enabled -and $_.Name -notmatch "^(DefaultAccount|WDAGUtilityAccount)$" })
-    $noPwUsers = @($act | Where-Object { -not $_.PasswordRequired } | ForEach-Object { $_.Name })
-    if ($noPwUsers.Count -gt 0) {
-        Fail "01" "비밀번호 미필수 계정: $($noPwUsers -join ', ')"
+    $noPwAccts = @($act | Where-Object { -not $_.PasswordRequired })
+    $empty01 = @($noPwAccts | Where-Object { (Get-PwdFlagState $_) -eq "empty" } | ForEach-Object { Get-PwdFlagText $_ })
+    $check01 = @($noPwAccts | Where-Object { $s = Get-PwdFlagState $_; $s -eq "flag" -or $s -eq "unk" } | ForEach-Object { Get-PwdFlagText $_ })
+    $msa01   = @($noPwAccts | Where-Object { (Get-PwdFlagState $_) -eq "msa" } | ForEach-Object { Get-PwdFlagText $_ })
+    $info01 = ""; if ($msa01.Count) { $info01 = " / " + ($msa01 -join ', ') }
+    if ($empty01.Count -gt 0) {
+        Fail "01" "비밀번호 미설정 계정: $($empty01 -join ', ')$(if ($check01.Count) { ' / 확인 필요: ' + ($check01 -join ', ') })$info01"
+    } elseif ($check01.Count -gt 0) {
+        MC "01" "비밀번호 필수 플래그(PasswordRequired)가 꺼진 계정 - 실제 비밀번호 설정 여부 확인 필요: $($check01 -join ', ')$info01"
     } else {
-        Pass "01" "모든 활성 계정 비밀번호 필수 ($(($act | ForEach-Object { $_.Name }) -join ', '))"
+        Pass "01" "모든 활성 계정 비밀번호 필수 또는 Microsoft 계정 ($(($act | ForEach-Object { $_.Name }) -join ', '))$info01"
     }
 }
 
