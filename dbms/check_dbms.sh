@@ -16,7 +16,8 @@
 #
 # [사전 조건]
 #   - 설치형 DB 를 로컬에서 점검할 때는 root 권한 필요 (sudo bash 또는 root 로그인)
-#   - DBMS 접속 정보를 환경변수로 전달 (아래 참고)
+#   - DBMS 접속 계정·비밀번호는 실행 중 입력 (터미널 실행 시 '[DBMS] DB 접속 계정' → '비밀번호(숨김)' 순으로 질문,
+#     Enter = 기본 계정/OS 인증). 아래 환경변수로 미리 지정한 값은 묻지 않음 (자동 실행·터미널 아님 → 환경변수만 사용)
 #
 # [접속 정보 환경변수]
 #   Oracle:  ORACLE_USER  ORACLE_PASS  ORACLE_SID  ORACLE_SERVICE  ORACLE_HOST  ORACLE_PORT
@@ -332,6 +333,26 @@ case "$(_low "$_KMODE")" in
 3|all) _KMODE="all" ;;
 *) echo "사용법: $0 [ef|mi|all]  (ef=전자금융, mi=주요정보 2026 상세가이드, all=둘 다)" >&2; exit 1 ;;
 esac
+
+# ── DB 접속 계정·비밀번호 입력 (터미널 실행 시) ──────────────────
+# $1=표시명 $2=계정 변수명 $3=비밀번호 변수명 $4=계정 Enter 시 동작 $5=비밀번호 Enter 시 동작 $6=1 이면 계정 Enter 시 비밀번호 질문 생략(OS 인증)
+# 환경변수로 이미 지정한 계정·비밀번호는 묻지 않음. 비밀번호는 숨김 입력, 화면·결과·증적에 남기지 않음. 터미널이 아니면(자동 실행) 묻지 않음.
+_CRED_ASKED=""
+_ask_cred() {
+    local _u="" _p=""
+    [ -t 0 ] || return 0
+    _CRED_ASKED=1
+    if [ -z "${!2}" ]; then
+        read -r -p "[$1] DB 접속 계정 (Enter=$4): " _u </dev/tty
+        [ -n "$_u" ] && printf -v "$2" '%s' "$_u"
+        [ -z "$_u" ] && [ "$6" = 1 ] && return 0
+    fi
+    if [ -z "${!3}" ]; then
+        read -rs -p "[$1] ${!2:+${!2} }비밀번호 (Enter=$5): " _p </dev/tty; echo >&2
+        [ -n "$_p" ] && printf -v "$3" '%s' "$_p"
+    fi
+    return 0
+}
 
 # ── 결과 사본 / 증적 파일 (심볼릭 링크·기존 파일 방어: 지우고 O_EXCL 로 새로 생성, umask 077) ──
 _new_file() {   # $1=경로 → 새 빈 파일 생성 성공 시 0
@@ -712,6 +733,8 @@ _ora_env() {   # root/sudo 실행 등 환경변수 없음 → ora_pmon 프로세
     export ORACLE_HOME="$h" ORACLE_SID="${ORACLE_SID:-${s2:-$sid}}" PATH="$h/bin:$PATH"
 }
 check_oracle() {
+    if [ "$_REMOTE" = 1 ]; then _ask_cred "Oracle" ORACLE_USER ORACLE_PASS "system" "비밀번호 없음"
+    else _ask_cred "Oracle" ORACLE_USER ORACLE_PASS "OS 인증(/ as sysdba)" "OS 인증(/ as sysdba)" 1; fi
     ORACLE_USER="${ORACLE_USER:-system}"
     ORACLE_PASS="${ORACLE_PASS-}"
     _ORA_OS_USER=""; _ORA_SU=""
@@ -757,7 +780,7 @@ check_oracle() {
         CONN="/ as sysdba"
         [ "$(id -u)" = 0 ] && [ -n "$_ORA_OS_USER" ] && [ "$_ORA_OS_USER" != "root" ] && _ORA_SU="$_ORA_OS_USER"
     else
-        CONN=$(_ora_conn "$ORACLE_USER" "$ORACLE_PASS")
+        CONN=$(_ora_conn "$ORACLE_USER" "$ORACLE_PASS" "$( [ "$(_up "$ORACLE_USER")" = SYS ] && echo 1)")   # SYS 는 as sysdba 로만 접속 가능
     fi
 
     _ora_exec() {   # 접속 문자열은 표준입력으로만 전달 (프로세스 인자 노출 없음)
@@ -798,7 +821,7 @@ $2" | grep -v '^$' | sed "s/^/[$c]/"
     if [ -z "$ORACLE_PASS" ] && [ "$_REMOTE" != 1 ] && ! run_q "SELECT 'CONN_'||'OK' FROM DUAL" | grep -q CONN_OK && [ -t 0 ]; then
         read -rs -p "Oracle OS 인증 실패 - SYS 비밀번호: " ORACLE_PASS </dev/tty; echo >&2
         _ORA_SU=""; CONN=$(_ora_conn "sys" "$ORACLE_PASS" 1)
-    elif [ -z "$ORACLE_PASS" ] && [ "$_REMOTE" = 1 ] && [ -t 0 ]; then
+    elif [ -z "$ORACLE_PASS" ] && [ "$_REMOTE" = 1 ] && [ -z "$_CRED_ASKED" ] && [ -t 0 ]; then
         read -rs -p "Oracle ${ORACLE_USER} 비밀번호: " ORACLE_PASS </dev/tty; echo >&2
         CONN=$(_ora_conn "$ORACLE_USER" "$ORACLE_PASS" "$( [ "$(_up "$ORACLE_USER")" = SYS ] && echo 1)")
     fi
@@ -1181,6 +1204,7 @@ $2" | grep -v '^$' | sed "s/^/[$c]/"
 # MySQL/MariaDB 점검
 # ================================================================
 check_mysql() {
+    _ask_cred "MySQL/MariaDB" MYSQL_USER MYSQL_PASS "root" "소켓/OS 인증·~/.my.cnf 시도"
     MYSQL_USER="${MYSQL_USER:-root}"
     MYSQL_PASS="${MYSQL_PASS-}"
     MYSQL_HOST="${MYSQL_HOST:-localhost}"
@@ -1620,6 +1644,8 @@ check_mysql() {
 # PostgreSQL 점검
 # ================================================================
 check_pgsql() {
+    _ask_cred "PostgreSQL" PGSQL_USER PGPASSWORD "postgres" "peer 인증·~/.pgpass 시도"
+    [ -n "$PGPASSWORD" ] && export PGPASSWORD
     PGSQL_USER="${PGSQL_USER:-postgres}"
     PGSQL_DB="${PGSQL_DB:-postgres}"
     PGSQL_HOST="${PGSQL_HOST-}"
@@ -2004,11 +2030,12 @@ check_tibero() {
         [ -n "$TB_HOME" ] && export TB_HOME TB_SID PATH="$TB_HOME/bin:$TB_HOME/client/bin:$PATH"
     fi
     TB_HOME="${TB_HOME:-/opt/tibero}"
+    _ask_cred "Tibero" TIBERO_USER TIBERO_PASS "tibero" "비밀번호 없음"
     TB_USER="${TIBERO_USER:-tibero}"
     TB_PASS="${TIBERO_PASS-}"
     TB_DB="${TIBERO_DB-}"   # 미지정 시 별칭 없이 TB_SID 로컬 접속 후 tbdsn 별칭 'tibero' 시도
     DBMS_KIND="tibero"
-    [ -z "$TB_PASS" ] && [ -t 0 ] && { read -rs -p "Tibero ${TB_USER} 비밀번호: " TB_PASS </dev/tty; echo >&2; }
+    [ -z "$TB_PASS" ] && [ -z "$_CRED_ASKED" ] && [ -t 0 ] && { read -rs -p "Tibero ${TB_USER} 비밀번호: " TB_PASS </dev/tty; echo >&2; }
 
     TBSQL=$(command -v tbsql 2>/dev/null)
     [ -z "$TBSQL" ] && [ -d "$TB_HOME/bin" ] && TBSQL=$(find "$TB_HOME/bin" -name "tbsql" 2>/dev/null | head -1)
@@ -2344,6 +2371,7 @@ check_tibero() {
 # MSSQL(Linux) 점검 — sqlcmd 기반
 # ================================================================
 check_mssql() {
+    _ask_cred "MSSQL" MSSQL_USER MSSQL_PASS "sa" "비밀번호 없음"
     MSSQL_USER="${MSSQL_USER:-sa}"
     MSSQL_PASS="${MSSQL_PASS-}"
     MSSQL_SERVER="${MSSQL_SERVER:-localhost}"; MSSQL_SERVER="${MSSQL_SERVER#tcp:}"
@@ -2366,7 +2394,7 @@ check_mssql() {
     fi
 
     # 비밀번호는 -P 인자 대신 SQLCMDPASSWORD 환경변수로만 전달 (ps 에 노출되지 않음)
-    [ -z "$MSSQL_PASS" ] && [ -t 0 ] && { read -rs -p "SQL Server ${MSSQL_USER} 비밀번호: " MSSQL_PASS </dev/tty; echo >&2; }
+    [ -z "$MSSQL_PASS" ] && [ -z "$_CRED_ASKED" ] && [ -t 0 ] && { read -rs -p "SQL Server ${MSSQL_USER} 비밀번호: " MSSQL_PASS </dev/tty; echo >&2; }
     if [ -n "$MSSQL_PASS" ]; then export SQLCMDPASSWORD="$MSSQL_PASS"; else unset SQLCMDPASSWORD; fi
     # -b: 오류 시 종료코드 1, -r 1: 오류 메시지를 stderr 로 분리, 열 이름 줄 포함(-h 기본) → 증적에 열 이름 기록
     _SQLCMD_OPTS="-S ${MSSQL_SERVER},${MSSQL_PORT} -U ${MSSQL_USER} -W -s | -b -r 1"

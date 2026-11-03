@@ -23,7 +23,8 @@ echo  3) Both
 echo  Output: %SCRIPT_DIR%^<host^>_mssql_^<target^>_dbms.txt  (UTF-8 with BOM, written by the script itself)
 echo ========================================
 echo  Env: MSSQL_SERVER MSSQL_PORT MSSQL_USER MSSQL_PASS MSSQL_WINAUTH  DBMS_ENV=rds^|azure  DBMS_REMOTE=1
-echo  (If MSSQL_PASS is not set, Windows authentication is tried first, then a hidden password prompt.)
+echo  (The script asks for the DB login account and password - hidden input. Values already set in Env are not asked.
+echo   Press Enter at the account prompt to try Windows authentication first, then the sa password.)
 set "SEL="
 set /p SEL=Select [1/2/3]:
 set "MODE=all"

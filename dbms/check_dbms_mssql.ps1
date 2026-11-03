@@ -19,6 +19,7 @@
 # [접속 정보 환경변수]
 #   $env:MSSQL_SERVER  = "localhost"   (기본: localhost. 원격/관리형은 엔드포인트, 예: mydb.xxxx.ap-northeast-2.rds.amazonaws.com)
 #   $env:MSSQL_PORT    = "1433"        (선택. MSSQL_SERVER 에 ,포트 또는 \인스턴스 가 없을 때 사용)
+#   ※ 콘솔 실행 시 'DB 접속 계정' → '비밀번호(숨김)' 를 묻는다 (아래 환경변수로 지정한 값은 묻지 않음, 계정 Enter = Windows 인증 → sa)
 #   $env:MSSQL_USER    = "sa"          (기본: sa)
 #   $env:MSSQL_PASS    = "<비밀번호>"  (미지정 시 Windows 인증 시도 → 대화형이면 숨김 입력. 비밀번호는 sqlcmd 인자가 아니라 SQLCMDPASSWORD 환경변수로만 전달)
 #   $env:MSSQL_WINAUTH = "1"           (Windows 인증 시 — 설정하면 USER/PASS 무시)
@@ -62,6 +63,18 @@ $MSSQL_SERVER = if ($env:MSSQL_SERVER) { $env:MSSQL_SERVER } else { "localhost" 
 $MSSQL_USER   = if ($env:MSSQL_USER)   { $env:MSSQL_USER }   else { "sa" }
 $MSSQL_PASS   = $env:MSSQL_PASS
 $USE_WIN_AUTH = if ($env:MSSQL_WINAUTH) { $true } else { $false }
+# 콘솔 실행 시 접속 계정·비밀번호 입력 (환경변수로 지정한 값은 묻지 않음). 계정 Enter = Windows 인증 시도 → 실패 시 sa 비밀번호 입력
+# 계정을 입력하면 Windows 인증을 건너뛰고 SQL 인증으로 접속. 비밀번호는 숨김 입력, SQLCMDPASSWORD 로만 전달
+$script:UserGiven = $false
+if (-not $USE_WIN_AUTH -and [Environment]::UserInteractive -and $Host.Name -eq 'ConsoleHost') {
+    if (-not $env:MSSQL_USER) {
+        $u = "$(Read-Host '[MSSQL] DB 접속 계정 (Enter=Windows 인증 시도, 실패 시 sa)')".Trim()
+        if ($u) { $MSSQL_USER = $u; $script:UserGiven = $true }
+    } else { $script:UserGiven = $true }
+    if ($script:UserGiven -and -not $MSSQL_PASS) {
+        try { $sp = Read-Host -AsSecureString "[MSSQL] $MSSQL_USER 비밀번호"; $MSSQL_PASS = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sp)) } catch {}
+    }
+}
 $script:SrvArg = $MSSQL_SERVER
 if ($env:MSSQL_PORT -and $MSSQL_SERVER -notmatch '[,\\]') { $script:SrvArg = "$MSSQL_SERVER,$($env:MSSQL_PORT)" }
 
@@ -260,7 +273,7 @@ function Run-Q([string]$q,[switch]$Opt) {
 function Q-Int([string]$q) { $v = Run-Q $q | Select-Object -First 1; if ("$v".Trim() -match '^-?\d+$') { [int]"$v".Trim() } else { $null } }
 # 접속: MSSQL_PASS 미지정 → Windows 인증 우선 시도 → 실패하고 대화형이면 숨김 입력 (비밀번호는 SQLCMDPASSWORD 환경변수로만 전달, 종료 시 제거)
 Item-Begin 'DBM-000'
-if (-not $USE_WIN_AUTH -and -not $MSSQL_PASS) {
+if (-not $USE_WIN_AUTH -and -not $MSSQL_PASS -and -not $script:UserGiven) {
     $USE_WIN_AUTH = $true
     if ("$(Run-Q 'SELECT 1' -Opt | Select-Object -First 1)".Trim() -ne "1") {
         $USE_WIN_AUTH = $false
