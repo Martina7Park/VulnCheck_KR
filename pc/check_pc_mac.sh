@@ -9,7 +9,7 @@
 #   Windows PC는 check_pc.ps1 사용.
 #
 # [대상 OS]
-#   macOS 12 (Monterey) ~ macOS 15 (Sequoia)
+#   macOS 12 ~ 27 (bash 3.2 호환) — PC-07 은 Apple 보안 릴리스 목록을 조회해 지원 종료(EoS)·미적용 패치 판정
 #
 # [사전 조건]
 #   - 관리자(sudo) 권한 권장 (일부 항목은 일반 사용자로도 점검 가능)
@@ -80,6 +80,79 @@ evd_file() {
     fi
 }
 
+CUSER=$(stat -f %Su /dev/console 2>/dev/null)
+_evd_raw() { printf '[참고] %s\n%s\n\n' "$1" "$2" >> "$_EVD"; }
+# 서비스 실제 활성 여부: system 도메인에 로드됐거나 포트 수신 중일 때만 활성
+#  ※ 'launchctl list' 의 com.apple.screensharing.agent / RemoteDesktop.agent 는 모든 사용자 세션에 항상 로드되는 보조 에이전트라 활성 근거가 아님
+_svc_on() { launchctl print "system/$1" >/dev/null 2>&1; }
+_listen() { netstat -an -p tcp 2>/dev/null | awk '$NF=="LISTEN"{print $4}' | grep -qE "[.:]$1\$"; }
+FS_ON=""; { _svc_on com.apple.smbd || _listen 445; } && FS_ON="${FS_ON} SMB"; { _svc_on com.apple.AppleFileServer || _listen 548; } && FS_ON="${FS_ON} AFP"
+SS_ON=0; { _svc_on com.apple.screensharing || _listen 5900; } && SS_ON=1
+ARD_ON=0; { pgrep -x ARDAgent >/dev/null 2>&1 || _listen 3283; } && ARD_ON=1
+# 백신: 앱 이름·실행 파일 이름(경로 제외)으로만 판별 — /Applications/AhnLab/ASTx(안랩 세이프 트랜잭션, 금융 보안 모듈)는 백신 아님
+AV_APP_RE='^(v3|ahnlab ?v3)|kaspersky|alyac|sophos|symantec|norton|mcafee|^eset|bitdefender|crowdstrike|falcon|sentinel|defender|malwarebytes|avast|avira|trend ?micro'
+AV_PROC_RE='^(v3|ahnlab ?v3)|kav|kaspersky|sophos|symantec|norton|mcafee|^eset|esets|bitdefender|bdldaemon|^falcon|com\.crowdstrike|sentinel|wdav|malwarebytes|^rtprotection|avast|avira|alyac|trend ?micro|^icoreservice'
+AV_APPS=$(find /Applications "/Users/${CUSER:-$USER}/Applications" -maxdepth 2 -name '*.app' 2>/dev/null | sed 's#.*/##' | grep -iE "$AV_APP_RE" | sort -u | tr '\n' ',' | sed 's/,$//')
+AV_PROCS=$(ps -axco comm 2>/dev/null | grep -iE "$AV_PROC_RE" | sort -u | tr '\n' ',' | sed 's/,$//')
+# ── macOS 지원(EoS) 판정: Apple 보안 릴리스 페이지(support.apple.com/100100) 실시간 조회 ──
+# Apple 은 macOS 지원 종료일을 공지하지 않으므로 '실제 보안 업데이트 배포 여부'로 판정:
+#   최신 주요 버전(N) 최초 출시일 이후에도 CVE 포함 보안 업데이트를 받은 주요 버전 = 지원 중, 그 외 = 지원 종료
+#   (예: macOS 27 출시 2026-09-14 이후 15·26·27 만 보안 업데이트 → 14 이하 종료)
+# 결과 변수: EOS_RES(양호/취약/수동확인) EOS_DESC / PATCH_LATEST(같은 주요 버전 최신 보안 릴리스, 미적용 시)
+#           PATCH_DATE·PATCH_AGE(미적용 보안 릴리스 중 가장 오래된 것의 배포일·경과일) — 조회 실패 시 오프라인 추정
+# MAC_EOS_OFFLINE=1 이면 온라인 조회 생략, PATCH_GRACE_DAYS(기본 30) 경과한 보안 릴리스 미적용 시 패치 미흡
+mac_eos_check() {
+    local rows="" major=${OS_VER%%.*} src="Apple 보안 릴리스(support.apple.com/100100) 실시간 조회"
+    EOS_RES=""; EOS_DESC=""; PATCH_LATEST=""; PATCH_DATE=""; PATCH_AGE=""
+    if [ -z "$MAC_EOS_OFFLINE" ]; then
+        rows=$(curl -sL -m 20 -A "Mozilla/5.0" "https://support.apple.com/en-us/100100" 2>/dev/null | tr -d '\r\n' | sed 's#</tr>#\
+#g' | sed -e 's/<[^>]*>/|/g' -e 's/&nbsp;/ /g' -e 's/|[| ]*/|/g' | awk -F'|' '
+            BEGIN{split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec",M," "); for(i=1;i<=12;i++) m[M[i]]=sprintf("%02d",i)}
+            $2 ~ /^macOS [A-Z][A-Za-z ]* [0-9]+(\.[0-9]+)*$/ {
+                nc = ($0 ~ /no published CVE/) ? 1 : 0
+                v=$2; sub(/.* /,"",v); d=$(NF-1)
+                if (split(d,a," ")==3 && (a[2] in m)) print v, a[3] m[a[2]] sprintf("%02d",a[1]), nc
+            }')
+    fi
+    _evd_raw "macOS 보안 릴리스 목록(버전 날짜 CVE없음여부)" "${rows:-조회 실패 - 내장 기준 사용}"
+    if [ -n "$rows" ] && [ "$(echo "$rows" | wc -l)" -ge 5 ]; then
+        local today; today=$(date +%Y%m%d)
+        eval "$(echo "$rows" | awk -v cur="$OS_VER" -v mj="$major" -v today="$today" '
+            function vcmp(a,b,  x,y,i,n){n=split(a,x,".");split(b,y,".");if(n<length(y))n=length(y);for(i=1;i<=n;i++){if((x[i]+0)<(y[i]+0))return -1;if((x[i]+0)>(y[i]+0))return 1}return 0}
+            function jd(s,  y,mo,d){y=substr(s,1,4)+0;mo=substr(s,5,2)+0;d=substr(s,7,2)+0;if(mo<3){y--;mo+=12};return int(365.25*(y+4716))+int(30.6001*(mo+1))+d}
+            { split($1,p,"."); M=p[1]+0; if(M>N)N=M
+              if(!($3)){ if($2>last[M]) last[M]=$2; if(lv[M]=="" || vcmp($1,lv[M])>0) lv[M]=$1 }
+              if($1==M"" && (n0[M]==""||$2<n0[M])) n0[M]=$2
+              if(!($3) && vcmp($1,cur)>0 && M==mj){ if(pl==""||vcmp($1,pl)>0) pl=$1; if(pd==""||$2<pd) pd=$2 } }
+            END{ n0d=n0[N]; if(n0d==""){for(k in last) if(k+0==N) n0d=last[k]}
+              sup=""; for(k=N;k>=10;k--) if(k in last && (k==N || last[k]>=n0d)) sup=sup (sup==""?"":"·") k
+              printf "EOS_N=%d; EOS_N0=%s; EOS_SUP=\"%s\"; EOS_LASTV=\"%s\"; EOS_LASTD=\"%s\"; ", N, n0d, sup, lv[mj], last[mj]
+              if (mj+0>N) r="양호"; else if (mj in last && (mj==N || last[mj]>=n0d)) r="양호"; else r="취약"
+              printf "EOS_RES=%s; PATCH_LATEST=\"%s\"; PATCH_DATE=\"%s\"; PATCH_AGE=\"%s\"\n", r, pl, pd, (pd==""?"":jd(today)-jd(pd)) }')"
+        local fd; fd=$(echo "$EOS_N0" | sed 's/\(....\)\(..\)\(..\)/\1-\2-\3/')
+        local ld; ld=$(echo "$EOS_LASTD" | sed 's/\(....\)\(..\)\(..\)/\1-\2-\3/')
+        if [ "$EOS_RES" = "양호" ]; then
+            EOS_DESC="macOS ${OS_VER} - Apple 보안 업데이트 지원 중 (지원 주요 버전: ${EOS_SUP}, 해당 버전 최근 보안 릴리스 ${EOS_LASTV:-미확인}${ld:+ ${ld}}) [${src}]"
+        else
+            EOS_DESC="macOS ${OS_VER} - Apple 보안 업데이트 지원 종료 (최종 보안 릴리스 ${EOS_LASTV:-최근 3년 목록에 없음}${ld:+ ${ld}}, macOS ${EOS_N} 출시(${fd}) 이후 업데이트 없음) - 지원 버전(${EOS_SUP})으로 업그레이드 필요 [${src}]"
+        fi
+        PATCH_DATE=$(echo "$PATCH_DATE" | sed 's/\(....\)\(..\)\(..\)/\1-\2-\3/')
+    else
+        # 오프라인 추정: Apple 은 매년 9월 새 주요 버전 출시(26=2025, 27=2026 …) 후 최신 3개 주요 버전만 보안 업데이트
+        local y m n list sup oldest
+        y=$(date +%Y); m=$(date +%m); m=${m#0}
+        n=$((y - 2000)); [ "$m" -ge 9 ] && n=$((n + 1))
+        list="11 12 13 14 15"; local k=26; while [ $k -le $n ]; do list="$list $k"; k=$((k+1)); done
+        sup=$(echo $list | awk '{print $(NF-2), $(NF-1), $NF}'); oldest=${sup%% *}
+        if [ "${major:-0}" -gt "$n" ] 2>/dev/null || echo " $sup " | grep -q " $major "; then
+            if [ "$major" = "$oldest" ] && [ "$m" -ge 9 ] && [ "$m" -le 10 ]; then EOS_RES="수동확인"; EOS_DESC="macOS ${OS_VER} - 신규 주요 버전 출시 전환기(지원 종료 가능) - Apple 보안 릴리스 확인 필요 (Apple 서버 조회 실패, 추정 지원 버전: ${sup// /·})"
+            else EOS_RES="양호"; EOS_DESC="macOS ${OS_VER} - 보안 업데이트 지원 버전 (Apple 서버 조회 실패 → 추정 지원 버전: ${sup// /·}, support.apple.com/100100 확인 권장)"; fi
+        else
+            EOS_RES="취약"; EOS_DESC="macOS ${OS_VER} - 보안 업데이트 지원 종료 버전 (Apple 서버 조회 실패 → 추정 지원 버전: ${sup// /·})"
+        fi
+    fi
+}
+
 # ── PC-01: 패스워드 설정 ────────────────────────────────────────
 evd "PC-01" "dscl . -list /Users UniqueID 2>/dev/null | awk '\$2>=500'; defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled 2>/dev/null; sysadminctl -guestAccount status 2>&1"
 # 로컬 사용자(UID 500 이상)별 인증 방식 확인 — macOS 는 빈 암호 여부를 직접 조회할 수 없으므로 게스트 활성 시 취약, 그 외 수동확인
@@ -116,47 +189,45 @@ else
 fi
 
 # ── PC-03: 화면보호기 / 화면 잠금 ─────────────────────────────────
-evd "PC-03" "defaults read com.apple.screensaver askForPassword 2>/dev/null; pmset -g custom 2>/dev/null | grep displaysleep"
-ask_pw=$(defaults read com.apple.screensaver askForPassword 2>/dev/null)
-ask_delay=$(defaults read com.apple.screensaver askForPasswordDelay 2>/dev/null)
-display_sleep=$(pmset -g custom 2>/dev/null | awk '/displaysleep/{print $2; exit}')
+evd "PC-03" "sysadminctl -screenLock status 2>&1; defaults read com.apple.screensaver askForPassword 2>/dev/null; pmset -g custom 2>/dev/null | grep displaysleep"
+# macOS 13+ 는 askForPassword 키를 쓰지 않음(설정 앱 '잠금 화면') → sysadminctl -screenLock 우선, 실패 시 구 키 사용
+lk=$(sysadminctl -screenLock status 2>&1 | grep -oiE 'immediate|off|[0-9]+ seconds' | head -1)
+if [ -z "$lk" ]; then ask_pw=$(defaults read com.apple.screensaver askForPassword 2>/dev/null); [ "$ask_pw" = "1" ] && lk="$(defaults read com.apple.screensaver askForPasswordDelay 2>/dev/null || echo 0) seconds"; [ "$ask_pw" = "0" ] && lk="off"; fi
+display_sleep=$(pmset -g custom 2>/dev/null | awk '/displaysleep/{print $2}' | sort -n | tail -1)
 
-if [ "$ask_pw" = "1" ]; then
-    delay_sec=${ask_delay:-0}
+if echo "$lk" | grep -qiE 'immediate|seconds'; then
     if [ -n "$display_sleep" ] && [ "$display_sleep" -gt 0 ] 2>/dev/null && [ "$display_sleep" -le 10 ]; then
-        result "PC-03|양호|화면잠금 암호 활성, 디스플레이절전=${display_sleep}분, 암호지연=${delay_sec}초"
+        result "PC-03|양호|화면잠금 암호 요구(${lk}), 디스플레이절전=${display_sleep}분"
     elif [ -n "$display_sleep" ] && [ "$display_sleep" -gt 0 ] 2>/dev/null; then
-        result "PC-03|취약|화면잠금 암호 활성이나 디스플레이절전=${display_sleep}분(10분 이하 권장)"
+        result "PC-03|취약|화면잠금 암호 요구(${lk})이나 디스플레이절전=${display_sleep}분(10분 이하 권장)"
     else
-        result "PC-03|취약|화면잠금 암호 활성이나 디스플레이절전 미설정(${display_sleep:-미확인})"
+        result "PC-03|취약|화면잠금 암호 요구(${lk})이나 디스플레이절전 미설정(${display_sleep:-미확인})"
     fi
 else
-    result "PC-03|취약|화면잠금 시 암호 요구 비활성 (askForPassword=${ask_pw:-미설정})"
+    result "PC-03|취약|화면잠금 시 암호 요구 비활성 (screenLock=${lk:-미확인})"
 fi
 
 # ── PC-04: 공유폴더 (파일 공유 서비스) ──────────────────────────────
-evd "PC-04" "launchctl list 2>/dev/null | grep -E 'smbd|AppleFileServer'"
-smb_running=$(launchctl list 2>/dev/null | grep "com.apple.smbd")
-afp_running=$(launchctl list 2>/dev/null | grep "com.apple.AppleFileServer")
-
-if [ -z "$smb_running" ] && [ -z "$afp_running" ]; then
+evd "PC-04" "launchctl print system/com.apple.smbd 2>&1 | head -3; netstat -an -p tcp 2>/dev/null | grep LISTEN | grep -E '[.:](445|548) '; sharing -l 2>/dev/null"
+# 일반 사용자 'launchctl list' 로는 system 도메인의 smbd 가 보이지 않음 → system 도메인 로드·포트 수신으로 판정
+if [ -z "$FS_ON" ]; then
     result "PC-04|양호|파일 공유 서비스(SMB/AFP) 비활성"
 else
-    shared_list=$(sharing -l 2>/dev/null | grep "name:" | sed 's/.*name:[[:space:]]*//' | tr '\n' ',' | sed 's/,$//')
-    result "PC-04|취약|파일 공유 활성: ${smb_running:+SMB }${afp_running:+AFP }공유=${shared_list:-없음}"
+    shared_list=$(sharing -l 2>/dev/null | awk -F':[ \t]*' '/^name:/{print $2}' | tr '\n' ',' | sed 's/,$//')
+    result "PC-04|취약|파일 공유 활성:${FS_ON} 공유=${shared_list:-확인 필요(sudo)}"
 fi
 
 # ── PC-05: 불필요 서비스 비활성화 ──────────────────────────────────
-evd "PC-05" "launchctl list 2>/dev/null | grep -E 'screensharing|RemoteDesktop|VNCServer|tftpd|bootpd|postfix|ftp-proxy'"
+evd "PC-05" "launchctl print system/com.apple.screensharing 2>&1 | head -3; netstat -an -p tcp 2>/dev/null | grep LISTEN | grep -E '[.:](5900|3283|69|21) '; pgrep -lx ARDAgent; launchctl list 2>/dev/null | grep -E 'VNCServer|tftpd|bootpd|postfix|ftp-proxy'"
 bad_svc=""
-for svc in com.apple.screensharing \
-           com.apple.RemoteDesktop.agent \
-           com.apple.VNCServer \
+[ "$SS_ON" = 1 ] && bad_svc="${bad_svc} 화면공유(VNC)"
+[ "$ARD_ON" = 1 ] && bad_svc="${bad_svc} 원격관리(ARD)"
+for svc in com.apple.VNCServer \
            com.apple.tftpd \
            com.apple.bootpd \
            org.postfix.master \
            com.apple.ftp-proxy; do
-    if launchctl list 2>/dev/null | grep -q "$svc"; then
+    if launchctl list 2>/dev/null | grep -q "$svc" || _svc_on "$svc"; then
         bad_svc="${bad_svc} ${svc##com.apple.}"
     fi
 done
@@ -168,18 +239,12 @@ else
 fi
 
 # ── PC-06: 백신 / Gatekeeper ──────────────────────────────────────
-evd "PC-06" "spctl --status 2>/dev/null; ls /Applications/ 2>/dev/null | grep -iE 'CrowdStrike|SentinelOne|AhnLab|V3'"
+evd "PC-06" "spctl --status 2>/dev/null; find /Applications -maxdepth 2 -name '*.app' 2>/dev/null | sed 's#.*/##' | grep -iE '$AV_APP_RE'; ps -axco comm 2>/dev/null | grep -iE '$AV_PROC_RE' | sort -u"
 gk_status=$(spctl --status 2>/dev/null)
-av_apps=""
-for app in CrowdStrike SentinelOne Symantec McAfee Sophos ESET Avast Kaspersky AhnLab V3 Trend; do
-    if ls /Applications/ 2>/dev/null | grep -qi "$app"; then
-        av_apps="${av_apps} ${app}"
-    fi
-done
-
+av_apps="${AV_APPS:+ ${AV_APPS}}"
 if echo "$gk_status" | grep -qi "enabled"; then
     if [ -n "$av_apps" ]; then
-        result "PC-06|양호|Gatekeeper 활성 + 백신:${av_apps}"
+        result "PC-06|양호|Gatekeeper 활성 + 백신:${av_apps}$([ -n "$AV_PROCS" ] && echo " (실행: ${AV_PROCS})" || echo " (실시간 감시 프로세스 미확인 - 백신 설정 확인)")"
     else
         result "PC-06|수동확인|Gatekeeper 활성, 백신 미탐지 (XProtect 내장 보호만 확인) — 백신 설치 및 실시간 감시 여부 확인"
     fi
@@ -192,11 +257,24 @@ evd "PC-07" "defaults read /Library/Preferences/com.apple.SoftwareUpdate Automat
 auto_check=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null)
 auto_install=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null)
 crit_install=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall 2>/dev/null)
+# 키 미설정 = macOS 기본값(자동 확인 켜짐). softwareupdate --schedule 결과를 우선 사용
+sched=$(softwareupdate --schedule 2>/dev/null)
+if echo "$sched" | grep -qi 'turned on'; then auto_on=1
+elif echo "$sched" | grep -qi 'turned off'; then auto_on=0
+elif [ "$auto_check" = "0" ]; then auto_on=0; else auto_on=1; fi
+mac_eos_check   # Apple 보안 릴리스 목록 조회 → 지원 종료(EoS)·미적용 보안 패치
+GRACE=${PATCH_GRACE_DAYS:-30}
+pmiss=""; [ -n "$PATCH_LATEST" ] && pmiss="미적용 보안 릴리스 ${OS_VER} → ${PATCH_LATEST} (가장 오래된 미적용 배포 ${PATCH_DATE}, ${PATCH_AGE}일 경과)"
+au="AutoCheck=${auto_check:-기본 1}, AutoInstall=${auto_install:-미설정}, 긴급패치=${crit_install:-기본 1}"
 
-if [ "$auto_check" = "1" ]; then
-    result "PC-07|양호|자동 업데이트 활성 (AutoCheck=1, AutoInstall=${auto_install:-미설정}, 긴급패치=${crit_install:-미설정}), OS=${OS_VER}"
+if [ "$EOS_RES" = "취약" ]; then
+    result "PC-07|취약|${EOS_DESC}"
+elif [ -n "$PATCH_LATEST" ] && [ "${PATCH_AGE:-0}" -gt "$GRACE" ] 2>/dev/null; then
+    result "PC-07|취약|${pmiss} - ${GRACE}일 이상 보안 패치 미적용 (${au})"
+elif [ "$auto_on" != "1" ]; then
+    result "PC-07|취약|자동 업데이트 확인 비활성 (${au}), OS=${OS_VER}"
 else
-    result "PC-07|취약|자동 업데이트 비활성 (AutoCheck=${auto_check:-미설정})"
+    result "PC-07|양호|자동 업데이트 활성 (${au}), OS=${OS_VER} 지원 버전$([ -n "$pmiss" ] && echo ", ${pmiss}(유예 ${GRACE}일 이내)")"
 fi
 
 # ── PC-08: 방화벽 활성화 ──────────────────────────────────────────
@@ -223,15 +301,14 @@ else
 fi
 
 # ── PC-10: 원격 접속 제한 ──────────────────────────────────────────
-evd "PC-10" "systemsetup -getremotelogin 2>/dev/null; launchctl list 2>/dev/null | grep -E 'RemoteDesktop|screensharing'"
+evd "PC-10" "systemsetup -getremotelogin 2>/dev/null; launchctl print system/com.openssh.sshd 2>&1 | head -2; netstat -an -p tcp 2>/dev/null | grep LISTEN | grep -E '[.:](22|5900|3283) '; pgrep -lx ARDAgent"
 remote_login=$(systemsetup -getremotelogin 2>/dev/null)
-remote_mgmt=$(launchctl list 2>/dev/null | grep "com.apple.RemoteDesktop.agent")
-screen_share=$(launchctl list 2>/dev/null | grep "com.apple.screensharing")
 
 issues10=""
-echo "$remote_login" | grep -qi "on" && issues10="${issues10} SSH활성"
-[ -n "$remote_mgmt" ] && issues10="${issues10} 원격관리활성"
-[ -n "$screen_share" ] && issues10="${issues10} 화면공유활성"
+# systemsetup 은 관리자 권한 없으면 'You need administrator access' 출력('on' 오탐 방지) → ': On' 만 인정, sshd 로드·22 포트 보조 확인
+{ echo "$remote_login" | grep -qi ': On' || _svc_on com.openssh.sshd || _listen 22; } && issues10="${issues10} SSH활성"
+[ "$ARD_ON" = 1 ] && issues10="${issues10} 원격관리활성"
+[ "$SS_ON" = 1 ] && issues10="${issues10} 화면공유활성"
 
 if [ -z "$issues10" ]; then
     result "PC-10|양호|원격 로그인(SSH)/원격관리/화면공유 모두 비활성"
