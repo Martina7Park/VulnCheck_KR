@@ -33,7 +33,7 @@ _safe_new() { [ -L "$1" ] && rm -f "$1"; return 0; }   # 심볼릭 링크는 따
 
 # ── 실행 권한 / 사용자 설정을 읽을 대상 계정 ──
 #   root(sudo) : 시스템 데몬·공유·보안 정책까지 조회 가능. 사용자 설정은 SUDO_USER 또는 콘솔 사용자 기준으로 읽는다
-#   비root     : launchctl 시스템 도메인·systemsetup·pwpolicy 등은 조회 불가 → 해당 항목은 '점검불가'
+#   비root     : systemsetup·pwpolicy·profiles 등은 조회 불가 → 해당 항목은 '점검불가' (launchctl system 도메인 적재 여부는 비root 도 조회 가능 → SYSVIS)
 IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
 RUN_USER=$(id -un 2>/dev/null)
 CON_USER=$(stat -f %Su /dev/console 2>/dev/null)
@@ -67,14 +67,26 @@ listening() {
 # svc_state <launchd 라벨> <포트>: on / off / unk
 #  ※ 'launchctl list' 에 보이는 com.apple.screensharing.agent / com.apple.RemoteDesktop.agent 는 모든 사용자 세션에 항상 로드되는 보조 에이전트라 서비스 활성 근거가 아님
 #    → 서비스 데몬이 system 도메인에 로드됐는지(launchctl print system/<라벨>) 또는 포트가 LISTEN 중인지로만 판정
-#  on: 포트 LISTEN 또는 system 도메인 로드 / off: root 이고 launchctl 로 조회했는데 미로드·포트 닫힘 / unk: 비root 에서 system 도메인을 못 보거나 launchctl 없음 (단정 불가)
+#  on: 포트 LISTEN 또는 system 도메인 로드 / off: system 도메인 조회 가능(root 또는 SYSVIS=1)한데 미로드·포트 닫힘 / unk: system 도메인을 못 보거나 launchctl 없음 (단정 불가)
+# 비root 도 'launchctl print system/<라벨>' 로 system 도메인 적재 여부를 읽을 수 있음
+#  (macOS 26.6 실기 확인: 비root 에서 적재된 com.apple.coreservicesd 는 조회되고, 미적재 서비스는 "Could not find service")
+#  → system 도메인이 조회되면(SYSVIS=1) 비root 라도 '미적재 + 포트 닫힘 = off' 로 판정 (점검불가 남발 방지)
+SYSVIS=0; have launchctl && launchctl print system/com.apple.coreservicesd >/dev/null 2>&1 && SYSVIS=1
 svc_state() {
     if [ -n "$2" ] && listening "$2"; then echo on; return; fi
     if have launchctl; then
         if launchctl print "system/$1" >/dev/null 2>&1; then echo on; return; fi
-        [ "$IS_ROOT" -eq 1 ] && { echo off; return; }
+        { [ "$IS_ROOT" -eq 1 ] || [ "$SYSVIS" -eq 1 ]; } && { echo off; return; }
     fi
     echo unk
+}
+# remote_tools: 3rd-party 원격 지원 프로그램 실행 여부 (프로세스 이름 기준) — Chrome 원격 데스크톱 호스트는 remoting_me2me_host 로 실행됨
+#  + Chrome 원격 데스크톱 '원격 액세스' 켜짐 표시 파일(/Library/PrivilegedHelperTools/org.chromium.chromoting.me2me_enabled)
+remote_tools() {
+    local t
+    t=$(ps -axo comm 2>/dev/null | awk -F/ '{print $NF}' | grep -iE '^(TeamViewer|AnyDesk|RemoteView|Chrome Remote|remoting_(me2me_)?host$|rustdesk|Splashtop|ScreenConnect|LogMeIn|GoToAssist|RealVNC|vncserver)' | sort -u | tr '\n' ',' | sed 's/,$//')
+    [ -e /Library/PrivilegedHelperTools/org.chromium.chromoting.me2me_enabled ] && t="${t:+${t},}Chrome 원격 데스크톱(원격 액세스 켜짐)"
+    echo "$t"
 }
 # ard_state: 원격 관리(ARD) on / off / unk — ARDAgent 프로세스(ps 는 모든 사용자 프로세스가 보임) 또는 3283 포트 LISTEN 이면 on
 ard_state() {
@@ -415,9 +427,9 @@ fson=""; [ "$smb" = on ] && fson="${fson} SMB"; [ "$afp" = on ] && fson="${fson}
 if [ -n "$fson" ]; then
     if [ -n "$gshare" ]; then result "PC-04|취약|파일 공유(${fson# }) 활성 + 공유 폴더 게스트 접근 허용 (비밀번호 없이 접근): ${gshare}"
     elif [ "$guest" = "1" ]; then result "PC-04|취약|파일 공유(${fson# }) 활성 + 게스트 접근 허용 (AllowGuestAccess=1), 공유: ${shares:-목록 조회 불가}"
-    elif [ "$IS_ROOT" -eq 1 ]; then result "PC-04|수동확인|파일 공유 사용(${fson# }): ${shares:-공유 목록 없음} - 불필요 공유 여부·접근 권한 확인"
+    elif [ "$IS_ROOT" -eq 1 ] || [ -n "$SHARING" ]; then result "PC-04|수동확인|파일 공유 사용(${fson# }): ${shares:-공유 목록 없음} - 불필요 공유 여부·접근 권한 확인"
     else result "PC-04|점검불가|파일 공유(${fson# }) 활성이나 공유 폴더 목록(sharing -l)·공유별 게스트 설정 조회 불가: ${NEED_ROOT} (AllowGuestAccess=${guest:-미설정})"; fi
-elif [ "$IS_ROOT" -eq 1 ] && [ "$smb" = "off" ] && [ "$afp" = "off" ]; then
+elif [ "$smb" = "off" ] && [ "$afp" = "off" ]; then
     # 공유 폴더가 정의돼 있어도 파일 공유 서비스(SMB/AFP)가 꺼져 있으면 외부 접근 불가 → 양호
     result "PC-04|양호|파일 공유 서비스(SMB/AFP) 비활성 (system 도메인 미적재, 포트 445/548 닫힘)$([ -n "$shares" ] && echo " - 정의된 공유 ${shares} 는 서비스가 꺼져 있어 접근 불가")$({ [ -n "$gshare" ] || [ "$guest" = "1" ]; } && echo ", 게스트 허용 설정 존재(${gshare:-AllowGuestAccess=1}) - 재활성 시 취약")"
 elif [ "$IS_ROOT" -eq 1 ]; then result "PC-04|점검불가|SMB/AFP 서비스 상태(launchctl)를 조회하지 못함 (launchctl 명령 없음 또는 오류, 포트 445/548 닫힘)"
@@ -444,9 +456,18 @@ if [ "$IS_ROOT" -eq 1 ]; then
     launchctl list 2>/dev/null | awk '$3=="com.apple.InternetSharing"{f=1} END{exit f?0:1}' && bad="${bad} 인터넷 공유"
     launchctl list 2>/dev/null | awk '$3 ~ /^com\.apple\.(tftpd|ftpd|telnetd|bootpd)$/{f=1} END{exit f?0:1}' && bad="${bad} TFTP/FTP/Telnet/BOOTP"
 else
-    if port_open 22; then bad="${bad} 원격 로그인(SSH, 포트22 리슨)"; else unk05=1; fi
-    if port_open 69; then bad="${bad} TFTP(포트69)"; fi
-    unk05=1   # Apple 이벤트·인터넷 공유·ftpd/bootpd 적재 여부는 root 필요
+    # 비root: systemsetup 은 관리자 권한 필요 → launchd system 도메인 적재·포트 LISTEN 으로 판정 (SYSVIS=0 이면 점검불가)
+    # 인터넷 공유 데몬(com.apple.NetworkSharing)은 꺼져 있어도 system 도메인에 항상 적재(not running)되므로 적재 여부가 아니라 NAT 설정·프로세스로 판정
+    nat=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.nat NAT 2>/dev/null | awk '/Enabled/{gsub(/[ ;]/,"",$3); print $3; exit}')
+    evq "PC-05" "인터넷 공유 (com.apple.nat NAT Enabled / InternetSharing 프로세스)" "NAT Enabled=${nat:-미설정} 프로세스=$(ps -axo comm 2>/dev/null | awk -F/ '$NF=="InternetSharing"{print "실행"; exit}')"
+    { [ "$nat" = "1" ] || ps -axo comm 2>/dev/null | awk -F/ '$NF=="InternetSharing"{f=1} END{exit f?0:1}'; } && bad="${bad} 인터넷 공유"
+    for entry in "com.openssh.sshd:22:원격 로그인(SSH)" "com.apple.AEServer:3031:원격 Apple 이벤트" \
+                 "com.apple.tftpd:69:TFTP" "com.apple.ftpd:21:FTP" "com.apple.telnetd:23:Telnet" "com.apple.bootpd::BOOTP"; do
+        lb=${entry%%:*}; rest=${entry#*:}; pt=${rest%%:*}; nm=${rest#*:}
+        st=$(svc_state "$lb" "$pt")
+        evq "PC-05" "서비스 상태 (system 도메인 적재 / 포트 ${pt:-없음} LISTEN, 비root SYSVIS=${SYSVIS})" "$lb = $st"
+        case "$st" in on) case "$bad" in *"$nm"*) ;; *) bad="${bad} ${nm}" ;; esac ;; unk) unk05=1 ;; esac
+    done
 fi
 cups=$(cupsctl 2>/dev/null | grep -c '_share_printers=1')
 [ "${cups:-0}" -gt 0 ] && bad="${bad} 프린터 공유"
@@ -577,7 +598,7 @@ else
     idle=$(urd -currentHost read com.apple.screensaver idleTime)
     askpw=$(urd read com.apple.screensaver askForPassword)
     askdl=$(urd read com.apple.screensaver askForPasswordDelay)
-    lkst=$(urun sysadminctl -screenLock status)
+    lkst=$(urun sysadminctl -screenLock status | sed 's/^.*\] //')   # 'YYYY-MM-DD hh:mm:ss sysadminctl[pid] ' 로그 머리 제거
     ds_all=$(pmset -g custom 2>/dev/null | awk '/displaysleep/{print $2}')
     dsl=""
     for v in $ds_all; do
@@ -611,11 +632,12 @@ fi
 evd "PC-18" "launchctl print system/com.apple.screensharing"
 evd "PC-18" "netstat -an -p tcp"
 evd "PC-18" "ps -axo comm"
+evd "PC-18" "ls -l /Library/PrivilegedHelperTools 2>/dev/null | grep -i chromoting; launchctl print system 2>/dev/null | grep -i chromoting"
 evd "PC-18" "nc -z -w 1 127.0.0.1 5900 && echo 'port 5900 open' || echo 'port 5900 closed'; nc -z -w 1 127.0.0.1 3283 && echo 'port 3283 open' || echo 'port 3283 closed'"
 rs=""; unk18=0
 case "$(svc_state com.apple.screensharing 5900)" in on) rs="${rs} 화면 공유" ;; unk) unk18=1 ;; esac
 case "$(ard_state)" in on) rs="${rs} 원격 관리(ARD)" ;; unk) unk18=1 ;; esac
-tp=$(ps -axo comm 2>/dev/null | awk -F/ '{print $NF}' | grep -iE '^(TeamViewer|AnyDesk|RemoteView|Chrome Remote|remoting_host)' | sort -u | tr '\n' ',' | sed 's/,$//')
+tp=$(remote_tools)
 [ -n "$tp" ] && rs="${rs} 원격 지원 프로그램(${tp})"
 if [ -n "$rs" ]; then result "PC-18|취약|원격 지원 기능 사용:${rs}"
 elif [ "$unk18" -eq 1 ] && [ "$IS_ROOT" -eq 1 ]; then result "PC-18|점검불가|화면 공유 서비스 적재 여부 조회 불가: launchctl 명령 없음/조회 실패"

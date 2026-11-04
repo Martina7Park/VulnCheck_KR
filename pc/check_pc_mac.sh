@@ -40,7 +40,7 @@ _safe_new() { [ -L "$1" ] && rm -f "$1"; return 0; }   # 심볼릭 링크는 따
 
 # ── 실행 권한 / 사용자 설정을 읽을 대상 계정 ──
 #   root(sudo) : 시스템 데몬·공유·보안 정책까지 조회 가능. 사용자 설정은 SUDO_USER 또는 콘솔 사용자 기준으로 읽는다
-#   비root     : launchctl 시스템 도메인·systemsetup·pwpolicy 등은 조회 불가 → 해당 항목은 '점검불가'
+#   비root     : systemsetup·pwpolicy·profiles 등은 조회 불가 → 해당 항목은 '점검불가' (launchctl system 도메인 적재 여부는 비root 도 조회 가능 → SYSVIS)
 IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
 RUN_USER=$(id -un 2>/dev/null)
 CON_USER=$(stat -f %Su /dev/console 2>/dev/null)
@@ -74,14 +74,26 @@ listening() {
 # svc_state <launchd 라벨> <포트>: on / off / unk
 #  ※ 'launchctl list' 에 보이는 com.apple.screensharing.agent / com.apple.RemoteDesktop.agent 는 모든 사용자 세션에 항상 로드되는 보조 에이전트라 서비스 활성 근거가 아님
 #    → 서비스 데몬이 system 도메인에 로드됐는지(launchctl print system/<라벨>) 또는 포트가 LISTEN 중인지로만 판정
-#  on: 포트 LISTEN 또는 system 도메인 로드 / off: root 이고 launchctl 로 조회했는데 미로드·포트 닫힘 / unk: 비root 에서 system 도메인을 못 보거나 launchctl 없음 (단정 불가)
+#  on: 포트 LISTEN 또는 system 도메인 로드 / off: system 도메인 조회 가능(root 또는 SYSVIS=1)한데 미로드·포트 닫힘 / unk: system 도메인을 못 보거나 launchctl 없음 (단정 불가)
+# 비root 도 'launchctl print system/<라벨>' 로 system 도메인 적재 여부를 읽을 수 있음
+#  (macOS 26.6 실기 확인: 비root 에서 적재된 com.apple.coreservicesd 는 조회되고, 미적재 서비스는 "Could not find service")
+#  → system 도메인이 조회되면(SYSVIS=1) 비root 라도 '미적재 + 포트 닫힘 = off' 로 판정 (점검불가 남발 방지)
+SYSVIS=0; have launchctl && launchctl print system/com.apple.coreservicesd >/dev/null 2>&1 && SYSVIS=1
 svc_state() {
     if [ -n "$2" ] && listening "$2"; then echo on; return; fi
     if have launchctl; then
         if launchctl print "system/$1" >/dev/null 2>&1; then echo on; return; fi
-        [ "$IS_ROOT" -eq 1 ] && { echo off; return; }
+        { [ "$IS_ROOT" -eq 1 ] || [ "$SYSVIS" -eq 1 ]; } && { echo off; return; }
     fi
     echo unk
+}
+# remote_tools: 3rd-party 원격 지원 프로그램 실행 여부 (프로세스 이름 기준) — Chrome 원격 데스크톱 호스트는 remoting_me2me_host 로 실행됨
+#  + Chrome 원격 데스크톱 '원격 액세스' 켜짐 표시 파일(/Library/PrivilegedHelperTools/org.chromium.chromoting.me2me_enabled)
+remote_tools() {
+    local t
+    t=$(ps -axo comm 2>/dev/null | awk -F/ '{print $NF}' | grep -iE '^(TeamViewer|AnyDesk|RemoteView|Chrome Remote|remoting_(me2me_)?host$|rustdesk|Splashtop|ScreenConnect|LogMeIn|GoToAssist|RealVNC|vncserver)' | sort -u | tr '\n' ',' | sed 's/,$//')
+    [ -e /Library/PrivilegedHelperTools/org.chromium.chromoting.me2me_enabled ] && t="${t:+${t},}Chrome 원격 데스크톱(원격 액세스 켜짐)"
+    echo "$t"
 }
 # ard_state: 원격 관리(ARD) on / off / unk — ARDAgent 프로세스(ps 는 모든 사용자 프로세스가 보임) 또는 3283 포트 LISTEN 이면 on
 ard_state() {
@@ -446,7 +458,7 @@ gshare=$(sharing -l 2>/dev/null | awk -F':[ \t]*' '/^name:/{n=$2} /guest access/
 guest04=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.smb.server AllowGuestAccess 2>/dev/null)
 if [ "$smb" = "on" ] || [ "$afp" = "on" ]; then
     result "PC-04|취약|파일 공유 활성: $([ "$smb" = on ] && echo 'SMB ')$([ "$afp" = on ] && echo 'AFP ')공유=${shared_list:-목록 조회 불가($([ "$IS_ROOT" -eq 1 ] || echo "$NEED_ROOT"))}"
-elif [ "$IS_ROOT" -eq 1 ] && [ "$smb" = "off" ] && [ "$afp" = "off" ]; then
+elif [ "$smb" = "off" ] && [ "$afp" = "off" ]; then
     # 공유 폴더 정의만 있고 SMB/AFP 서비스가 꺼져 있으면 외부에서 접근할 수 없음 → 양호 (게스트 허용 설정이 남아 있으면 재활성 시 위험)
     result "PC-04|양호|파일 공유 서비스(SMB/AFP) 비활성 (system 도메인 미적재, 포트 445/548 닫힘)$([ -n "$shared_list" ] && echo " - 정의된 공유 ${shared_list} 는 서비스가 꺼져 있어 접근 불가")$({ [ -n "$gshare" ] || [ "$guest04" = "1" ]; } && echo ", 게스트 허용 설정 존재(${gshare:-AllowGuestAccess=1}) - 재활성 시 취약")"
 elif [ "$IS_ROOT" -eq 1 ]; then
@@ -578,6 +590,7 @@ evd "PC-10" "launchctl print system/com.openssh.sshd"
 evd "PC-10" "launchctl print system/com.apple.screensharing"
 evd "PC-10" "netstat -an -p tcp"
 evd "PC-10" "ps -axo comm"
+evd "PC-10" "ls -l /Library/PrivilegedHelperTools 2>/dev/null | grep -i chromoting; launchctl print system 2>/dev/null | grep -i chromoting"
 evd "PC-10" "nc -z -w 1 127.0.0.1 22 && echo 'port 22 open' || echo 'port 22 closed'; nc -z -w 1 127.0.0.1 5900 && echo 'port 5900 open' || echo 'port 5900 closed'; nc -z -w 1 127.0.0.1 3283 && echo 'port 3283 open' || echo 'port 3283 closed'"
 issues10=""; unk10=0; rl_err=""
 sshst=$(svc_state com.openssh.sshd 22)
@@ -598,6 +611,9 @@ fi
 [ "$ssst" = unk ] && unk10=1
 [ "$ardst" = on ] && issues10="${issues10} 원격관리(ARD)활성"
 [ "$ardst" = unk ] && unk10=1
+rt10=$(remote_tools)
+evq "PC-10" "3rd-party 원격 지원 프로그램 (프로세스 이름 / Chrome 원격 데스크톱 원격 액세스 표시 파일)" "${rt10:-없음}"
+[ -n "$rt10" ] && issues10="${issues10} 원격지원프로그램(${rt10})"
 if [ -n "$issues10" ]; then
     result "PC-10|취약|원격 접속 서비스 활성:${issues10}"
 elif [ "$unk10" -eq 1 ]; then

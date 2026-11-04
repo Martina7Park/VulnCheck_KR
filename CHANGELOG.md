@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-11-04 — macOS PC: 비root 서비스 판정·원격 지원 프로그램 탐지 보완
+
+- `pc/check_pc_mac.sh`, `pc/check_pc_mac_kisa.sh`: 비root 에서도 `launchctl print system/<라벨>` 로 system 도메인 적재 여부를 읽을 수 있음(macOS 26.6 실기 확인) → `SYSVIS` 로 확인되면 '미적재 + 포트 닫힘 = 비활성'으로 판정
+  - sudo 없이 실행 시 '점검불가'였던 전금 PC-04·PC-05·PC-10, 주요정보 PC-04·PC-05·PC-18 이 실제 상태로 판정됨
+  - 주요정보 PC-05(비root): 원격 로그인·원격 Apple 이벤트·TFTP/FTP/Telnet/BOOTP 를 launchd 적재·포트로 확인. 인터넷 공유는 데몬(com.apple.NetworkSharing)이 꺼져 있어도 항상 적재되므로 NAT 설정·프로세스로 판정
+- 원격 지원 프로그램 탐지(주요정보 PC-18, 전금 PC-10): Chrome 원격 데스크톱 호스트(`remoting_me2me_host`, `me2me_enabled` 표시 파일) 미탐지 수정, RustDesk·Splashtop·ScreenConnect·LogMeIn·GoToAssist·RealVNC 추가
+- 주요정보 PC-16: 판정 문구에 섞이던 `sysadminctl` 로그 머리(날짜·PID) 제거
+- 검증: macOS 26.6.2 비root 실행 — 주요정보 점검불가 3→0, 전금 4→1(Safari 전체 디스크 접근 필요 PC-15만 남음), `tools/check_evidence.py` 문제 항목 0
+
 ## 2026-11-03 — DBMS 접속 계정·비밀번호 실행 중 입력
 
 - `dbms/check_dbms.sh`: 터미널 실행 시 점검 기준 선택 뒤 `[DBMS] DB 접속 계정` → `비밀번호(숨김)` 를 묻는 `_ask_cred` 추가 (Oracle·MySQL/MariaDB·PostgreSQL·Tibero·MSSQL)
